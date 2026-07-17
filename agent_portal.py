@@ -1,10 +1,13 @@
 import streamlit as st
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
 import datetime
 import plotly.express as px
 import plotly.graph_objects as go 
 import calendar
 import math
+
 st.set_page_config(page_title="Sparta Agent Portal", layout="wide")
 
 
@@ -139,101 +142,55 @@ ACCESS_KEYS = st.secrets["agent_keys"]
 
 def log_agent_login(agent_name):
     try:
-        log_sheet = ss.worksheet('Logs')
-    except gspread.WorksheetNotFound:
-        log_sheet = ss.add_worksheet(title="Logs", rows="1000", cols="3")
-        log_sheet.append_row(["Timestamp", "Agent Name", "Action"])
+        info = st.secrets["gcp_service_account"]
+        creds = Credentials.from_service_account_info(info, scopes=[
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive'
+        ])
+        client = gspread.authorize(creds)
+        ss = client.open_by_key('1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ')
+        try:
+            log_sheet = ss.worksheet('Logs')
+        except gspread.WorksheetNotFound:
+            log_sheet = ss.add_worksheet(title="Logs", rows="1000", cols="3")
+            log_sheet.append_row(["Timestamp", "Agent Name", "Action"])
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_sheet.append_row([timestamp, agent_name, "Login"])
     except:
         pass
 
-#############################################################################
+def robust_date_parser(date_str):
+    date_str = str(date_str).strip()
+    try:
+        if '/' in date_str: return pd.to_datetime(date_str, dayfirst=True)
+        return pd.to_datetime(date_str)
+    except: return pd.NaT
+
 @st.cache_data(ttl=300)
 def fetch_data():
+    info = st.secrets["gcp_service_account"]
+    creds = Credentials.from_service_account_info(info, scopes=[
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ])
+    client = gspread.authorize(creds)
+    ss = client.open_by_key('1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ')
+    
+    df1 = pd.DataFrame(ss.worksheet('Sparta').get_all_records())
+    df1['Date_Parsed'] = pd.to_datetime(df1['Standardized_Date'], errors='coerce')
+    df1['Advisor'] = df1['Advisor'].astype(str).str.strip().str.title()
+    
+    df2_raw = pd.DataFrame(ss.worksheet('Sparta2').get_all_records())
+    df2_raw['Date_Parsed'] = df2_raw['Sale Date'].apply(robust_date_parser)
+    df2_raw['Advisor'] = df2_raw['Agent'].astype(str).str.strip().str.title()
 
-    CSV_URL = (
-        "https://raw.githubusercontent.com/"
-        "dataanalystsparta-netizen/"
-        "dashboard-excel-sync/main/dashboard-data.csv"
-    )
-
-    df = pd.read_csv(CSV_URL).fillna("")
-
-    # --------------------------------------------------
-    # Rename columns to match the old dashboard
-    # --------------------------------------------------
-    df = df.rename(columns={
-
-        # Basic
-        "Advisor (Created Username)": "Advisor",
-        "Phone Number": "CLI",
-        "Sale Date": "Standardized_Date",
-
-        # Quality
-        "Quality Remarks (Quality Comments)": "Quality Remarks",
-
-        # Welcome
-        "Welcome Call Status": "Welcome Call Status",
-        "Welcome Call Remarks (Welcome Comments)": "Welcome call Remarks",
-
-        # Live / Portal
-        "Committed (Live) Status (Onboarding Status)": "Portal Status",
-
-    })
-
-    # --------------------------------------------------
-    # Create columns expected by the dashboard
-    # --------------------------------------------------
-
-    df["Sale Date"] = df["Standardized_Date"]
-
-    df["Telephone No."] = df["CLI"]
-
-    df["Status"] = df["Portal Status"]
-
-    df["Voice of Customer"] = ""
-
-    df["Committed Date"] = pd.NaT
-
-    df["Live Date"] = pd.NaT
-
-
-  
-
-    # --------------------------------------------------
-    # Dates
-    # --------------------------------------------------
-
-    df["Date_Parsed"] = pd.to_datetime(
-        df["Standardized_Date"],
-        dayfirst=True,
-        errors="coerce"
-    )
-
-    df["Advisor"] = (
-        df["Advisor"]
-        .astype(str)
-        .str.strip()
-        .str.title()
-    )
-
-    # --------------------------------------------------
-    # Return exactly what the dashboard expects
-    # --------------------------------------------------
-
-
-    last_sync = datetime.datetime.now().strftime("%d-%m-%Y %H:%M")
-
-    return df, last_sync
-
-
-
-
-
-
-
-
+    try:
+        meta = ss.worksheet('Meta').get_all_values()
+        last_sync = meta[0][1]
+    except:
+        last_sync = "Unknown"
+        
+    return df1, df2_raw, last_sync
 
 def map_quality(val):
     s = str(val).lower()
@@ -309,13 +266,9 @@ else:
             st.rerun()
 
     try:
-        df1, last_sync = fetch_data()
-
-
-
-        
+        df1, df2_raw, last_sync = fetch_data()
         ag1 = df1[df1['Advisor'] == agent].copy()
-        ag2 = ag1.copy()
+        ag2 = df2_raw[df2_raw['Advisor'] == agent].copy()
         
         col_title, col_time = st.columns([3, 1])
         with col_title:
@@ -333,12 +286,12 @@ else:
         end_date = col_b.date_input("End Date", today_date)
 
         ag1_filtered = ag1[(ag1['Date_Parsed'].dt.date >= start_date) & (ag1['Date_Parsed'].dt.date <= end_date)].copy()
-        ag2_filtered = ag1_filtered.copy()
+        ag2_filtered = ag2[(ag2['Date_Parsed'].dt.date >= start_date) & (ag2['Date_Parsed'].dt.date <= end_date)].copy()
         
         ag1_filtered['Q_Status'] = ag1_filtered['Quality Status'].apply(map_quality)
         ag2_filtered['P_Status'] = ag2_filtered['Status'].apply(map_portal)
-        wc_col = "Welcome Call Status"
-        ag1_filtered['WC_Clean'] = ag1_filtered[wc_col].apply(map_wc)
+        wc_col = 'Status' if 'Status' in ag1_filtered.columns else 'Welcome call Status' if 'Welcome call Status' in ag1_filtered.columns else None
+        if wc_col: ag1_filtered['WC_Clean'] = ag1_filtered[wc_col].apply(map_wc)
 
         # ---------------- CATEGORISED KPI BOXES ----------------
         total_apps = len(ag1_filtered)
@@ -576,81 +529,208 @@ else:
         st.write("---")
 
         # ---------------- RECENT APPLICATIONS LOG WITH SECTIONS ----------------
-        # ---------------- RECENT APPLICATIONS LOG ----------------
-        
         st.subheader("🔍 Recent Applications Log")
-        
-        recent_log = ag1.copy()
-        
-        recent_log["Sale Date"] = (
-            pd.to_datetime(
-                recent_log["Standardized_Date"],
-                errors="coerce",
-                dayfirst=True
+        if not ag1.empty:
+            ag2_clean = ag2.copy()
+            ag2_clean['Telephone No.'] = ag2_clean['Telephone No.'].astype(str).str.strip()
+            ag2_clean = ag2_clean.rename(columns={'Status': 'Portal Status', 'Committed Date': 'Live Date'})
+            ag2_unique = ag2_clean.sort_values('Date_Parsed').drop_duplicates('Telephone No.', keep='last')
+            
+            ag1_log_base = ag1.copy()
+            ag1_log_base['CLI_Key'] = ag1_log_base['CLI'].astype(str).str.strip()
+            merged_log = ag1_log_base.merge(
+                ag2_unique[['Telephone No.', 'LetterStatus', 'CallStatus', 'Comments', 'Voice of Customer', 'Cancellation Reason', 'Portal Status', 'Live Date']],
+                left_on='CLI_Key', 
+                right_on='Telephone No.', 
+                how='left'
             )
-            .dt.strftime("%d-%m-%Y")
-            .fillna("")
-        )
-        
-        
-        columns_layout = [
-        
-        ("Basic Info","Sale Date"),
-        ("Basic Info","Customer Name"),
-        
-        ("Quality Audit","Quality Status"),
-        ("Quality Audit","Quality Remarks"),
-        ("Quality Audit","Cancellation Reason - quality"),
-        
-        ("Welcome Call","Welcome Call Status"),
-        ("Welcome Call","Welcome call Remarks"),
-        ("Welcome Call","Cancellation Reason - welcome"),
-        
-        ("Provisioning","Provisioning Status"),
-        ("Provisioning","Provisioning Remarks (Provisioning Comments)"),
-        ("Provisioning","Cancellation/Rejection Reason - Provisioning"),
-        
-        ("Live Status","Portal Status"),
-        ("Live Status","LetterStatus (Dispatch Status)"),
-        ("Live Status","Confirmation Status"),
-        ("Live Status","Confirmation Comment"),
-        
-        ("Live Status","Cancellation/Rejection Reason - Dispatch"),
-        ("Live Status","Cancellation/Rejection Reason - Confirmation"),
-        ("Live Status","Cancellation/Rejection Reason - Onboarding"),
-        ("Live Status","Cancellation/Rejection Reason - Potential Opportunity")
-        
-        ]
-        
-        
-        recent_log = recent_log.sort_values(
-            "Date_Parsed",
-            ascending=False
-        )
-        
-        
-        valid_cols = [
-            c for _,c in columns_layout
-            if c in recent_log.columns
-        ]
-        
-        
-        display_df = recent_log[valid_cols].copy()
-        
-        
-        display_df.columns = pd.MultiIndex.from_tuples(
-            [
-                x for x in columns_layout
-                if x[1] in valid_cols
+
+            # --- RENAME AND CLEANUP RECENT LOG DATE COLUMNS TO DD-MM-YYYY STRING ---
+            merged_log['Sale Date'] = pd.to_datetime(merged_log['Standardized_Date'], errors='coerce').dt.strftime('%d-%m-%Y').fillna('')
+            merged_log['Live Date'] = pd.to_datetime(merged_log['Live Date'], errors='coerce').dt.strftime('%d-%m-%Y').fillna('')
+
+            columns_layout = [
+                ('Basic Info.', 'S.No.'),
+                ('Basic Info.', 'Sale Date'),
+                ('Basic Info.', 'Customer Name'),
+                ('Quality Audit', 'Quality Status'),
+                ('Quality Audit', 'Quality Remarks'),
+                ('Welcome Call', 'Status'),
+                ('Welcome Call', 'Welcome call Remarks'),
+                ('Live Status', 'LetterStatus'),
+                ('Live Status', 'CallStatus'),
+                ('Live Status', 'Portal Status'),
+                ('Live Status', 'Live Date'),
+                ('Live Status', 'Comments'),
+                ('Live Status', 'Voice of Customer'),
+                ('Live Status', 'Cancellation Reason')
             ]
-        )
-        
-        
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True
-        )
+            
+            # --- CUSTOM DATE RANGE, ALL RECORDS & LIMIT CONTROLS ---
+            log_col1, log_col2, log_col3 = st.columns([1.8, 2.2, 1])
+            with log_col1:
+                log_filter_type = st.radio("Log View Filter:", ["All Applications", "By Specific Date Range", "By Specific Month"], horizontal=True)
+            with log_col2:
+                if log_filter_type == "By Specific Date Range":
+                    ld_col1, ld_col2 = st.columns(2)
+                    log_start = ld_col1.date_input("Log Start Date", today_date.replace(day=1), key="log_start_date")
+                    log_end = ld_col2.date_input("Log End Date", today_date, key="log_end_date")
+                    recent_log = merged_log[(merged_log['Date_Parsed'].dt.date >= log_start) & (merged_log['Date_Parsed'].dt.date <= log_end)].sort_values(by='Date_Parsed', ascending=False)
+                elif log_filter_type == "By Specific Month":
+                    unique_months = sorted(merged_log['Date_Parsed'].dt.strftime('%Y-%m').dropna().unique(), reverse=True)
+                    if unique_months:
+                        selected_month = st.selectbox("Select Month for Log (YYYY-MM):", unique_months)
+                        recent_log = merged_log[merged_log['Date_Parsed'].dt.strftime('%Y-%m') == selected_month].sort_values(by='Date_Parsed', ascending=False)
+                    else:
+                        recent_log = merged_log[0:0]
+                else:
+                    recent_log = merged_log.sort_values(by='Date_Parsed', ascending=False)
+
+            recent_log['S.No.'] = range(1, len(recent_log) + 1)
+
+            with log_col3:
+                row_limit = st.selectbox("Show records per page:", [5, 10, 20, 50, 100, "All"], index=2)
+
+            valid_layout = [item for item in columns_layout if item[1] in recent_log.columns]
+            display_df = recent_log[[item[1] for item in valid_layout]].copy()
+            display_df.columns = pd.MultiIndex.from_tuples(valid_layout)
+
+            table_container = st.container()
+
+            # --- Pagination Layout Config ---
+            if "current_page" not in st.session_state:
+                st.session_state.current_page = 1
+
+            if row_limit != "All":
+                limit = int(row_limit)
+                total_records = len(display_df)
+                total_pages = max(1, math.ceil(total_records / limit))
+                
+                # Safety check if records shrink from dynamic filtering
+                if st.session_state.current_page > total_pages:
+                    st.session_state.current_page = 1
+                
+                start_idx = (st.session_state.current_page - 1) * limit
+                end_idx = min(start_idx + limit, total_records)
+                display_df_page = display_df.iloc[start_idx:end_idx]
+                
+                if total_pages > 1:
+                    st.write("")
+                    pag_col1, pag_col2 = st.columns([1, 1])
+                    with pag_col1:
+                        st.markdown(f"<p style='color: #475569; font-size: 0.85rem; margin-top: 6px;'>Showing {start_idx + 1} to {end_idx} of {total_records} entries</p>", unsafe_allow_html=True)
+                    with pag_col2:
+                        b_col1, b_col2, b_col3 = st.columns([2, 1, 1])
+                        with b_col1:
+                            st.markdown(f"<p style='text-align: right; color: #475569; font-size: 0.85rem; margin-top: 6px;'>Page {st.session_state.current_page} of {total_pages}</p>", unsafe_allow_html=True)
+                        with b_col2:
+                            if st.button("Previous", disabled=(st.session_state.current_page == 1), use_container_width=True, key="prev_pg_action"):
+                                st.session_state.current_page -= 1
+                                st.rerun()
+                        with b_col3:
+                            if st.button("Next", disabled=(st.session_state.current_page == total_pages), use_container_width=True, key="next_pg_action"):
+                                st.session_state.current_page += 1
+                                st.rerun()
+                else:
+                    display_df_page = display_df
+            else:
+                display_df_page = display_df
+
+            def style_log_row(row):
+                styles = [''] * len(row)
+                
+                def get_val(col_name):
+                    for col in row.index:
+                        if col[1] == col_name: return str(row[col]).lower()
+                    return ""
+
+                DARK_GREEN = '#065F46'
+                DARK_AMBER = '#92400E'
+                DARK_RED = '#991B1B'
+
+                BG_GREEN = 'rgba(16, 185, 129, 0.3)'
+                BG_AMBER = 'rgba(245, 158, 11, 0.3)'
+                BG_RED   = 'rgba(239, 68, 68, 0.3)'
+
+                q_val = get_val('Quality Status')
+                q_bg, q_txt = '', ''
+                if any(x in q_val for x in ['appr', 'pass']):
+                    q_bg, q_txt = BG_GREEN, DARK_GREEN
+                elif any(x in q_val for x in ['rew', 'repro']):
+                    q_bg, q_txt = BG_AMBER, DARK_AMBER
+                elif any(x in q_val for x in ['can', 'rej']):
+                    q_bg, q_txt = BG_RED, DARK_RED
+                q_style = f'background-color: {q_bg}; color: {q_txt}; font-weight: bold;' if q_bg else ''
+
+                wc_val = get_val('Status')
+                wc_bg, wc_txt = '', ''
+                if any(x in wc_val for x in ['done', 'pass', 'comp', 'live']):
+                    wc_bg, wc_txt = BG_GREEN, DARK_GREEN
+                elif any(x in wc_val for x in ['pend', 'pnd', 'paper', 'ppw', 'com']):
+                    wc_bg, wc_txt = BG_AMBER, DARK_AMBER
+                elif any(x in wc_val for x in ['can', 'rej']):
+                    wc_bg, wc_txt = BG_RED, DARK_RED
+                wc_style = f'background-color: {wc_bg}; color: {wc_txt}; font-weight: bold;' if wc_bg else ''
+
+                call_val = get_val('CallStatus')
+                c_bg, c_txt = '', ''
+                if 'satisfied' in call_val:
+                    c_bg, c_txt = BG_GREEN, DARK_GREEN
+                elif any(x in call_val for x in ['pend', 'cancel']):
+                    c_bg, c_txt = BG_RED, DARK_RED
+                c_style = f'background-color: {c_bg}; color: {c_txt}; font-weight: bold;' if c_bg else ''
+                
+                portal_val = get_val('Portal Status')
+                p_bg, p_txt = '', ''
+                if 'live' in portal_val:
+                    p_bg, p_txt = BG_GREEN, DARK_GREEN
+                elif 'committed' in portal_val:
+                    p_bg, p_txt = BG_AMBER, DARK_AMBER
+                elif any(x in portal_val for x in ['rej', 'cancel']):
+                    p_bg, p_txt = BG_RED, DARK_RED
+                p_style = f'background-color: {p_bg}; color: {p_txt}; font-weight: bold;' if p_bg else ''
+
+                quality_cols = ['S.No.', 'Sale Date', 'Customer Name', 'Quality Status', 'Quality Remarks']
+                portal_group = ['Portal Status', 'Live Date', 'Comments', 'Voice of Customer', 'Cancellation Reason']
+                
+                for i, col_tuple in enumerate(row.index):
+                    col = col_tuple[1] 
+                    current_style = ""
+                    
+                    if col == 'LetterStatus':
+                        current_style = 'background-color: rgba(59, 130, 246, 0.3);'
+                    elif col == 'CallStatus':
+                        current_style = c_style
+                    elif col in portal_group:
+                        if col == 'Portal Status':
+                            current_style = p_style
+                        else:
+                            current_style = f'background-color: {p_bg};' if p_bg else ''
+                    elif col in quality_cols:
+                        if col == 'Quality Status':
+                            current_style = q_style
+                        else:
+                            current_style = f'background-color: {q_bg};' if q_bg else ''
+                    else:
+                        if col == 'Status':
+                            current_style = wc_style
+                        else:
+                            current_style = f'background-color: {wc_bg};' if wc_bg else ''
+                    
+                    if col == 'S.No.':
+                        current_style += 'border-left: 3px solid #1E3A8A;'
+                    
+                    if col in ['Customer Name', 'Quality Remarks', 'Welcome call Remarks', 'Cancellation Reason']:
+                        current_style += 'border-right: 3px solid #1E3A8A;'
+                    
+                    styles[i] = current_style
+                return styles           
+            
+            styled_log = display_df_page.style.apply(style_log_row, axis=1)
+            
+            with table_container:
+                st.dataframe(styled_log, use_container_width=True, hide_index=True)
+
         # ------------ DISPOSITION PERFORMANCE TIPS ---
         st.markdown("""
             <div class="tips-box">
@@ -694,6 +774,3 @@ else:
         st.write("---")
 
     except Exception as e: st.error(f"Error: {e}")
-
-
-
