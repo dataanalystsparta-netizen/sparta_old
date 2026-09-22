@@ -645,6 +645,14 @@ st.html(
         font-weight: 800;
     }
 
+    .funnel-companion {
+        margin-top: 3px;
+        color: #92400E;
+        font-size: .56rem;
+        font-weight: 800;
+        letter-spacing: .15px;
+    }
+
     .funnel-track {
         height: 10px;
         border-radius: 99px;
@@ -992,20 +1000,28 @@ def render_comparison_cards(metrics):
 
 
 def stage_snapshot(apps_df, portal_df, welcome_col):
+    """Return the four true funnel stages.
+
+    Committed is intentionally NOT treated as a fifth downstream stage.
+    It sits at the same level as Live, so it is returned separately only as
+    companion information for the Live stage.
+    """
     total = len(apps_df)
     quality_approved = len(apps_df[apps_df["Q_Status"] == "Approved"])
     wc_done = 0
     if welcome_col and "WC_Clean" in apps_df.columns:
         wc_done = len(apps_df[apps_df["WC_Clean"] == "Done"])
-    committed = len(portal_df[portal_df["P_Status"] == "Committed"]) if not portal_df.empty else 0
     live = len(portal_df[portal_df["P_Status"] == "Live"]) if not portal_df.empty else 0
-    return [
+    committed = len(portal_df[portal_df["P_Status"] == "Committed"]) if not portal_df.empty else 0
+
+    stages = [
         ("Applications", total, "#3B82F6"),
-        ("QA Approved", quality_approved, "#10B981"),
-        ("WC Done", wc_done, "#06B6D4"),
-        ("Committed", committed, "#F59E0B"),
+        ("Quality", quality_approved, "#10B981"),
+        ("Welcome", wc_done, "#06B6D4"),
         ("Live", live, "#047857"),
     ]
+
+    return stages, committed
 
 
 def add_date_strings(frame, source_col, output_col):
@@ -1274,25 +1290,26 @@ try:
         kpi_panel("Live status", group_4)
 
     # ========================================================================
-    # ACTION CENTRE
+    # ACTION CENTRE — CANCELLATION FIRST
     # ========================================================================
-    rework_count = len(ag1_filtered[ag1_filtered["Q_Status"] == "Rework"])
-    wc_followup_count = 0
+    quality_cancel_count = len(ag1_filtered[ag1_filtered["Q_Status"] == "Cancelled"])
+    wc_cancel_count = 0
     if wc_col and "WC_Clean" in ag1_filtered.columns:
-        wc_followup_count = len(ag1_filtered[ag1_filtered["WC_Clean"].isin(["Pending", "Paperwork"])])
-    committed_count = len(ag2_filtered[ag2_filtered["P_Status"] == "Committed"]) if not ag2_filtered.empty else 0
+        wc_cancel_count = len(ag1_filtered[ag1_filtered["WC_Clean"] == "Cancelled"])
+    live_cancel_count = len(ag2_filtered[ag2_filtered["P_Status"] == "Cancelled"]) if not ag2_filtered.empty else 0
+    total_cancel_count = quality_cancel_count + wc_cancel_count + live_cancel_count
 
     st.divider()
     render_section(
         "Action centre",
         "⚡",
-        "The three areas with the clearest next-step actions in the selected period",
+        "Cancellation-focused queues highlighting records that need attention in the selected period",
     )
 
     action_items = [
-        ("Quality rework", rework_count, "▣", "#FFF7ED", "#C2410C", "Review the Quality Remarks and address applications returned for rework."),
-        ("Welcome call follow-up", wc_followup_count, "☎", "#EFF6FF", "#1D4ED8", "Pending + paperwork records that may need a welcome-call follow-up."),
-        ("Committed pipeline", committed_count, "↗", "#ECFDF5", "#047857", "Applications currently at Committed status and not yet shown as Live."),
+        ("Quality cancellations", quality_cancel_count, "!", "#FEF2F2", "#B91C1C", "Review cancelled applications and the associated Quality Remarks for recurring loss points."),
+        ("Welcome call cancellations", wc_cancel_count, "☎", "#FFF7ED", "#C2410C", "Review Welcome Call cancellations and remarks to identify avoidable customer drop-offs."),
+        ("Live-stage cancellations", live_cancel_count, "×", "#FEF2F2", "#991B1B", "Review final-stage cancellations, customer feedback and cancellation reasons."),
     ]
 
     action_html = []
@@ -1311,47 +1328,57 @@ try:
         )
     st.html('<div class="action-wrap">' + ''.join(action_html) + '</div>')
 
-    with st.expander("Open the action queues", expanded=False):
-        aq1, aq2, aq3 = st.tabs(["Quality rework", "Welcome follow-up", "Committed pipeline"])
+    st.caption(f"Total cancellation records across the three tracked stages in this period: {total_cancel_count:,}")
+
+    with st.expander("Open cancellation queues", expanded=False):
+        aq1, aq2, aq3 = st.tabs(["Quality cancellations", "Welcome cancellations", "Live-stage cancellations"])
 
         with aq1:
-            rework_df = ag1_filtered[ag1_filtered["Q_Status"] == "Rework"].copy()
-            if not rework_df.empty:
-                rework_df = add_date_strings(rework_df, "Standardized_Date", "Sale Date")
-                cols = pick_existing(rework_df, ["S.No.", "Sale Date", "Customer Name", "CLI", "Quality Remarks"])
-                if "S.No." not in cols:
-                    rework_df["S.No."] = range(1, len(rework_df) + 1)
-                    cols = ["S.No."] + [c for c in cols if c != "S.No."]
-                st.dataframe(rework_df[cols], use_container_width=True, hide_index=True, height=260)
+            quality_cancel_df = ag1_filtered[ag1_filtered["Q_Status"] == "Cancelled"].copy()
+            if not quality_cancel_df.empty:
+                quality_cancel_df = add_date_strings(quality_cancel_df, "Standardized_Date", "Sale Date")
+                cols = pick_existing(
+                    quality_cancel_df,
+                    ["Sale Date", "Customer Name", "CLI", "Quality Status", "Quality Remarks"],
+                )
+                st.dataframe(quality_cancel_df[cols], use_container_width=True, hide_index=True, height=260)
             else:
-                st.success("No Quality Rework applications in the selected period.")
+                st.success("No Quality Cancellation applications in the selected period.")
 
         with aq2:
             if wc_col:
-                wc_follow_df = ag1_filtered[ag1_filtered["WC_Clean"].isin(["Pending", "Paperwork"])].copy()
-                if not wc_follow_df.empty:
-                    wc_follow_df = add_date_strings(wc_follow_df, "Standardized_Date", "Sale Date")
-                    cols = pick_existing(wc_follow_df, ["Sale Date", "Customer Name", "CLI", wc_col, "Welcome call Remarks"])
-                    st.dataframe(wc_follow_df[cols], use_container_width=True, hide_index=True, height=260)
+                wc_cancel_df = ag1_filtered[ag1_filtered["WC_Clean"] == "Cancelled"].copy()
+                if not wc_cancel_df.empty:
+                    wc_cancel_df = add_date_strings(wc_cancel_df, "Standardized_Date", "Sale Date")
+                    cols = pick_existing(
+                        wc_cancel_df,
+                        ["Sale Date", "Customer Name", "CLI", wc_col, "Welcome call Remarks"],
+                    )
+                    st.dataframe(wc_cancel_df[cols], use_container_width=True, hide_index=True, height=260)
                 else:
-                    st.success("No Pending/Paperwork Welcome Calls in the selected period.")
+                    st.success("No Welcome Call Cancellation applications in the selected period.")
             else:
                 st.info("Welcome Call status is not available in the current source data.")
 
         with aq3:
-            committed_df = ag2_filtered[ag2_filtered["P_Status"] == "Committed"].copy()
-            if not committed_df.empty:
-                committed_df = add_date_strings(committed_df, "Sale Date", "Sale Date")
-                committed_df = add_date_strings(committed_df, "Committed Date", "Committed Date")
+            live_cancel_df = ag2_filtered[ag2_filtered["P_Status"] == "Cancelled"].copy()
+            if not live_cancel_df.empty:
+                live_cancel_df = add_date_strings(live_cancel_df, "Sale Date", "Sale Date")
                 cols = pick_existing(
-                    committed_df,
-                    ["Sale Date", "Customer Name", "Telephone No.", "Committed Date", "Comments", "Voice of Customer", "Cancellation Reason"],
+                    live_cancel_df,
+                    [
+                        "Sale Date",
+                        "Customer Name",
+                        "Telephone No.",
+                        "Portal Status",
+                        "Cancellation Reason",
+                        "Comments",
+                        "Voice of Customer",
+                    ],
                 )
-                if not cols:
-                    cols = pick_existing(committed_df, ["Telephone No.", "Comments"])
-                st.dataframe(committed_df[cols], use_container_width=True, hide_index=True, height=260)
+                st.dataframe(live_cancel_df[cols], use_container_width=True, hide_index=True, height=260)
             else:
-                st.success("No currently Committed applications in the selected period.")
+                st.success("No Live-stage Cancellation applications in the selected period.")
 
     # ========================================================================
     # CONVERSION SNAPSHOT + PERIOD MOMENTUM
@@ -1360,16 +1387,30 @@ try:
     funnel_col, compare_col = st.columns([1.05, 1.95], gap="large")
 
     with funnel_col:
-        render_section("Pipeline snapshot", "◎", "Each stage shown as a percentage of applications in the selected period")
-        stages = stage_snapshot(ag1_filtered, ag2_filtered, wc_col)
+        render_section(
+            "Pipeline snapshot",
+            "◎",
+            "Four true stages. Committed sits alongside Live at the same level and is not treated as a downstream stage.",
+        )
+        stages, committed_count = stage_snapshot(ag1_filtered, ag2_filtered, wc_col)
         total_for_funnel = max(total_apps, 1)
         funnel_rows = []
         for name, count, color in stages:
             width = min(max(pct(count, total_for_funnel), 0), 100)
+            companion = ""
+            if name == "Live":
+                companion = (
+                    f'<div class="funnel-companion">Committed: {committed_count:,}</div>'
+                    if committed_count
+                    else '<div class="funnel-companion">Committed: 0</div>'
+                )
             funnel_rows.append(
                 f"""
                 <div class="funnel-row">
-                    <div class="funnel-name">{escape(name)}</div>
+                    <div class="funnel-name">
+                        {escape(name)}
+                        {companion}
+                    </div>
                     <div class="funnel-track">
                         <div class="funnel-fill" style="width:{width:.1f}%;background:{color};"></div>
                     </div>
@@ -1380,8 +1421,8 @@ try:
         st.html(
             '<div class="funnel-shell">'
             '<div class="funnel-note">'
-            'This is a selected-period stage snapshot rather than a strict cohort conversion calculation, '
-            'so each stage is independently shown against Applications.'
+            'This is a selected-period stage snapshot rather than a strict cohort conversion calculation. '
+            'Quality = Approved, Welcome = Done, and Live = Live records. Committed is displayed as same-level companion information only.'
             '</div>'
             + ''.join(funnel_rows)
             + '</div>'
