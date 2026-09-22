@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 import calendar
 import math
 from html import escape
+from io import BytesIO
 
 # ============================================================================
 # SPARTA AGENT PORTAL — PREMIUM UI REFRESH
@@ -541,6 +542,225 @@ st.html(
         padding: 3px 0 0;
     }
 
+    /* ------------------------ ACTION CENTRE ------------------------------ */
+    .action-wrap {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+        margin: 4px 0 8px;
+    }
+
+    .action-card {
+        position: relative;
+        overflow: hidden;
+        min-height: 124px;
+        padding: 15px 16px;
+        border-radius: 15px;
+        background: rgba(255,255,255,.93);
+        border: 1px solid #E2E8F0;
+        box-shadow: 0 8px 22px rgba(15,23,42,.045);
+    }
+
+    .action-card::after {
+        content: "";
+        position: absolute;
+        width: 90px;
+        height: 90px;
+        right: -28px;
+        top: -35px;
+        border-radius: 999px;
+        border: 1px solid rgba(37,99,235,.08);
+    }
+
+    .action-top {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+    }
+
+    .action-icon {
+        width: 31px;
+        height: 31px;
+        border-radius: 9px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: .85rem;
+        font-weight: 900;
+        flex: 0 0 auto;
+    }
+
+    .action-label {
+        color: #475569;
+        font-size: .64rem;
+        text-transform: uppercase;
+        letter-spacing: .9px;
+        font-weight: 900;
+    }
+
+    .action-count {
+        margin-top: 8px;
+        color: #0F172A;
+        font-size: 1.45rem;
+        line-height: 1;
+        font-weight: 900;
+        letter-spacing: -.04em;
+    }
+
+    .action-copy {
+        margin-top: 6px;
+        color: #64748B;
+        font-size: .70rem;
+        line-height: 1.4;
+        max-width: 92%;
+    }
+
+    /* --------------------------- FUNNEL --------------------------------- */
+    .funnel-shell {
+        padding: 16px 17px;
+        border-radius: 15px;
+        background: rgba(255,255,255,.93);
+        border: 1px solid #E2E8F0;
+        box-shadow: 0 8px 22px rgba(15,23,42,.045);
+    }
+
+    .funnel-note {
+        color: #64748B;
+        font-size: .68rem;
+        line-height: 1.45;
+        margin-bottom: 12px;
+    }
+
+    .funnel-row {
+        display: grid;
+        grid-template-columns: 98px 1fr 58px;
+        gap: 9px;
+        align-items: center;
+        margin: 10px 0;
+    }
+
+    .funnel-name {
+        color: #334155;
+        font-size: .69rem;
+        font-weight: 800;
+    }
+
+    .funnel-track {
+        height: 10px;
+        border-radius: 99px;
+        background: #EDF2F7;
+        overflow: hidden;
+    }
+
+    .funnel-fill {
+        height: 100%;
+        border-radius: 99px;
+        min-width: 3px;
+    }
+
+    .funnel-value {
+        text-align: right;
+        color: #0F172A;
+        font-size: .68rem;
+        font-weight: 900;
+    }
+
+    /* ------------------------ COMPARISON -------------------------------- */
+    .comparison-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+    }
+
+    .comparison-card {
+        min-height: 92px;
+        padding: 13px 14px;
+        border-radius: 13px;
+        background: linear-gradient(180deg, #FFFFFF, #F8FAFC);
+        border: 1px solid #E2E8F0;
+        box-shadow: 0 6px 16px rgba(15,23,42,.035);
+    }
+
+    .comparison-label {
+        color: #64748B;
+        text-transform: uppercase;
+        letter-spacing: .65px;
+        font-size: .59rem;
+        font-weight: 900;
+    }
+
+    .comparison-value {
+        color: #0F172A;
+        font-size: 1.18rem;
+        font-weight: 900;
+        margin-top: 6px;
+    }
+
+    .comparison-base {
+        color: #94A3B8;
+        font-size: .63rem;
+        margin-top: 2px;
+    }
+
+    .delta {
+        display: inline-block;
+        margin-top: 7px;
+        padding: 3px 7px;
+        border-radius: 99px;
+        font-size: .60rem;
+        font-weight: 900;
+    }
+
+    .delta-up {
+        background: #ECFDF5;
+        color: #047857;
+    }
+
+    .delta-down {
+        background: #FEF2F2;
+        color: #B91C1C;
+    }
+
+    .delta-flat {
+        background: #F1F5F9;
+        color: #64748B;
+    }
+
+    /* ------------------------ MINI STATS -------------------------------- */
+    .mini-stat-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 9px;
+    }
+
+    .mini-stat {
+        padding: 12px 13px;
+        border-radius: 12px;
+        background: rgba(255,255,255,.92);
+        border: 1px solid #E2E8F0;
+    }
+
+    .mini-stat-label {
+        color: #64748B;
+        font-size: .60rem;
+        font-weight: 900;
+        text-transform: uppercase;
+        letter-spacing: .65px;
+    }
+
+    .mini-stat-value {
+        color: #0F172A;
+        font-size: 1.12rem;
+        font-weight: 900;
+        margin-top: 5px;
+    }
+
+    .mini-stat-sub {
+        color: #94A3B8;
+        font-size: .61rem;
+        margin-top: 2px;
+    }
+
     /* --------------------------- RESPONSIVE ------------------------------ */
     @media (max-width: 900px) {
         .block-container { padding-left: 1rem; padding-right: 1rem; }
@@ -731,6 +951,106 @@ def kpi_panel(title, kpis):
         for i, kpi in enumerate(active):
             with cols[i]:
                 render_kpi(kpi[0], kpi[1], kpi[2])
+
+
+def pct(value, total):
+    if not total:
+        return 0.0
+    return (value / total) * 100
+
+
+def comparison_delta(current, previous, is_rate=False):
+    if is_rate:
+        delta = current - previous
+        if abs(delta) < 0.05:
+            return "→ 0.0 pp", "flat"
+        return (f"↑ {abs(delta):.1f} pp" if delta > 0 else f"↓ {abs(delta):.1f} pp"), ("up" if delta > 0 else "down")
+
+    delta = current - previous
+    if delta == 0:
+        return "→ 0", "flat"
+    return (f"↑ {abs(delta):,}" if delta > 0 else f"↓ {abs(delta):,}"), ("up" if delta > 0 else "down")
+
+
+def render_comparison_cards(metrics):
+    cards = []
+    for label, current, previous, is_rate, base_text in metrics:
+        value_text = f"{current:.1f}%" if is_rate else f"{int(current):,}"
+        delta_text, direction = comparison_delta(current, previous, is_rate=is_rate)
+        cards.append(
+            f"""
+            <div class="comparison-card">
+                <div class="comparison-label">{escape(label)}</div>
+                <div class="comparison-value">{value_text}</div>
+                <div class="comparison-base">{escape(base_text)}</div>
+                <span class="delta delta-{direction}">{delta_text}</span>
+            </div>
+            """
+        )
+
+    st.html('<div class="comparison-grid">' + ''.join(cards) + '</div>')
+
+
+def stage_snapshot(apps_df, portal_df, welcome_col):
+    total = len(apps_df)
+    quality_approved = len(apps_df[apps_df["Q_Status"] == "Approved"])
+    wc_done = 0
+    if welcome_col and "WC_Clean" in apps_df.columns:
+        wc_done = len(apps_df[apps_df["WC_Clean"] == "Done"])
+    committed = len(portal_df[portal_df["P_Status"] == "Committed"]) if not portal_df.empty else 0
+    live = len(portal_df[portal_df["P_Status"] == "Live"]) if not portal_df.empty else 0
+    return [
+        ("Applications", total, "#3B82F6"),
+        ("QA Approved", quality_approved, "#10B981"),
+        ("WC Done", wc_done, "#06B6D4"),
+        ("Committed", committed, "#F59E0B"),
+        ("Live", live, "#047857"),
+    ]
+
+
+def add_date_strings(frame, source_col, output_col):
+    frame = frame.copy()
+    if source_col in frame.columns:
+        frame[output_col] = pd.to_datetime(frame[source_col], errors="coerce").dt.strftime("%d-%m-%Y").fillna("")
+    return frame
+
+
+def pick_existing(frame, candidates):
+    return [c for c in candidates if c in frame.columns]
+
+
+def summary_for_period(base_apps, base_portal, start_date, end_date, welcome_col):
+    apps = base_apps[(base_apps["Date_Parsed"].dt.date >= start_date) & (base_apps["Date_Parsed"].dt.date <= end_date)].copy()
+    portal = base_portal[(base_portal["Date_Parsed"].dt.date >= start_date) & (base_portal["Date_Parsed"].dt.date <= end_date)].copy()
+
+    if "Quality Status" in apps.columns:
+        apps["Q_Status"] = apps["Quality Status"].apply(map_quality)
+    else:
+        apps["Q_Status"] = "Others"
+
+    if "Status" in portal.columns:
+        portal["P_Status"] = portal["Status"].apply(map_portal)
+    else:
+        portal["P_Status"] = "Others"
+
+    total_apps = len(apps)
+    total_portal = len(portal)
+    approved = len(apps[apps["Q_Status"] == "Approved"])
+
+    wc_done = 0
+    if welcome_col and welcome_col in apps.columns:
+        apps["WC_Clean"] = apps[welcome_col].apply(map_wc)
+        wc_done = len(apps[apps["WC_Clean"] == "Done"])
+
+    live = len(portal[portal["P_Status"] == "Live"])
+    live_denominator = total_portal if total_portal > 0 else total_apps
+
+    return {
+        "apps": total_apps,
+        "approval_rate": pct(approved, total_apps),
+        "wc_done_rate": pct(wc_done, total_apps),
+        "live_rate": pct(live, live_denominator),
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -952,6 +1272,200 @@ try:
         kpi_panel("Welcome call status", group_3)
     with b4:
         kpi_panel("Live status", group_4)
+
+    # ========================================================================
+    # ACTION CENTRE
+    # ========================================================================
+    rework_count = len(ag1_filtered[ag1_filtered["Q_Status"] == "Rework"])
+    wc_followup_count = 0
+    if wc_col and "WC_Clean" in ag1_filtered.columns:
+        wc_followup_count = len(ag1_filtered[ag1_filtered["WC_Clean"].isin(["Pending", "Paperwork"])])
+    committed_count = len(ag2_filtered[ag2_filtered["P_Status"] == "Committed"]) if not ag2_filtered.empty else 0
+
+    st.divider()
+    render_section(
+        "Action centre",
+        "⚡",
+        "The three areas with the clearest next-step actions in the selected period",
+    )
+
+    action_items = [
+        ("Quality rework", rework_count, "▣", "#FFF7ED", "#C2410C", "Review the Quality Remarks and address applications returned for rework."),
+        ("Welcome call follow-up", wc_followup_count, "☎", "#EFF6FF", "#1D4ED8", "Pending + paperwork records that may need a welcome-call follow-up."),
+        ("Committed pipeline", committed_count, "↗", "#ECFDF5", "#047857", "Applications currently at Committed status and not yet shown as Live."),
+    ]
+
+    action_html = []
+    for title, count, icon, bg, fg, copy in action_items:
+        action_html.append(
+            f"""
+            <div class="action-card">
+                <div class="action-top">
+                    <div class="action-icon" style="background:{bg};color:{fg};">{icon}</div>
+                    <div class="action-label">{escape(title)}</div>
+                </div>
+                <div class="action-count">{count:,}</div>
+                <div class="action-copy">{escape(copy)}</div>
+            </div>
+            """
+        )
+    st.html('<div class="action-wrap">' + ''.join(action_html) + '</div>')
+
+    with st.expander("Open the action queues", expanded=False):
+        aq1, aq2, aq3 = st.tabs(["Quality rework", "Welcome follow-up", "Committed pipeline"])
+
+        with aq1:
+            rework_df = ag1_filtered[ag1_filtered["Q_Status"] == "Rework"].copy()
+            if not rework_df.empty:
+                rework_df = add_date_strings(rework_df, "Standardized_Date", "Sale Date")
+                cols = pick_existing(rework_df, ["S.No.", "Sale Date", "Customer Name", "CLI", "Quality Remarks"])
+                if "S.No." not in cols:
+                    rework_df["S.No."] = range(1, len(rework_df) + 1)
+                    cols = ["S.No."] + [c for c in cols if c != "S.No."]
+                st.dataframe(rework_df[cols], use_container_width=True, hide_index=True, height=260)
+            else:
+                st.success("No Quality Rework applications in the selected period.")
+
+        with aq2:
+            if wc_col:
+                wc_follow_df = ag1_filtered[ag1_filtered["WC_Clean"].isin(["Pending", "Paperwork"])].copy()
+                if not wc_follow_df.empty:
+                    wc_follow_df = add_date_strings(wc_follow_df, "Standardized_Date", "Sale Date")
+                    cols = pick_existing(wc_follow_df, ["Sale Date", "Customer Name", "CLI", wc_col, "Welcome call Remarks"])
+                    st.dataframe(wc_follow_df[cols], use_container_width=True, hide_index=True, height=260)
+                else:
+                    st.success("No Pending/Paperwork Welcome Calls in the selected period.")
+            else:
+                st.info("Welcome Call status is not available in the current source data.")
+
+        with aq3:
+            committed_df = ag2_filtered[ag2_filtered["P_Status"] == "Committed"].copy()
+            if not committed_df.empty:
+                committed_df = add_date_strings(committed_df, "Sale Date", "Sale Date")
+                committed_df = add_date_strings(committed_df, "Committed Date", "Committed Date")
+                cols = pick_existing(
+                    committed_df,
+                    ["Sale Date", "Customer Name", "Telephone No.", "Committed Date", "Comments", "Voice of Customer", "Cancellation Reason"],
+                )
+                if not cols:
+                    cols = pick_existing(committed_df, ["Telephone No.", "Comments"])
+                st.dataframe(committed_df[cols], use_container_width=True, hide_index=True, height=260)
+            else:
+                st.success("No currently Committed applications in the selected period.")
+
+    # ========================================================================
+    # CONVERSION SNAPSHOT + PERIOD MOMENTUM
+    # ========================================================================
+    st.divider()
+    funnel_col, compare_col = st.columns([1.05, 1.95], gap="large")
+
+    with funnel_col:
+        render_section("Pipeline snapshot", "◎", "Each stage shown as a percentage of applications in the selected period")
+        stages = stage_snapshot(ag1_filtered, ag2_filtered, wc_col)
+        total_for_funnel = max(total_apps, 1)
+        funnel_rows = []
+        for name, count, color in stages:
+            width = min(max(pct(count, total_for_funnel), 0), 100)
+            funnel_rows.append(
+                f"""
+                <div class="funnel-row">
+                    <div class="funnel-name">{escape(name)}</div>
+                    <div class="funnel-track">
+                        <div class="funnel-fill" style="width:{width:.1f}%;background:{color};"></div>
+                    </div>
+                    <div class="funnel-value">{count:,} · {width:.1f}%</div>
+                </div>
+                """
+            )
+        st.html(
+            '<div class="funnel-shell">'
+            '<div class="funnel-note">'
+            'This is a selected-period stage snapshot rather than a strict cohort conversion calculation, '
+            'so each stage is independently shown against Applications.'
+            '</div>'
+            + ''.join(funnel_rows)
+            + '</div>'
+        )
+
+    with compare_col:
+        period_days = (end_date - start_date).days + 1
+        prev_start = start_date - datetime.timedelta(days=period_days)
+        prev_end = start_date - datetime.timedelta(days=1)
+
+        current_summary = {
+            "apps": total_apps,
+            "approval_rate": pct(len(ag1_filtered[ag1_filtered["Q_Status"] == "Approved"]), total_apps),
+            "wc_done_rate": pct(len(ag1_filtered[ag1_filtered["WC_Clean"] == "Done"]) if wc_col and "WC_Clean" in ag1_filtered.columns else 0, total_apps),
+            "live_rate": pct(len(ag2_filtered[ag2_filtered["P_Status"] == "Live"]), total_ag2 if total_ag2 > 0 else total_apps),
+        }
+        previous_summary = summary_for_period(ag1, ag2, prev_start, prev_end, wc_col)
+
+        render_section(
+            "Period momentum",
+            "Δ",
+            f"Selected period versus the immediately preceding {period_days}-day period ({prev_start.strftime('%d %b')} – {prev_end.strftime('%d %b')})",
+        )
+
+        if previous_summary["apps"] == 0 and current_summary["apps"] == 0:
+            st.info("There is no application activity in the selected or comparison period.")
+        else:
+            render_comparison_cards(
+                [
+                    ("Applications", current_summary["apps"], previous_summary["apps"], False, f"Previous: {previous_summary['apps']:,}"),
+                    ("QA approval", current_summary["approval_rate"], previous_summary["approval_rate"], True, f"Previous: {previous_summary['approval_rate']:.1f}%"),
+                    ("WC completion", current_summary["wc_done_rate"], previous_summary["wc_done_rate"], True, f"Previous: {previous_summary['wc_done_rate']:.1f}%"),
+                    ("Live rate", current_summary["live_rate"], previous_summary["live_rate"], True, f"Previous: {previous_summary['live_rate']:.1f}%"),
+                ]
+            )
+
+    # ========================================================================
+    # ACTIVITY CONSISTENCY
+    # ========================================================================
+    st.divider()
+    render_section("Activity consistency", "◷", "A simple view of how consistently applications were generated across working days")
+
+    def portal_is_holiday(dt):
+        wd = dt.weekday()
+        if wd == 6:
+            return True
+        if wd == 5:
+            week_num = (dt.day - 1) // 7 + 1
+            return week_num in [1, 3, 5]
+        return False
+
+    range_dates = [start_date + datetime.timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+    working_days = [d for d in range_dates if not portal_is_holiday(d)]
+    daily_activity = ag1_filtered.groupby(ag1_filtered["Date_Parsed"].dt.date).size() if not ag1_filtered.empty else pd.Series(dtype="int64")
+    active_days = sum(1 for d in working_days if daily_activity.get(d, 0) > 0)
+    zero_sales_days = sum(1 for d in working_days if daily_activity.get(d, 0) == 0)
+    best_day_text = "—"
+    best_day_count = 0
+    if not daily_activity.empty:
+        best_day = daily_activity.idxmax()
+        best_day_count = int(daily_activity.max())
+        best_day_text = pd.Timestamp(best_day).strftime("%d %b")
+    avg_active_day = (total_apps / active_days) if active_days > 0 else 0
+
+    activity_cards = [
+        ("Working days", len(working_days), "in selected range"),
+        ("Active days", active_days, f"of {len(working_days)} working days"),
+        ("Avg apps / active day", f"{avg_active_day:.1f}", "applications"),
+        ("Best sales day", best_day_text, f"{best_day_count:,} applications" if best_day_count else "no activity"),
+    ]
+    activity_html = []
+    for label, value, sub in activity_cards:
+        activity_html.append(
+            f"""
+            <div class="mini-stat">
+                <div class="mini-stat-label">{escape(str(label))}</div>
+                <div class="mini-stat-value">{escape(str(value))}</div>
+                <div class="mini-stat-sub">{escape(str(sub))}</div>
+            </div>
+            """
+        )
+    st.html('<div class="mini-stat-grid">' + ''.join(activity_html) + '</div>')
+    if len(working_days) > 0 and zero_sales_days > 0:
+        st.caption(f"There were {zero_sales_days} working day(s) with no applications in the selected period.")
 
     # ------------------------------------------------------------------------
     # INSIGHT FLAGS
@@ -1399,6 +1913,36 @@ try:
                 [5, 10, 20, 50, 100, "All"],
                 index=2,
                 key="log_row_limit",
+            )
+
+        # Export the currently filtered application log without changing the table behaviour.
+        export_valid_layout = [item for item in columns_layout if item[1] in recent_log.columns]
+        export_cols = [item[1] for item in export_valid_layout]
+        export_df = recent_log[export_cols].copy() if export_cols else recent_log.copy()
+        export_csv = export_df.to_csv(index=False).encode("utf-8-sig")
+        excel_buffer = BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+            export_df.to_excel(writer, index=False, sheet_name="Applications")
+        excel_buffer.seek(0)
+
+        export_col1, export_col2 = st.columns([1, 1])
+        with export_col1:
+            st.download_button(
+                "↓ CSV",
+                data=export_csv,
+                file_name=f"{agent}_applications.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="export_log_csv",
+            )
+        with export_col2:
+            st.download_button(
+                "↓ Excel",
+                data=excel_buffer.getvalue(),
+                file_name=f"{agent}_applications.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="export_log_excel",
             )
 
         recent_log["S.No."] = range(1, len(recent_log) + 1)
