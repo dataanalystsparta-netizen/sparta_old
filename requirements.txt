@@ -11,3 +11,4 @@ xlsxwriter
 fpdf
 folium
 streamlit_folium
+openpyxl
