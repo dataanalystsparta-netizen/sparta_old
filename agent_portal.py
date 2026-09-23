@@ -2084,6 +2084,14 @@ try:
                 key="log_row_limit",
             )
 
+        # Full-record search for the application log.
+        # This must be defined before the filtering logic below.
+        log_search = st.text_input(
+            "Search applications",
+            placeholder="Search customer, phone, quality remark, WC remark, cancellation reason…",
+            key="log_search",
+        )
+
         # --------------------------------------------------------------------
         # ADVANCED HIERARCHICAL STATUS FILTERS
         # --------------------------------------------------------------------
