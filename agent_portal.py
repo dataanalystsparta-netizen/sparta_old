@@ -825,6 +825,41 @@ st.html(
         margin: 10px 0;
     }
 
+    .change-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px;
+    }
+
+    .change-card {
+        padding: 9px 10px;
+        border-radius: 11px;
+        background: rgba(248,250,252,.88);
+        border: 1px solid #E5EBF3;
+    }
+
+    .change-label {
+        color: #64748B;
+        font-size: .58rem;
+        font-weight: 900;
+        text-transform: uppercase;
+        letter-spacing: .65px;
+    }
+
+    .change-value {
+        color: #0F172A;
+        font-size: .86rem;
+        font-weight: 900;
+        margin-top: 4px;
+    }
+
+    .change-sub {
+        color: #94A3B8;
+        font-size: .57rem;
+        line-height: 1.3;
+        margin-top: 2px;
+    }
+
     /* --------------------------- RESPONSIVE ------------------------------ */
     @media (max-width: 900px) {
         .block-container { padding-left: 1rem; padding-right: 1rem; }
@@ -1091,6 +1126,21 @@ def pick_existing(frame, candidates):
     return [c for c in candidates if c in frame.columns]
 
 
+def get_preset_dates(preset, today):
+    if preset == "Today":
+        return today, today
+    if preset == "This Week":
+        start = today - datetime.timedelta(days=today.weekday())
+        return start, today
+    if preset == "This Month":
+        return today.replace(day=1), today
+    if preset == "Last Month":
+        first_this = today.replace(day=1)
+        last_prev = first_this - datetime.timedelta(days=1)
+        return last_prev.replace(day=1), last_prev
+    return st.session_state.get("main_start_date", today.replace(day=1)), st.session_state.get("main_end_date", today)
+
+
 def summary_for_period(base_apps, base_portal, start_date, end_date, welcome_col):
     apps = base_apps[(base_apps["Date_Parsed"].dt.date >= start_date) & (base_apps["Date_Parsed"].dt.date <= end_date)].copy()
     portal = base_portal[(base_portal["Date_Parsed"].dt.date >= start_date) & (base_portal["Date_Parsed"].dt.date <= end_date)].copy()
@@ -1244,32 +1294,56 @@ try:
         )
 
     # ------------------------------------------------------------------------
-    # GLOBAL DATE FILTER
+    # GLOBAL DATE FILTER + QUICK PRESETS
     # ------------------------------------------------------------------------
-    with st.container(border=True):
-        filter_icon, date_col1, date_col2, spacer = st.columns([0.42, 1.2, 1.2, 2.1])
+    if "main_start_date" not in st.session_state:
+        st.session_state.main_start_date = today_date.replace(day=1)
+    if "main_end_date" not in st.session_state:
+        st.session_state.main_end_date = today_date
+    if "date_preset" not in st.session_state:
+        st.session_state.date_preset = "This Month"
 
-        with filter_icon:
+    def apply_date_preset():
+        preset = st.session_state.date_preset
+        if preset != "Custom":
+            preset_start, preset_end = get_preset_dates(preset, today_date)
+            st.session_state.main_start_date = preset_start
+            st.session_state.main_end_date = preset_end
+
+    with st.container(border=True):
+        top_filter_col, preset_col, start_col, end_col = st.columns([0.55, 2.25, 1.25, 1.25], gap="small")
+
+        with top_filter_col:
             st.markdown("### 🗓️")
 
-        with date_col1:
+        with preset_col:
+            st.caption("QUICK RANGE")
+            st.radio(
+                "Quick Range",
+                ["This Month", "Today", "This Week", "Last Month", "Custom"],
+                horizontal=True,
+                key="date_preset",
+                on_change=apply_date_preset,
+                label_visibility="collapsed",
+            )
+
+        with start_col:
             st.caption("START DATE")
             start_date = st.date_input(
                 "Start Date",
-                today_date.replace(day=1),
-                label_visibility="collapsed",
                 key="main_start_date",
+                disabled=st.session_state.date_preset != "Custom",
+                label_visibility="collapsed",
             )
 
-        with date_col2:
+        with end_col:
             st.caption("END DATE")
             end_date = st.date_input(
                 "End Date",
-                today_date,
-                label_visibility="collapsed",
                 key="main_end_date",
+                disabled=st.session_state.date_preset != "Custom",
+                label_visibility="collapsed",
             )
-
 
     # Protect against a reversed user-selected range without altering the source data.
     if start_date > end_date:
@@ -1581,6 +1655,40 @@ try:
             )
         st.html('<div class="mini-stat-grid">' + ''.join(activity_html) + '</div>')
 
+        def change_card(label, current, previous, is_rate=False):
+            if is_rate:
+                delta = current - previous
+                value = f"{delta:+.1f} pp"
+                sub = f"{current:.1f}% now · {previous:.1f}% previous"
+            else:
+                delta = current - previous
+                value = f"{delta:+,}"
+                sub = f"{current:,} now · {previous:,} previous"
+
+            if delta > 0:
+                value_prefix = "↑ " + value.lstrip("+")
+            elif delta < 0:
+                value_prefix = "↓ " + value.lstrip("+")
+            else:
+                value_prefix = "→ 0.0 pp" if is_rate else "→ 0"
+
+            return (
+                f'<div class="change-card">'
+                f'<div class="change-label">{escape(label)}</div>'
+                f'<div class="change-value">{escape(value_prefix)}</div>'
+                f'<div class="change-sub">{escape(sub)}</div>'
+                f'</div>'
+            )
+
+        change_html = [
+            change_card("Applications", current_summary["apps"], previous_summary["apps"], False),
+            change_card("QA approval", current_summary["approval_rate"], previous_summary["approval_rate"], True),
+            change_card("WC completion", current_summary["wc_done_rate"], previous_summary["wc_done_rate"], True),
+            change_card("Live rate", current_summary["live_rate"], previous_summary["live_rate"], True),
+        ]
+        st.html('<div class="pulse-separator"></div><div class="pulse-subtitle"><span></span>What changed?</div>')
+        st.html('<div class="change-grid">' + ''.join(change_html) + '</div>')
+
         if len(working_days) > 0 and zero_sales_days > 0:
             st.caption(f"{zero_sales_days} working day(s) had no applications in the selected period.")
 
@@ -1811,7 +1919,7 @@ try:
             st.info("No application data for the selected date range.")
 
     with col_cal:
-        render_section("Sales activity calendar", "▦", "Daily sales activity with working-day / holiday context")
+        render_section("Sales activity heatmap", "▦", "Daily application intensity — darker cells mean more sales")
 
         def is_holiday(dt):
             wd = dt.weekday()  # 0=Mon, 6=Sun
@@ -1827,14 +1935,19 @@ try:
             sel_month = st.selectbox(
                 "Month",
                 list(calendar.month_name)[1:],
-                index=today_date.month - 1,
+                index=start_date.month - 1,
                 key="calendar_month",
             )
         with c_year_col:
+            year_options = list(range(max(2025, start_date.year - 2), max(2025, today_date.year) + 1))
+            if start_date.year not in year_options:
+                year_options.append(start_date.year)
+                year_options = sorted(set(year_options))
+            default_year_index = year_options.index(start_date.year) if start_date.year in year_options else len(year_options) - 1
             sel_year = st.selectbox(
                 "Year",
-                [2025, 2026],
-                index=1,
+                year_options,
+                index=default_year_index,
                 key="calendar_year",
             )
 
@@ -1843,6 +1956,7 @@ try:
         dates = [datetime.date(sel_year, m_idx, day) for day in range(1, num_days + 1)]
 
         daily_sales = ag1.groupby(ag1["Date_Parsed"].dt.date).size()
+        calendar_max = int(daily_sales.max()) if not daily_sales.empty else 0
         cal_df = pd.DataFrame(
             {
                 "Date": dates,
@@ -1870,7 +1984,9 @@ try:
                 hovertemplate="%{customdata}<extra></extra>",
                 texttemplate="%{text}",
                 textfont=dict(color="#334155", size=11),
-                colorscale=[[0, "#F8FAFC"], [0.1, "#D1FAE5"], [1, "#047857"]],
+                zmin=0,
+                zmax=max(calendar_max, 1),
+                colorscale=[[0, "#F8FAFC"], [0.15, "#E6F7EE"], [0.50, "#86EFAC"], [1, "#047857"]],
                 showscale=False,
                 xgap=3,
                 ygap=3,
@@ -1914,7 +2030,10 @@ try:
             ),
         )
         st.plotly_chart(fig_cal, use_container_width=True, config={"displayModeBar": False})
-        st.caption("🟢 Sales activity  •  ◻ No sales  •  🔵 Holiday")
+        st.caption(
+            f"Showing {calendar.month_name[m_idx]} {sel_year} · peak day: {calendar_max:,} application(s) · "
+            "working day intensity  •  🔵 non-working / holiday"
+        )
 
     # ------------------------------------------------------------------------
     # RECENT APPLICATIONS LOG
@@ -1976,8 +2095,10 @@ try:
             ("Live Status", "Cancellation Reason"),
         ]
 
-        # Custom log controls preserved from the original portal.
-        log_col1, log_col2, log_col3 = st.columns([2.15, 2.45, 1])
+        # Smarter log controls: preserve the original date/month filters while adding
+        # compact status pills and full-record search.
+        log_col1, log_col2, log_col3 = st.columns([2.0, 2.55, 1.0], gap="small")
+
         with log_col1:
             log_filter_type = st.radio(
                 "Log View Filter:",
@@ -2031,6 +2152,70 @@ try:
                 index=2,
                 key="log_row_limit",
             )
+
+        status_col, search_col = st.columns([1.75, 1.25], gap="small")
+        with status_col:
+            log_status_filter = st.radio(
+                "Status filter",
+                ["All", "Cancelled", "Pending", "QA Approved", "WC Done", "Live"],
+                horizontal=True,
+                key="log_status_filter",
+                label_visibility="collapsed",
+            )
+        with search_col:
+            log_search = st.text_input(
+                "Search applications",
+                placeholder="Search customer, CLI, remarks, status...",
+                key="log_search",
+                label_visibility="collapsed",
+            )
+
+        # Apply compact status-pill filters. These are descriptive record filters,
+        # not new business rules: each pill maps directly to an existing status field.
+        if log_status_filter != "All":
+            q_series = merged_log.get("Quality Status", pd.Series("", index=merged_log.index)).fillna("").astype(str).str.lower()
+            wc_series = merged_log.get("Status", pd.Series("", index=merged_log.index)).fillna("").astype(str).str.lower()
+            p_series = merged_log.get("Portal Status", pd.Series("", index=merged_log.index)).fillna("").astype(str).str.lower()
+
+            if log_status_filter == "Cancelled":
+                mask = (q_series.str.contains("can|cancel", regex=True, na=False) |
+                        wc_series.str.contains("can|cancel", regex=True, na=False) |
+                        p_series.str.contains("can|cancel", regex=True, na=False))
+            elif log_status_filter == "Pending":
+                mask = (wc_series.str.contains("pend|pnd|paper|ppw", regex=True, na=False) |
+                        p_series.str.contains("pend|pnd", regex=True, na=False))
+            elif log_status_filter == "QA Approved":
+                mask = q_series.str.contains("appr|pass", regex=True, na=False)
+            elif log_status_filter == "WC Done":
+                mask = wc_series.str.contains("done|pass|comp", regex=True, na=False)
+            else:  # Live
+                mask = p_series.str.contains("live", regex=True, na=False)
+
+            recent_log = recent_log.loc[mask.loc[recent_log.index]]
+
+        if log_search.strip():
+            searchable_cols = pick_existing(
+                recent_log,
+                [
+                    "Customer Name", "CLI", "Quality Status", "Quality Remarks",
+                    "Status", "Welcome call Remarks", "LetterStatus", "CallStatus",
+                    "Portal Status", "Comments", "Voice of Customer", "Cancellation Reason",
+                ],
+            )
+            if searchable_cols:
+                search_blob = recent_log[searchable_cols].fillna("").astype(str).agg(" | ".join, axis=1)
+                recent_log = recent_log[search_blob.str.contains(log_search.strip(), case=False, regex=False, na=False)]
+
+        # Always sort after applying the filters so the newest matching records remain first.
+        recent_log = recent_log.sort_values(by="Date_Parsed", ascending=False)
+
+        filter_summary = []
+        if log_status_filter != "All":
+            filter_summary.append(log_status_filter)
+        if log_search.strip():
+            filter_summary.append(f'Search: "{log_search.strip()}"')
+        if filter_summary:
+            st.caption(" • ".join(filter_summary) + f"  ·  {len(recent_log):,} matching record(s)")
 
         # Export the currently filtered application log without changing the table behaviour.
         export_valid_layout = [item for item in columns_layout if item[1] in recent_log.columns]
