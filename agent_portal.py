@@ -23,7 +23,7 @@ from io import BytesIO
 # - Daily / Monthly breakdowns
 # - Trend chart
 # - Sales activity calendar
-# - Recent applications log with filters + pagination
+# - Recent applications log with hierarchical filters + pagination
 # - Existing disposition / performance tips
 # ============================================================================
 
@@ -825,41 +825,6 @@ st.html(
         margin: 10px 0;
     }
 
-    .change-grid {
-        display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 8px;
-    }
-
-    .change-card {
-        padding: 9px 10px;
-        border-radius: 11px;
-        background: rgba(248,250,252,.88);
-        border: 1px solid #E5EBF3;
-    }
-
-    .change-label {
-        color: #64748B;
-        font-size: .58rem;
-        font-weight: 900;
-        text-transform: uppercase;
-        letter-spacing: .65px;
-    }
-
-    .change-value {
-        color: #0F172A;
-        font-size: .86rem;
-        font-weight: 900;
-        margin-top: 4px;
-    }
-
-    .change-sub {
-        color: #94A3B8;
-        font-size: .57rem;
-        line-height: 1.3;
-        margin-top: 2px;
-    }
-
     /* --------------------------- RESPONSIVE ------------------------------ */
     @media (max-width: 900px) {
         .block-container { padding-left: 1rem; padding-right: 1rem; }
@@ -1655,40 +1620,6 @@ try:
             )
         st.html('<div class="mini-stat-grid">' + ''.join(activity_html) + '</div>')
 
-        def change_card(label, current, previous, is_rate=False):
-            if is_rate:
-                delta = current - previous
-                value = f"{delta:+.1f} pp"
-                sub = f"{current:.1f}% now · {previous:.1f}% previous"
-            else:
-                delta = current - previous
-                value = f"{delta:+,}"
-                sub = f"{current:,} now · {previous:,} previous"
-
-            if delta > 0:
-                value_prefix = "↑ " + value.lstrip("+")
-            elif delta < 0:
-                value_prefix = "↓ " + value.lstrip("+")
-            else:
-                value_prefix = "→ 0.0 pp" if is_rate else "→ 0"
-
-            return (
-                f'<div class="change-card">'
-                f'<div class="change-label">{escape(label)}</div>'
-                f'<div class="change-value">{escape(value_prefix)}</div>'
-                f'<div class="change-sub">{escape(sub)}</div>'
-                f'</div>'
-            )
-
-        change_html = [
-            change_card("Applications", current_summary["apps"], previous_summary["apps"], False),
-            change_card("QA approval", current_summary["approval_rate"], previous_summary["approval_rate"], True),
-            change_card("WC completion", current_summary["wc_done_rate"], previous_summary["wc_done_rate"], True),
-            change_card("Live rate", current_summary["live_rate"], previous_summary["live_rate"], True),
-        ]
-        st.html('<div class="pulse-separator"></div><div class="pulse-subtitle"><span></span>What changed?</div>')
-        st.html('<div class="change-grid">' + ''.join(change_html) + '</div>')
-
         if len(working_days) > 0 and zero_sales_days > 0:
             st.caption(f"{zero_sales_days} working day(s) had no applications in the selected period.")
 
@@ -2153,45 +2084,97 @@ try:
                 key="log_row_limit",
             )
 
-        status_col, search_col = st.columns([1.75, 1.25], gap="small")
-        with status_col:
-            log_status_filter = st.radio(
-                "Status filter",
-                ["All", "Cancelled", "Pending", "QA Approved", "WC Done", "Live"],
-                horizontal=True,
-                key="log_status_filter",
-                label_visibility="collapsed",
+        # --------------------------------------------------------------------
+        # ADVANCED HIERARCHICAL STATUS FILTERS
+        # --------------------------------------------------------------------
+        # Within one stage, checked statuses are combined with OR.
+        # Across selected stages, filters are combined with AND.
+        # Example: Quality > Approved + Welcome Call > Done returns records
+        # that are both QA Approved AND Welcome Call Done.
+        log_filter_source = merged_log.copy()
+        log_filter_source["Q_Filter_Status"] = log_filter_source.get(
+            "Quality Status", pd.Series("", index=log_filter_source.index)
+        ).apply(map_quality)
+
+        wc_filter_source_col = wc_col if wc_col and wc_col in log_filter_source.columns else (
+            "Status" if "Status" in log_filter_source.columns else None
+        )
+        if wc_filter_source_col:
+            log_filter_source["WC_Filter_Status"] = log_filter_source[wc_filter_source_col].apply(map_wc)
+        else:
+            log_filter_source["WC_Filter_Status"] = "Others"
+
+        log_filter_source["P_Filter_Status"] = log_filter_source.get(
+            "Portal Status", pd.Series("", index=log_filter_source.index)
+        ).apply(map_portal)
+
+        quality_options = ["Approved", "Cancelled", "Rework", "Rejected", "Others"]
+        welcome_options = ["Done", "Pending", "Paperwork", "Cancelled", "Others"]
+        live_options = ["Live", "Committed", "Cancelled", "Others"]
+
+        with st.expander("☷  Advanced status filters", expanded=False):
+            st.caption(
+                "Select one or more statuses at each level. Multiple selections within a level are OR; "
+                "selected levels are AND. Leave every box unticked to show all applications."
             )
-        with search_col:
-            log_search = st.text_input(
-                "Search applications",
-                placeholder="Search customer, CLI, remarks, status...",
-                key="log_search",
-                label_visibility="collapsed",
-            )
 
-        # Apply compact status-pill filters. These are descriptive record filters,
-        # not new business rules: each pill maps directly to an existing status field.
-        if log_status_filter != "All":
-            q_series = merged_log.get("Quality Status", pd.Series("", index=merged_log.index)).fillna("").astype(str).str.lower()
-            wc_series = merged_log.get("Status", pd.Series("", index=merged_log.index)).fillna("").astype(str).str.lower()
-            p_series = merged_log.get("Portal Status", pd.Series("", index=merged_log.index)).fillna("").astype(str).str.lower()
+            filter_header_cols = st.columns(3)
+            selected_quality = []
+            selected_wc = []
+            selected_live = []
 
-            if log_status_filter == "Cancelled":
-                mask = (q_series.str.contains("can|cancel", regex=True, na=False) |
-                        wc_series.str.contains("can|cancel", regex=True, na=False) |
-                        p_series.str.contains("can|cancel", regex=True, na=False))
-            elif log_status_filter == "Pending":
-                mask = (wc_series.str.contains("pend|pnd|paper|ppw", regex=True, na=False) |
-                        p_series.str.contains("pend|pnd", regex=True, na=False))
-            elif log_status_filter == "QA Approved":
-                mask = q_series.str.contains("appr|pass", regex=True, na=False)
-            elif log_status_filter == "WC Done":
-                mask = wc_series.str.contains("done|pass|comp", regex=True, na=False)
-            else:  # Live
-                mask = p_series.str.contains("live", regex=True, na=False)
+            with filter_header_cols[0]:
+                st.markdown("**01 · Quality Audit**")
+                for status_name in quality_options:
+                    if st.checkbox(
+                        status_name,
+                        key=f"log_q_status_{status_name.lower()}"
+                    ):
+                        selected_quality.append(status_name)
 
-            recent_log = recent_log.loc[mask.loc[recent_log.index]]
+            with filter_header_cols[1]:
+                st.markdown("**02 · Welcome Call**")
+                for status_name in welcome_options:
+                    if st.checkbox(
+                        status_name,
+                        key=f"log_wc_status_{status_name.lower()}"
+                    ):
+                        selected_wc.append(status_name)
+
+            with filter_header_cols[2]:
+                st.markdown("**03 · Live Status**")
+                for status_name in live_options:
+                    if st.checkbox(
+                        status_name,
+                        key=f"log_live_status_{status_name.lower()}"
+                    ):
+                        selected_live.append(status_name)
+
+            if st.button("Clear status filters", key="clear_log_status_filters"):
+                for group_prefix, options in [
+                    ("log_q_status_", quality_options),
+                    ("log_wc_status_", welcome_options),
+                    ("log_live_status_", live_options),
+                ]:
+                    for status_name in options:
+                        st.session_state[f"{group_prefix}{status_name.lower()}"] = False
+                st.rerun()
+
+        # Start from the date/month filtered log produced above.
+        recent_log = recent_log.sort_values(by="Date_Parsed", ascending=False)
+
+        # Apply the hierarchy to the currently visible rows only.
+        if selected_quality or selected_wc or selected_live:
+            stage_mask = pd.Series(True, index=log_filter_source.index)
+
+            if selected_quality:
+                stage_mask &= log_filter_source["Q_Filter_Status"].isin(selected_quality)
+            if selected_wc:
+                stage_mask &= log_filter_source["WC_Filter_Status"].isin(selected_wc)
+            if selected_live:
+                stage_mask &= log_filter_source["P_Filter_Status"].isin(selected_live)
+
+            recent_log = recent_log.loc[stage_mask.loc[recent_log.index]]
 
         if log_search.strip():
             searchable_cols = pick_existing(
@@ -2204,14 +2187,22 @@ try:
             )
             if searchable_cols:
                 search_blob = recent_log[searchable_cols].fillna("").astype(str).agg(" | ".join, axis=1)
-                recent_log = recent_log[search_blob.str.contains(log_search.strip(), case=False, regex=False, na=False)]
+                recent_log = recent_log[
+                    search_blob.str.contains(
+                        log_search.strip(), case=False, regex=False, na=False
+                    )
+                ]
 
         # Always sort after applying the filters so the newest matching records remain first.
         recent_log = recent_log.sort_values(by="Date_Parsed", ascending=False)
 
         filter_summary = []
-        if log_status_filter != "All":
-            filter_summary.append(log_status_filter)
+        if selected_quality:
+            filter_summary.append("QA: " + ", ".join(selected_quality))
+        if selected_wc:
+            filter_summary.append("WC: " + ", ".join(selected_wc))
+        if selected_live:
+            filter_summary.append("Live: " + ", ".join(selected_live))
         if log_search.strip():
             filter_summary.append(f'Search: "{log_search.strip()}"')
         if filter_summary:
