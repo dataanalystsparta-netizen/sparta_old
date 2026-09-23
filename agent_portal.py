@@ -927,11 +927,13 @@ def map_quality(val):
 
 
 def map_portal(val):
-    s = str(val).lower()
+    s = str(val).lower().strip()
     if "live" in s:
         return "Live"
     if "com" in s:
         return "Committed"
+    if any(x in s for x in ["pend", "pnd"]):
+        return "Pending"
     if any(x in s for x in ["can", "rej"]):
         return "Cancelled"
     return "Others"
@@ -941,6 +943,8 @@ def map_wc(val):
     s = str(val).lower().strip()
     if any(x in s for x in ["done", "pass", "comp"]):
         return "Done"
+    if any(x in s for x in ["follow", "f/u", "f u"]):
+        return "Follow up"
     if any(x in s for x in ["pend", "pnd"]):
         return "Pending"
     if any(x in s for x in ["paper", "ppw"]):
@@ -2117,8 +2121,8 @@ try:
         ).apply(map_portal)
 
         quality_options = ["Approved", "Cancelled", "Rework", "Rejected", "Others"]
-        welcome_options = ["Done", "Pending", "Paperwork", "Cancelled", "Others"]
-        live_options = ["Live", "Committed", "Cancelled", "Others"]
+        welcome_options = ["Done", "Follow up", "Pending", "Paperwork", "Cancelled", "Others"]
+        live_options = ["Live", "Committed", "Pending", "Cancelled", "Others"]
 
         with st.expander("☷  Advanced status filters", expanded=False):
             st.caption(
@@ -2126,6 +2130,17 @@ try:
                 "selected levels are AND. Leave every box unticked to show all applications."
             )
 
+            # Reset by rotating the widget-key namespace instead of modifying
+            # instantiated checkbox state. This avoids Streamlit's
+            # `st.session_state.<widget_key>` modification error.
+            if "log_status_filter_version" not in st.session_state:
+                st.session_state.log_status_filter_version = 0
+
+            if st.button("Clear status filters", key="clear_log_status_filters"):
+                st.session_state.log_status_filter_version += 1
+                st.rerun()
+
+            filter_version = st.session_state.log_status_filter_version
             filter_header_cols = st.columns(3)
             selected_quality = []
             selected_wc = []
@@ -2134,39 +2149,23 @@ try:
             with filter_header_cols[0]:
                 st.markdown("**01 · Quality Audit**")
                 for status_name in quality_options:
-                    if st.checkbox(
-                        status_name,
-                        key=f"log_q_status_{status_name.lower()}"
-                    ):
+                    widget_key = f"log_q_status_v{filter_version}_{status_name.lower().replace(' ', '_')}"
+                    if st.checkbox(status_name, key=widget_key):
                         selected_quality.append(status_name)
 
             with filter_header_cols[1]:
                 st.markdown("**02 · Welcome Call**")
                 for status_name in welcome_options:
-                    if st.checkbox(
-                        status_name,
-                        key=f"log_wc_status_{status_name.lower()}"
-                    ):
+                    widget_key = f"log_wc_status_v{filter_version}_{status_name.lower().replace(' ', '_')}"
+                    if st.checkbox(status_name, key=widget_key):
                         selected_wc.append(status_name)
 
             with filter_header_cols[2]:
                 st.markdown("**03 · Live Status**")
                 for status_name in live_options:
-                    if st.checkbox(
-                        status_name,
-                        key=f"log_live_status_{status_name.lower()}"
-                    ):
+                    widget_key = f"log_live_status_v{filter_version}_{status_name.lower().replace(' ', '_')}"
+                    if st.checkbox(status_name, key=widget_key):
                         selected_live.append(status_name)
-
-            if st.button("Clear status filters", key="clear_log_status_filters"):
-                for group_prefix, options in [
-                    ("log_q_status_", quality_options),
-                    ("log_wc_status_", welcome_options),
-                    ("log_live_status_", live_options),
-                ]:
-                    for status_name in options:
-                        st.session_state[f"{group_prefix}{status_name.lower()}"] = False
-                st.rerun()
 
         # Start from the date/month filtered log produced above.
         recent_log = recent_log.sort_values(by="Date_Parsed", ascending=False)
