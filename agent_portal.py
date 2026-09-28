@@ -1362,6 +1362,8 @@ def normalize_api_records(api_df):
     portal["Telephone No."] = api["Phone Number"]
     portal["Status"] = api["Committed (Live) Status (Onboarding Status)"].fillna("").astype(str).str.strip()
     portal["LetterStatus"] = api["LetterStatus (Dispatch Status)"].fillna("").astype(str).str.strip()
+    portal["Provisioning Status"] = api["Provisioning Status"].fillna("").astype(str).str.strip()
+    portal["Provisioning Remarks"] = api["Provisioning Remarks (Provisioning Comments)"].apply(clean_reason_text)
     portal["CallStatus"] = api["Confirmation Status"].fillna("").astype(str).str.strip()
     portal["Comments"] = api["Confirmation Comment"].apply(clean_reason_text)
     portal["Voice of Customer"] = ""
@@ -2584,6 +2586,8 @@ try:
                     "_RecordKey",
                     "Telephone No.",
                     "LetterStatus",
+                    "Provisioning Status",
+                    "Provisioning Remarks",
                     "CallStatus",
                     "Comments",
                     "Voice of Customer",
@@ -2616,6 +2620,8 @@ try:
             ("Welcome Call", "Status"),
             ("Welcome Call", "Welcome call Remarks"),
             ("Live Status", "LetterStatus"),
+            ("Live Status", "Provisioning Status"),
+            ("Live Status", "Provisioning Remarks"),
             ("Live Status", "CallStatus"),
             ("Live Status", "Portal Status"),
             ("Live Status", "Live Date"),
