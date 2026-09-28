@@ -20,7 +20,7 @@ import os
 # - Agent access-key authentication
 # - Login logging to Google Sheets / Logs
 # - Existing Sparta + Sparta2 Google Sheet historical data
-# - CRM API used only for records not already present in Google Sheets
+# - CRM data mirrored into Google Sheets by a separate 5-minute sync job
 # - 5-minute data cache
 # - Start/end date filtering
 # - Quality / Welcome Call / Live KPIs
@@ -846,15 +846,21 @@ st.html(
 # ----------------------------------------------------------------------------
 LOGO_URL = "https://raw.githubusercontent.com/dataanalystsparta-netizen/logos/refs/heads/main/sparta-telecom-squarelogo-1663578233108%20(1).jpg"
 SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ")
+CRM_MIRROR_SHEET_URL = st.secrets.get(
+    "CRM_MIRROR_SHEET_URL",
+    "https://docs.google.com/spreadsheets/d/1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ/edit?gid=1647226826#gid=1647226826",
+)
+CRM_MIRROR_WORKSHEET_GID = int(st.secrets.get("CRM_MIRROR_WORKSHEET_GID", "1647226826"))
 
 # Existing authentication remains unchanged.
 ACCESS_KEYS = st.secrets["agent_keys"]
 
 # ---------------------------------------------------------------------------
 # HYBRID DATA-SOURCE CONFIGURATION
-# Google Sheets remains the historical/legacy source. The API is only used to
-# add records that do not already exist in either Google Sheet, using the
-# agreed primary key: Sale Date + Phone Number.
+# Google Sheets remains the historical/legacy source. A dedicated CRM mirror
+# worksheet supplies new CRM records, using Sale Date + Phone Number for
+# reconciliation. The direct API functions below are retained for reference
+# but are no longer called by the portal.
 # ---------------------------------------------------------------------------
 SPARTA_API_URL = st.secrets.get(
     "SPARTA_API_URL",
@@ -902,6 +908,7 @@ def resolve_api_secret():
 
 
 SPARTA_API_TOKEN = resolve_api_secret()
+SPARTA_API_AUTH_MODE = str(st.secrets.get("SPARTA_API_AUTH_MODE", "auto")).strip().lower()
 SPARTA_API_TIMEOUT = int(st.secrets.get("SPARTA_API_TIMEOUT_SECONDS", 60))
 SPARTA_API_MAX_RETRIES = int(st.secrets.get("SPARTA_API_MAX_RETRIES", 3))
 DATA_CACHE_TTL = int(st.secrets.get("DATA_CACHE_TTL_SECONDS", 300))
@@ -1178,44 +1185,120 @@ def combine_api_cancellation_reasons(row):
 
 
 def fetch_api_excel():
-    """Fetch the CRM Excel export. API failures never block the legacy source."""
+    """Fetch the CRM Excel export.
+
+    The CRM endpoint is known to return an XLSX file.  In practice the API may
+    be configured with a Bearer token, X-API-Key, or a raw Authorization token,
+    so ``SPARTA_API_AUTH_MODE = "auto"`` tries those common formats only when
+    the previous format is rejected with HTTP 401/403.
+    """
     if not SPARTA_API_TOKEN:
         return pd.DataFrame(), "API not configured", 0, "API token missing"
 
-    headers = {
-        "Authorization": f"Bearer {SPARTA_API_TOKEN}",
+    base_headers = {
         "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream, */*",
+        "User-Agent": "Sparta-Agent-Portal/1.0",
     }
 
+    auth_mode = SPARTA_API_AUTH_MODE
+    if auth_mode == "auto":
+        auth_variants = [
+            ("bearer", {"Authorization": f"Bearer {SPARTA_API_TOKEN}"}),
+            ("x-api-key", {"X-API-Key": SPARTA_API_TOKEN}),
+            ("authorization-token", {"Authorization": SPARTA_API_TOKEN}),
+            ("authorization-token-prefix", {"Authorization": f"Token {SPARTA_API_TOKEN}"}),
+        ]
+    elif auth_mode in {"bearer", "x-api-key", "authorization-token", "authorization-token-prefix"}:
+        auth_variants = []
+        if auth_mode == "bearer":
+            auth_variants.append((auth_mode, {"Authorization": f"Bearer {SPARTA_API_TOKEN}"}))
+        elif auth_mode == "x-api-key":
+            auth_variants.append((auth_mode, {"X-API-Key": SPARTA_API_TOKEN}))
+        elif auth_mode == "authorization-token":
+            auth_variants.append((auth_mode, {"Authorization": SPARTA_API_TOKEN}))
+        else:
+            auth_variants.append((auth_mode, {"Authorization": f"Token {SPARTA_API_TOKEN}"}))
+    else:
+        return (
+            pd.DataFrame(),
+            "API unavailable",
+            0,
+            f"Invalid SPARTA_API_AUTH_MODE: {SPARTA_API_AUTH_MODE}",
+        )
+
     last_error = None
-    for attempt in range(1, SPARTA_API_MAX_RETRIES + 2):
-        try:
-            response = requests.get(
-                SPARTA_API_URL,
-                headers=headers,
-                timeout=SPARTA_API_TIMEOUT,
-            )
-            response.raise_for_status()
+    last_status = None
 
-            if not response.content:
-                raise ValueError("API returned an empty response body.")
+    for auth_name, auth_headers in auth_variants:
+        headers = {**base_headers, **auth_headers}
 
-            api_df = pd.read_excel(BytesIO(response.content), engine="openpyxl")
-            api_df.columns = [str(c).replace("\ufeff", "").strip() for c in api_df.columns]
-
-            missing = [c for c in API_REQUIRED_COLUMNS if c not in api_df.columns]
-            if missing:
-                raise ValueError(
-                    "API Excel is missing required columns: " + ", ".join(missing)
+        for attempt in range(1, SPARTA_API_MAX_RETRIES + 2):
+            try:
+                response = requests.get(
+                    SPARTA_API_URL,
+                    headers=headers,
+                    timeout=SPARTA_API_TIMEOUT,
                 )
 
-            fetched_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            return api_df, fetched_at, len(api_df), ""
+                last_status = response.status_code
 
-        except Exception as exc:
-            last_error = str(exc)
-            if attempt <= SPARTA_API_MAX_RETRIES:
-                time.sleep(min(2 ** (attempt - 1), 6))
+                if response.status_code in (401, 403) and auth_mode == "auto":
+                    body = (response.text or "").strip().replace("\\n", " ")
+                    last_error = (
+                        f"HTTP {response.status_code} using {auth_name}"
+                        + (f": {body[:250]}" if body else "")
+                    )
+                    break
+
+                response.raise_for_status()
+
+                if not response.content:
+                    raise ValueError("API returned an empty response body.")
+
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                if "spreadsheet" not in content_type and "excel" not in content_type and not response.content.startswith(b"PK"):
+                    preview = (response.text or "").strip().replace("\\n", " ")[:250]
+                    raise ValueError(
+                        f"API returned unexpected content type '{content_type}'"
+                        + (f": {preview}" if preview else "")
+                    )
+
+                api_df = pd.read_excel(BytesIO(response.content), engine="openpyxl")
+                api_df.columns = [str(c).replace("\\ufeff", "").strip() for c in api_df.columns]
+
+                missing = [c for c in API_REQUIRED_COLUMNS if c not in api_df.columns]
+                if missing:
+                    raise ValueError(
+                        "API Excel is missing required columns: " + ", ".join(missing)
+                    )
+
+                fetched_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                return api_df, fetched_at, len(api_df), ""
+
+            except requests.RequestException as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                last_status = status or last_status
+                body = ""
+                try:
+                    body = (exc.response.text or "").strip().replace("\\n", " ")[:250]
+                except Exception:
+                    pass
+                last_error = str(exc) + (f" | {body}" if body else "")
+                if status in (401, 403) and auth_mode == "auto":
+                    break
+                if attempt <= SPARTA_API_MAX_RETRIES:
+                    time.sleep(min(2 ** (attempt - 1), 6))
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt <= SPARTA_API_MAX_RETRIES:
+                    time.sleep(min(2 ** (attempt - 1), 6))
+
+        # In auto mode, move to the next auth scheme after an auth rejection.
+        if auth_mode != "auto":
+            break
+
+    if last_status in (401, 403) and last_error:
+        return pd.DataFrame(), "API forbidden", 0, last_error
 
     return pd.DataFrame(), "API unavailable", 0, last_error or "Unknown API error"
 
@@ -1264,7 +1347,7 @@ def normalize_api_records(api_df):
     app["Quality Remarks"] = quality_remarks
     app["Status"] = wc_status
     app["Welcome call Remarks"] = wc_remarks
-    app["Source"] = "API"
+    app["Source"] = "CRM Mirror"
     app["_RecordKey"] = api["_RecordKey"]
 
     # -----------------------------------------------------------------------
@@ -1284,10 +1367,29 @@ def normalize_api_records(api_df):
     portal["Voice of Customer"] = ""
     portal["Cancellation Reason"] = api.apply(combine_api_cancellation_reasons, axis=1)
     portal["Committed Date"] = pd.NaT
-    portal["Source"] = "API"
+    portal["Source"] = "CRM Mirror"
     portal["_RecordKey"] = api["_RecordKey"]
 
     return app.reset_index(drop=True), portal.reset_index(drop=True)
+
+
+def fetch_crm_mirror(client):
+    """Read the CRM Excel mirror from the dedicated Google worksheet."""
+    crm_ws = client.open_by_key(SPREADSHEET_ID).get_worksheet_by_id(CRM_MIRROR_WORKSHEET_GID)
+    values = crm_ws.get_all_records()
+    crm_df = pd.DataFrame(values)
+    if crm_df.empty:
+        return crm_df, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 0, "CRM mirror sheet is empty"
+
+    crm_df.columns = [str(c).replace("\ufeff", "").strip() for c in crm_df.columns]
+    missing = [c for c in API_REQUIRED_COLUMNS if c not in crm_df.columns]
+    if missing:
+        return pd.DataFrame(), "CRM mirror invalid", 0, (
+            "CRM mirror is missing required columns: " + ", ".join(missing)
+        )
+
+    fetched_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return crm_df, fetched_at, len(crm_df), ""
 
 
 @st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
@@ -1338,8 +1440,11 @@ def fetch_data():
     except Exception:
         google_last_sync = "Unknown"
 
-    # ================================ API ==================================
-    api_df, api_fetched_at, api_row_count, api_error = fetch_api_excel()
+    # ============================ CRM MIRROR ==============================
+    # The independent sync job fetches the CRM Excel and writes it to a
+    # dedicated Google worksheet every 5 minutes. The portal only reads that
+    # worksheet; it does not call the CRM API directly.
+    api_df, api_fetched_at, api_row_count, api_error = fetch_crm_mirror(client)
 
     # Never modify or deduplicate the Google history. It remains authoritative
     # for records that already exist there.
@@ -1369,21 +1474,18 @@ def fetch_data():
 
     status_lines = [
         f"Google sync: {google_last_sync}",
-        f"API: {api_fetched_at}",
-        f"API rows fetched: {api_row_count:,}",
-        f"New API records added: {len(new_api_app):,}",
+        f"CRM mirror: {api_fetched_at}",
+        f"CRM mirror rows: {api_row_count:,}",
+        f"New CRM records added: {len(new_api_app):,}",
     ]
     if duplicate_count:
-        status_lines.append(f"API records already in Google: {duplicate_count:,}")
+        status_lines.append(f"CRM records already in Google: {duplicate_count:,}")
 
-    if not SPARTA_API_TOKEN:
-        status_lines.append("API warning: token missing - configure SPARTA_API_TOKEN in Streamlit secrets")
-        connection_status = "Google connected • API not configured"
-    elif api_error:
-        status_lines.append(f"API warning: {api_error}")
-        connection_status = "Google connected • API unavailable"
+    if api_error:
+        status_lines.append(f"CRM mirror warning: {api_error}")
+        connection_status = "Google connected • CRM mirror unavailable"
     else:
-        connection_status = "Google + API connected"
+        connection_status = "Google + CRM mirror connected"
 
     return df1_combined, df2_combined, "\n".join(status_lines), connection_status
 
@@ -1762,7 +1864,11 @@ try:
         st.session_state.date_preset = "This Month"
 
     def apply_date_preset():
-        preset = st.session_state.date_preset
+        # Streamlit callbacks can run before the main script body is rerun.
+        # Use a safe fallback so an existing/stale callback can never crash
+        # when the widget key is temporarily absent from session state.
+        preset = st.session_state.get("date_preset", "This Month")
+        st.session_state.date_preset = preset
         if preset != "Custom":
             preset_start, preset_end = get_preset_dates(preset, today_date)
             st.session_state.main_start_date = preset_start
