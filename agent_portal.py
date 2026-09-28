@@ -12,6 +12,7 @@ from io import BytesIO
 import re
 import time
 import requests
+import os
 
 # ============================================================================
 # SPARTA AGENT PORTAL — PREMIUM UI REFRESH
@@ -859,7 +860,48 @@ SPARTA_API_URL = st.secrets.get(
     "SPARTA_API_URL",
     "https://spartacrm.fastranking.cloud/api/dashboard/dashboard-data",
 )
-SPARTA_API_TOKEN = st.secrets.get("SPARTA_API_TOKEN", "")
+def resolve_api_secret():
+    """Read the API token from common Streamlit-secret layouts without exposing it."""
+    direct_names = [
+        "SPARTA_API_TOKEN",
+        "SPARTA_CRM_API_TOKEN",
+        "SPARTA_API_KEY",
+        "API_TOKEN",
+    ]
+
+    for name in direct_names:
+        try:
+            value = st.secrets.get(name, "")
+        except Exception:
+            value = ""
+        if value:
+            return str(value).strip()
+
+    # Also support a nested [sparta_api] / [SPARTA_API] secret block.
+    for section_name in ("sparta_api", "SPARTA_API", "api", "API"):
+        try:
+            section = st.secrets.get(section_name)
+        except Exception:
+            section = None
+        if section:
+            for key_name in ("token", "api_token", "key", "api_key"):
+                try:
+                    value = section.get(key_name, "")
+                except Exception:
+                    value = ""
+                if value:
+                    return str(value).strip()
+
+    # Local development fallback only. Streamlit Cloud should use secrets.
+    for env_name in ("SPARTA_API_TOKEN", "SPARTA_CRM_API_TOKEN", "SPARTA_API_KEY"):
+        value = os.getenv(env_name, "")
+        if value:
+            return value.strip()
+
+    return ""
+
+
+SPARTA_API_TOKEN = resolve_api_secret()
 SPARTA_API_TIMEOUT = int(st.secrets.get("SPARTA_API_TIMEOUT_SECONDS", 60))
 SPARTA_API_MAX_RETRIES = int(st.secrets.get("SPARTA_API_MAX_RETRIES", 3))
 DATA_CACHE_TTL = int(st.secrets.get("DATA_CACHE_TTL_SECONDS", 300))
@@ -918,38 +960,82 @@ def log_agent_login(agent_name):
 
 
 def robust_date_parser(date_value):
-    """Parse Google/API dates without pandas date-vs-date comparison issues."""
+    """Parse legacy Google dates using the portal's day-first convention."""
     if pd.isna(date_value):
         return pd.NaT
+    if isinstance(date_value, (pd.Timestamp, datetime.datetime, datetime.date)):
+        return pd.Timestamp(date_value)
+
     value = str(date_value).strip()
     if not value or value.lower() in {"nan", "nat", "none", "null"}:
         return pd.NaT
 
-    # Explicitly prefer day-first for the CRM/Google sales data, while still
-    # allowing ISO timestamps returned by either source.
-    for kwargs in (
-        {"format": "mixed", "dayfirst": True},
-        {"dayfirst": True},
-        {"format": "mixed"},
-    ):
+    # ISO / year-first values should remain year-first.
+    if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", value):
         try:
-            parsed = pd.to_datetime(value, errors="coerce", **kwargs)
+            return pd.to_datetime(value, errors="coerce", yearfirst=True)
+        except Exception:
+            return pd.NaT
+
+    # Legacy portal data uses day-first dates for slash/dash text values.
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y"):
+        try:
+            parsed = pd.to_datetime(value, format=fmt, errors="coerce")
             if not pd.isna(parsed):
                 return parsed
         except Exception:
             pass
-    return pd.NaT
+
+    try:
+        return pd.to_datetime(value, errors="coerce", dayfirst=True, format="mixed")
+    except Exception:
+        try:
+            return pd.to_datetime(value, errors="coerce", dayfirst=True)
+        except Exception:
+            return pd.NaT
 
 
 def parse_date_series(series):
-    """Vectorised mixed-format date parsing with a safe per-value fallback."""
-    parsed = pd.to_datetime(series, errors="coerce", format="mixed", dayfirst=True)
-    if parsed.notna().sum() < len(series):
-        missing = parsed.isna()
-        if missing.any():
-            parsed.loc[missing] = series.loc[missing].apply(robust_date_parser)
-    return parsed
+    """Parse legacy Google dates consistently as day-first, without dtype comparison issues."""
+    result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    for idx, value in series.items():
+        result.loc[idx] = robust_date_parser(value)
+    return result
 
+
+def parse_api_date(value):
+    """Parse CRM API Sale Date, whose supplied export format is DD-MM-YYYY."""
+    if pd.isna(value):
+        return pd.NaT
+    if isinstance(value, (pd.Timestamp, datetime.datetime, datetime.date)):
+        return pd.Timestamp(value)
+
+    text_value = str(value).strip()
+    if not text_value or text_value.lower() in {"nan", "nat", "none", "null"}:
+        return pd.NaT
+
+    # The CRM workbook examples are explicitly DD-MM-YYYY.
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y", "%d/%m/%y"):
+        try:
+            parsed = pd.to_datetime(text_value, format=fmt, errors="coerce")
+            if not pd.isna(parsed):
+                return parsed
+        except Exception:
+            pass
+
+    # ISO fallback for future API changes.
+    try:
+        return pd.to_datetime(text_value, errors="coerce", yearfirst=True, format="mixed")
+    except Exception:
+        return pd.to_datetime(text_value, errors="coerce", yearfirst=True)
+
+
+def parse_api_date_series(series):
+    """Parse every API date row using the CRM's DD-MM-YYYY contract."""
+    result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    for idx, value in series.items():
+        result.loc[idx] = parse_api_date(value)
+    return result
 
 def normalized_phone(value):
     """Normalize phone numbers for the agreed Sale Date + Phone key."""
@@ -1144,7 +1230,7 @@ def normalize_api_records(api_df):
         if col not in api.columns:
             api[col] = ""
 
-    api["Date_Parsed"] = parse_date_series(api["Sale Date"])
+    api["Date_Parsed"] = parse_api_date_series(api["Sale Date"])
     api["Advisor"] = api["Advisor (Created Username)"].apply(canonicalize_advisor)
     api["Customer Name"] = api["Customer Name"].fillna("").astype(str).str.strip()
     api["Phone Number"] = api["Phone Number"].apply(normalized_phone)
@@ -1290,11 +1376,12 @@ def fetch_data():
     if duplicate_count:
         status_lines.append(f"API records already in Google: {duplicate_count:,}")
 
-    if api_error:
+    if not SPARTA_API_TOKEN:
+        status_lines.append("API warning: token missing - configure SPARTA_API_TOKEN in Streamlit secrets")
+        connection_status = "Google connected • API not configured"
+    elif api_error:
         status_lines.append(f"API warning: {api_error}")
         connection_status = "Google connected • API unavailable"
-    elif not SPARTA_API_TOKEN:
-        connection_status = "Google connected • API not configured"
     else:
         connection_status = "Google + API connected"
 
@@ -1481,8 +1568,13 @@ def stage_snapshot(apps_df, portal_df, welcome_col):
 
 def add_date_strings(frame, source_col, output_col):
     frame = frame.copy()
-    if source_col in frame.columns:
-        frame[output_col] = pd.to_datetime(frame[source_col], errors="coerce").dt.strftime("%d-%m-%Y").fillna("")
+    if "Date_Parsed" in frame.columns:
+        parsed = frame["Date_Parsed"]
+    elif source_col in frame.columns:
+        parsed = parse_date_series(frame[source_col])
+    else:
+        parsed = pd.Series(pd.NaT, index=frame.index)
+    frame[output_col] = pd.to_datetime(parsed, errors="coerce").dt.strftime("%d-%m-%Y").fillna("")
     return frame
 
 
@@ -2399,12 +2491,12 @@ try:
         )
 
         merged_log["Sale Date"] = (
-            pd.to_datetime(merged_log["Standardized_Date"], errors="coerce")
+            pd.to_datetime(merged_log["Date_Parsed"], errors="coerce")
             .dt.strftime("%d-%m-%Y")
             .fillna("")
         )
         merged_log["Live Date"] = (
-            pd.to_datetime(merged_log["Live Date"], errors="coerce")
+            parse_date_series(merged_log["Live Date"])
             .dt.strftime("%d-%m-%Y")
             .fillna("")
         )
