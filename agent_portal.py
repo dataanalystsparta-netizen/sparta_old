@@ -9,14 +9,17 @@ import calendar
 import math
 from html import escape
 from io import BytesIO
+import json
+import re
+import requests
 
 # ============================================================================
 # SPARTA AGENT PORTAL — PREMIUM UI REFRESH
 # Existing functionality retained:
 # - Agent access-key authentication
 # - Login logging to Google Sheets / Logs
-# - Sparta + Sparta2 Google Sheet data
-# - 5-minute data cache
+# - Sparta + Sparta2 API data
+# - 5-minute API data cache
 # - Start/end date filtering
 # - Quality / Welcome Call / Live KPIs
 # - Insight flags
@@ -842,6 +845,14 @@ st.html(
 LOGO_URL = "https://raw.githubusercontent.com/dataanalystsparta-netizen/logos/refs/heads/main/sparta-telecom-squarelogo-1663578233108%20(1).jpg"
 SPREADSHEET_ID = "1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ"
 
+# Primary dashboard data source
+SPARTA_API_URL = st.secrets.get(
+    "SPARTA_API_URL",
+    "https://spartacrm.fastranking.cloud/api/dashboard/dashboard-data",
+)
+SPARTA_API_TOKEN = st.secrets.get("SPARTA_API_TOKEN", "").strip()
+SPARTA_API_TIMEOUT = int(st.secrets.get("SPARTA_API_TIMEOUT", 30))
+
 ACCESS_KEYS = st.secrets["agent_keys"]
 
 # ----------------------------------------------------------------------------
@@ -885,33 +896,364 @@ def robust_date_parser(date_str):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_data():
-    info = st.secrets["gcp_service_account"]
-    creds = Credentials.from_service_account_info(
-        info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-    client = gspread.authorize(creds)
-    ss = client.open_by_key(SPREADSHEET_ID)
+    """
+    Fetch the live Sparta dashboard workbook from the CRM API and translate
+    the new unified workbook structure into the two internal datasets that
+    the existing portal already understands (Sparta + Sparta2).
 
-    df1 = pd.DataFrame(ss.worksheet("Sparta").get_all_records())
-    df1["Date_Parsed"] = pd.to_datetime(df1["Standardized_Date"], errors="coerce")
-    df1["Advisor"] = df1["Advisor"].astype(str).str.strip().str.title()
+    The API returns an Excel workbook rather than JSON. The loader supports:
+      1. A workbook containing separate Sparta / Sparta2 sheets.
+      2. A single unified dashboard sheet containing all workflow stages.
 
-    df2_raw = pd.DataFrame(ss.worksheet("Sparta2").get_all_records())
-    df2_raw["Date_Parsed"] = df2_raw["Sale Date"].apply(robust_date_parser)
-    df2_raw["Advisor"] = df2_raw["Agent"].astype(str).str.strip().str.title()
+    The dashboard UI remains unchanged; only the source-to-internal mapping
+    happens here.
+    """
+
+    if not SPARTA_API_TOKEN:
+        raise RuntimeError(
+            "Missing SPARTA_API_TOKEN in Streamlit secrets. "
+            "Add the CRM API token to the app secrets before deploying."
+        )
+
+    headers = {
+        "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
+        "Authorization": f"Bearer {SPARTA_API_TOKEN}",
+    }
 
     try:
-        meta = ss.worksheet("Meta").get_all_values()
-        last_sync = meta[0][1]
-    except Exception:
-        last_sync = "Unknown"
+        response = requests.get(
+            SPARTA_API_URL,
+            headers=headers,
+            timeout=SPARTA_API_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Unable to connect to the Sparta CRM API: {exc}"
+        ) from exc
+
+    if response.status_code in (401, 403):
+        fallback_headers = {
+            "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
+            "X-API-Key": SPARTA_API_TOKEN,
+        }
+        try:
+            response = requests.get(
+                SPARTA_API_URL,
+                headers=fallback_headers,
+                timeout=SPARTA_API_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Unable to connect to the Sparta CRM API: {exc}"
+            ) from exc
+
+    if response.status_code >= 400:
+        body_preview = response.text[:500].replace("\n", " ").strip()
+        raise RuntimeError(
+            f"Sparta CRM API returned HTTP {response.status_code}. "
+            f"Response: {body_preview or 'No response body.'}"
+        )
+
+    content_type = (response.headers.get("Content-Type") or "").lower()
+    if not response.content:
+        raise RuntimeError("The Sparta CRM API returned an empty response.")
+
+    # ---------------------------------------------------------------------
+    # Read the API workbook.
+    # ---------------------------------------------------------------------
+    try:
+        workbook = pd.ExcelFile(BytesIO(response.content), engine="openpyxl")
+        sheets = {
+            str(sheet_name): pd.read_excel(
+                workbook,
+                sheet_name=sheet_name,
+                engine="openpyxl",
+            )
+            for sheet_name in workbook.sheet_names
+        }
+    except Exception as exc:
+        detail = f" Content-Type reported: {content_type}." if content_type else ""
+        raise RuntimeError(
+            "The Sparta CRM API response could not be read as an Excel workbook."
+            + detail
+        ) from exc
+
+    def _normalise_key(value):
+        return re.sub(r"[^a-z0-9]", "", str(value).replace("\ufeff", "").strip().lower())
+
+    def _clean_columns(df):
+        df = df.copy()
+        df.columns = [
+            str(col).replace("\ufeff", "").strip()
+            for col in df.columns
+        ]
+        return df
+
+    def _rename_by_aliases(df, aliases):
+        """Rename columns using normalized header aliases."""
+        df = _clean_columns(df)
+        lookup = {
+            _normalise_key(col): col
+            for col in df.columns
+        }
+        rename_map = {}
+        for canonical, candidates in aliases.items():
+            if canonical in df.columns:
+                continue
+            for candidate in candidates:
+                actual = lookup.get(_normalise_key(candidate))
+                if actual is not None:
+                    rename_map[actual] = canonical
+                    break
+        return df.rename(columns=rename_map)
+
+    def _ensure_column(df, column, default=""):
+        if column not in df.columns:
+            df[column] = default
+        return df
+
+    def _find_sheet_by_name(candidates):
+        wanted = {_normalise_key(x) for x in candidates}
+        for sheet_name, frame in sheets.items():
+            if _normalise_key(sheet_name) in wanted:
+                return frame.copy()
+        return pd.DataFrame()
+
+    # ---------------------------------------------------------------------
+    # New API workbook structure supplied by the user.
+    # ---------------------------------------------------------------------
+    unified_aliases = {
+        "Sale Date": ["Sale Date"],
+        "Advisor (Created Username)": ["Advisor (Created Username)", "Advisor", "Created Username"],
+        "Customer Name": ["Customer Name"],
+        "Phone Number": ["Phone Number", "Telephone No.", "Telephone Number", "Phone", "CLI"],
+        "Quality Status": ["Quality Status"],
+        "Quality Remarks": ["Quality Remarks (Quality Comments)", "Quality Remarks", "Quality Comments"],
+        "Welcome Call Status": ["Welcome Call Status", "Welcome Status", "Status"],
+        "Welcome Call Remarks": ["Welcome Call Remarks (Welcome Comments)", "Welcome Call Remarks", "Welcome Remarks", "Welcome Comments"],
+        "Provisioning Status": ["Provisioning Status", "Provisioning"],
+        "Provisioning Remarks": ["Provisioning Remarks (Provisioning Comments)", "Provisioning Remarks", "Provisioning Comments"],
+        "Committed (Live) Status (Onboarding Status)": ["Committed (Live) Status (Onboarding Status)", "Onboarding Status", "Committed Status", "Live Status"],
+        "LetterStatus (Dispatch Status)": ["LetterStatus (Dispatch Status)", "LetterStatus", "Dispatch Status"],
+        "Confirmation Status": ["Confirmation Status", "CallStatus", "Call Status"],
+        "Confirmation Comment": ["Confirmation Comment", "Confirmation Comments", "Comments"],
+        "Cancellation Reason - quality": ["Cancellation Reason - quality", "Cancellation Reason - Quality", "Quality Cancellation Reason"],
+        "Cancellation Reason - welcome": ["Cancellation Reason - welcome", "Cancellation Reason - Welcome", "Welcome Cancellation Reason"],
+        "Cancellation/Rejection Reason - Provisioning": ["Cancellation/Rejection Reason - Provisioning", "Provisioning Cancellation Reason", "Provisioning Rejection Reason"],
+        "Cancellation/Rejection Reason - Dispatch": ["Cancellation/Rejection Reason - Dispatch", "Dispatch Cancellation Reason", "Dispatch Rejection Reason"],
+        "Cancellation/Rejection Reason - Confirmation": ["Cancellation/Rejection Reason - Confirmation", "Confirmation Cancellation Reason", "Confirmation Rejection Reason"],
+        "Cancellation/Rejection Reason - Onboarding": ["Cancellation/Rejection Reason - Onboarding", "Onboarding Cancellation Reason", "Onboarding Rejection Reason"],
+        "Cancellation/Rejection Reason - Potential Opportunity": ["Cancellation/Rejection Reason - Potential Opportunity", "Potential Opportunity Reason"],
+    }
+
+    expected_unified = {
+        _normalise_key(name)
+        for name in [
+            "Sale Date",
+            "Advisor (Created Username)",
+            "Customer Name",
+            "Phone Number",
+            "Quality Status",
+            "Welcome Call Status",
+            "Committed (Live) Status (Onboarding Status)",
+        ]
+    }
+
+    def _unified_score(frame):
+        cols = {_normalise_key(c) for c in frame.columns}
+        return sum(1 for item in expected_unified if item in cols)
+
+    # Prefer an explicitly named Sparta/Sparta2 workbook when it exists.
+    sparta_sheet = _find_sheet_by_name(["Sparta", "Applications", "Application Data"])
+    sparta2_sheet = _find_sheet_by_name(["Sparta2", "Portal", "Live", "Live Data"])
+
+    # Otherwise identify the new unified dashboard export by its headers.
+    unified_sheet_name = None
+    best_score = 0
+    for sheet_name, frame in sheets.items():
+        score = _unified_score(_clean_columns(frame))
+        if score > best_score:
+            best_score = score
+            unified_sheet_name = sheet_name
+
+    if unified_sheet_name is not None and best_score >= 5:
+        base = _rename_by_aliases(
+            sheets[unified_sheet_name],
+            unified_aliases,
+        )
+
+        # ---------------------------------------------------------------
+        # Build the legacy Sparta dataset expected by the portal.
+        # ---------------------------------------------------------------
+        df1 = base.copy()
+        df1 = df1.rename(columns={
+            "Advisor (Created Username)": "Advisor",
+            "Phone Number": "CLI",
+            "Welcome Call Status": "Status",
+            "Welcome Call Remarks": "Welcome call Remarks",
+            "Provisioning Status": "Provisioning",
+        })
+        df1["Standardized_Date"] = df1.get("Sale Date", "")
+        df1["Quality Officer"] = ""
+        df1["Welcome Call By"] = ""
+        df1["Quality Date"] = ""
+        df1["WCD date"] = ""
+        df1["Prov Date"] = ""
+        df1["Current Provider"] = ""
+        df1["Packageoffered"] = ""
+        df1["Welcome Cancellation"] = df1.get("Cancellation Reason - welcome", "")
+        df1["Quality Cancellation Reason"] = df1.get("Cancellation Reason - quality", "")
+        df1["Provisioning Remarks"] = df1.get("Provisioning Remarks", "")
+        df1["Provisioning Cancellation Reason"] = df1.get(
+            "Cancellation/Rejection Reason - Provisioning", ""
+        )
+        df1["Dispatch Cancellation Reason"] = df1.get(
+            "Cancellation/Rejection Reason - Dispatch", ""
+        )
+        df1["Confirmation Cancellation Reason"] = df1.get(
+            "Cancellation/Rejection Reason - Confirmation", ""
+        )
+        df1["Onboarding Cancellation Reason"] = df1.get(
+            "Cancellation/Rejection Reason - Onboarding", ""
+        )
+        df1["Potential Opportunity Reason"] = df1.get(
+            "Cancellation/Rejection Reason - Potential Opportunity", ""
+        )
+
+        # ---------------------------------------------------------------
+        # Build the legacy Sparta2 dataset expected by the portal.
+        # ---------------------------------------------------------------
+        df2_raw = pd.DataFrame(index=base.index)
+        df2_raw["Sale Date"] = base.get("Sale Date", "")
+        df2_raw["Telephone No."] = base.get("Phone Number", "")
+        df2_raw["Agent"] = base.get("Advisor (Created Username)", "")
+        df2_raw["Status"] = base.get(
+            "Committed (Live) Status (Onboarding Status)", ""
+        )
+        df2_raw["LetterStatus"] = base.get("LetterStatus (Dispatch Status)", "")
+        # Existing portal UI calls this field CallStatus; in the new export
+        # the equivalent downstream field is Confirmation Status.
+        df2_raw["CallStatus"] = base.get("Confirmation Status", "")
+        df2_raw["Comments"] = base.get("Confirmation Comment", "")
+        df2_raw["Voice of Customer"] = ""
+        df2_raw["Cancellation Reason"] = base.get(
+            "Cancellation/Rejection Reason - Onboarding", ""
+        )
+        df2_raw["Committed Date"] = ""
+        df2_raw["Dispatch Cancellation Reason"] = base.get(
+            "Cancellation/Rejection Reason - Dispatch", ""
+        )
+        df2_raw["Confirmation Cancellation Reason"] = base.get(
+            "Cancellation/Rejection Reason - Confirmation", ""
+        )
+        df2_raw["Potential Opportunity Reason"] = base.get(
+            "Cancellation/Rejection Reason - Potential Opportunity", ""
+        )
+
+    else:
+        # -----------------------------------------------------------------
+        # Backward-compatible path for a workbook that still contains
+        # separate Sparta / Sparta2 sheets.
+        # -----------------------------------------------------------------
+        if sparta_sheet.empty and sheets:
+            # Fall back to the first non-empty sheet as Sparta.
+            for frame in sheets.values():
+                if not frame.empty:
+                    sparta_sheet = frame.copy()
+                    break
+
+        if sparta2_sheet.empty:
+            # If no second sheet exists, use a copy of Sparta. This keeps
+            # unified exports functional even when headers are slightly off.
+            sparta2_sheet = sparta_sheet.copy()
+
+        df1 = _rename_by_aliases(
+            sparta_sheet,
+            {
+                "Advisor": ["Advisor", "advisor", "Advisor (Created Username)", "Created Username"],
+                "Standardized_Date": ["Standardized_Date", "Standardized Date", "Sale Date", "sale_date", "Date"],
+                "CLI": ["CLI", "Phone Number", "Telephone No.", "Telephone", "Phone", "phone_number"],
+                "Quality Status": ["Quality Status", "QualityStatus", "quality_status"],
+                "Quality Remarks": ["Quality Remarks", "Quality Comments", "Quality Remarks (Quality Comments)"],
+                "Status": ["Status", "Welcome Call Status", "Welcome Status"],
+                "Welcome call Remarks": ["Welcome call Remarks", "Welcome Call Remarks", "Welcome Call Remarks (Welcome Comments)", "Welcome Remarks"],
+                "Customer Name": ["Customer Name"],
+            },
+        )
+
+        df2_raw = _rename_by_aliases(
+            sparta2_sheet,
+            {
+                "Sale Date": ["Sale Date", "SaleDate", "sale_date", "Date"],
+                "Agent": ["Agent", "agent", "Advisor", "Advisor (Created Username)", "Created Username"],
+                "Status": ["Status", "Committed (Live) Status (Onboarding Status)", "Onboarding Status", "Portal Status"],
+                "Telephone No.": ["Telephone No.", "Telephone", "Phone", "Phone Number", "phone_number", "CLI"],
+                "LetterStatus": ["LetterStatus", "LetterStatus (Dispatch Status)", "Dispatch Status"],
+                "CallStatus": ["CallStatus", "Call Status", "Confirmation Status"],
+                "Comments": ["Comments", "Confirmation Comment", "Confirmation Comments"],
+                "Voice of Customer": ["Voice of Customer"],
+                "Cancellation Reason": ["Cancellation Reason", "Cancellation/Rejection Reason - Onboarding", "Onboarding Cancellation Reason"],
+                "Committed Date": ["Committed Date", "Live Date", "CommittedDate"],
+            },
+        )
+
+    # ---------------------------------------------------------------------
+    # Preserve the columns used throughout the existing portal.
+    # ---------------------------------------------------------------------
+    for col in [
+        "Standardized_Date", "Advisor", "Customer Name", "CLI",
+        "Quality Status", "Quality Remarks", "Status", "Welcome call Remarks",
+    ]:
+        _ensure_column(df1, col)
+
+    for col in [
+        "Sale Date", "Agent", "Status", "Telephone No.", "LetterStatus",
+        "CallStatus", "Comments", "Voice of Customer", "Cancellation Reason",
+        "Committed Date",
+    ]:
+        _ensure_column(df2_raw, col)
+
+    df1 = _clean_columns(df1)
+    df2_raw = _clean_columns(df2_raw)
+
+    # Dates and advisor names — same working contract as the portal.
+    df1["Date_Parsed"] = pd.to_datetime(
+        df1["Standardized_Date"],
+        errors="coerce",
+        dayfirst=True,
+    )
+    df1["Advisor"] = (
+        df1["Advisor"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.title()
+    )
+
+    df2_raw["Date_Parsed"] = df2_raw["Sale Date"].apply(robust_date_parser)
+    df2_raw["Advisor"] = (
+        df2_raw["Agent"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.title()
+    )
+
+    # Keep phone values comparable between the two internal datasets.
+    df1["CLI"] = df1["CLI"].fillna("").astype(str).str.strip()
+    df2_raw["Telephone No."] = df2_raw["Telephone No."].fillna("").astype(str).str.strip()
+
+    # For a unified workbook there is no separate CRM sync timestamp in the
+    # supplied structure, so the successful API fetch time is the honest
+    # timestamp displayed in the portal.
+    last_sync = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if df1.empty and df2_raw.empty:
+        raise RuntimeError(
+            "The API returned an Excel workbook, but no usable Sparta dashboard data was found."
+        )
 
     return df1, df2_raw, last_sync
-
 
 def map_quality(val):
     s = str(val).lower()
@@ -1216,6 +1558,7 @@ with st.sidebar:
     st.html(
         '<div style="font-size:.67rem;color:#7E93BF;text-transform:uppercase;letter-spacing:1px;font-weight:800;margin:18px 0 8px;">Portal</div>',
         )
+    st.caption("Live data source: Sparta CRM API")
     if st.button("↪  Logout", use_container_width=True):
         st.session_state.authenticated = False
         st.session_state.agent_name = ""
@@ -2453,7 +2796,7 @@ try:
     )
 
     st.html(
-        '<div class="footer-note">Sparta Agent Portal • Your performance data is refreshed automatically from the connected reporting sheets.</div>',
+        '<div class="footer-note">Sparta Agent Portal • Your performance data is refreshed automatically from the Sparta CRM API.</div>',
     )
 
 except Exception as e:
