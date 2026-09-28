@@ -12,3 +12,4 @@ fpdf
 folium
 streamlit_folium
 openpyxl
+googleapiclient
