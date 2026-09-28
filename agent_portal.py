@@ -9,13 +9,17 @@ import calendar
 import math
 from html import escape
 from io import BytesIO
+import re
+import time
+import requests
 
 # ============================================================================
 # SPARTA AGENT PORTAL — PREMIUM UI REFRESH
 # Existing functionality retained:
 # - Agent access-key authentication
 # - Login logging to Google Sheets / Logs
-# - Sparta + Sparta2 Google Sheet data
+# - Existing Sparta + Sparta2 Google Sheet historical data
+# - CRM API used only for records not already present in Google Sheets
 # - 5-minute data cache
 # - Start/end date filtering
 # - Quality / Welcome Call / Live KPIs
@@ -840,9 +844,49 @@ st.html(
 # CONSTANTS
 # ----------------------------------------------------------------------------
 LOGO_URL = "https://raw.githubusercontent.com/dataanalystsparta-netizen/logos/refs/heads/main/sparta-telecom-squarelogo-1663578233108%20(1).jpg"
-SPREADSHEET_ID = "1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ"
+SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ")
 
+# Existing authentication remains unchanged.
 ACCESS_KEYS = st.secrets["agent_keys"]
+
+# ---------------------------------------------------------------------------
+# HYBRID DATA-SOURCE CONFIGURATION
+# Google Sheets remains the historical/legacy source. The API is only used to
+# add records that do not already exist in either Google Sheet, using the
+# agreed primary key: Sale Date + Phone Number.
+# ---------------------------------------------------------------------------
+SPARTA_API_URL = st.secrets.get(
+    "SPARTA_API_URL",
+    "https://spartacrm.fastranking.cloud/api/dashboard/dashboard-data",
+)
+SPARTA_API_TOKEN = st.secrets.get("SPARTA_API_TOKEN", "")
+SPARTA_API_TIMEOUT = int(st.secrets.get("SPARTA_API_TIMEOUT_SECONDS", 60))
+SPARTA_API_MAX_RETRIES = int(st.secrets.get("SPARTA_API_MAX_RETRIES", 3))
+DATA_CACHE_TTL = int(st.secrets.get("DATA_CACHE_TTL_SECONDS", 300))
+
+API_REQUIRED_COLUMNS = [
+    "Sale Date",
+    "Advisor (Created Username)",
+    "Customer Name",
+    "Phone Number",
+    "Quality Status",
+    "Quality Remarks (Quality Comments)",
+    "Welcome Call Status",
+    "Welcome Call Remarks (Welcome Comments)",
+    "Provisioning Status",
+    "Provisioning Remarks (Provisioning Comments)",
+    "Committed (Live) Status (Onboarding Status)",
+    "LetterStatus (Dispatch Status)",
+    "Confirmation Status",
+    "Confirmation Comment",
+    "Cancellation Reason - quality",
+    "Cancellation Reason - welcome",
+    "Cancellation/Rejection Reason - Provisioning",
+    "Cancellation/Rejection Reason - Dispatch",
+    "Cancellation/Rejection Reason - Confirmation",
+    "Cancellation/Rejection Reason - Onboarding",
+    "Cancellation/Rejection Reason - Potential Opportunity",
+]
 
 # ----------------------------------------------------------------------------
 # HELPERS
@@ -873,18 +917,297 @@ def log_agent_login(agent_name):
         pass
 
 
-def robust_date_parser(date_str):
-    date_str = str(date_str).strip()
-    try:
-        if "/" in date_str:
-            return pd.to_datetime(date_str, dayfirst=True)
-        return pd.to_datetime(date_str)
-    except Exception:
+def robust_date_parser(date_value):
+    """Parse Google/API dates without pandas date-vs-date comparison issues."""
+    if pd.isna(date_value):
+        return pd.NaT
+    value = str(date_value).strip()
+    if not value or value.lower() in {"nan", "nat", "none", "null"}:
         return pd.NaT
 
+    # Explicitly prefer day-first for the CRM/Google sales data, while still
+    # allowing ISO timestamps returned by either source.
+    for kwargs in (
+        {"format": "mixed", "dayfirst": True},
+        {"dayfirst": True},
+        {"format": "mixed"},
+    ):
+        try:
+            parsed = pd.to_datetime(value, errors="coerce", **kwargs)
+            if not pd.isna(parsed):
+                return parsed
+        except Exception:
+            pass
+    return pd.NaT
 
-@st.cache_data(ttl=300, show_spinner=False)
+
+def parse_date_series(series):
+    """Vectorised mixed-format date parsing with a safe per-value fallback."""
+    parsed = pd.to_datetime(series, errors="coerce", format="mixed", dayfirst=True)
+    if parsed.notna().sum() < len(series):
+        missing = parsed.isna()
+        if missing.any():
+            parsed.loc[missing] = series.loc[missing].apply(robust_date_parser)
+    return parsed
+
+
+def normalized_phone(value):
+    """Normalize phone numbers for the agreed Sale Date + Phone key."""
+    if pd.isna(value):
+        return ""
+    value = str(value).strip()
+    if not value or value.lower() in {"nan", "none", "null", "nat"}:
+        return ""
+    value = re.sub(r"\.0+$", "", value)
+
+    digits = re.sub(r"\D", "", value)
+    if not digits:
+        return ""
+
+    # UK-friendly normalization: +44XXXXXXXXXX -> 0XXXXXXXXXX.
+    if digits.startswith("44") and len(digits) in {11, 12}:
+        digits = "0" + digits[2:]
+
+    return digits
+
+
+def date_key_value(value):
+    parsed = robust_date_parser(value)
+    if pd.isna(parsed):
+        return ""
+    return pd.Timestamp(parsed).strftime("%Y-%m-%d")
+
+
+def make_record_key(date_value, phone_value):
+    """Primary key agreed for source reconciliation."""
+    date_key = date_key_value(date_value)
+    phone_key = normalized_phone(phone_value)
+    if not date_key or not phone_key:
+        return ""
+    return f"{date_key}|{phone_key}"
+
+
+def add_record_keys(frame, date_col, phone_col):
+    result = frame.copy()
+    if date_col in result.columns:
+        date_values = result[date_col]
+    else:
+        date_values = pd.Series([pd.NaT] * len(result), index=result.index)
+    if phone_col in result.columns:
+        phone_values = result[phone_col]
+    else:
+        phone_values = pd.Series([""] * len(result), index=result.index)
+
+    result["_RecordKey"] = [
+        make_record_key(d, p) for d, p in zip(date_values, phone_values)
+    ]
+    return result
+
+
+def existing_google_keys(df1, df2_raw):
+    """Return keys from BOTH legacy Google tabs without modifying them."""
+    keys = set()
+
+    df1_keyed = add_record_keys(df1, "Standardized_Date", "CLI")
+    keys.update(k for k in df1_keyed["_RecordKey"].tolist() if k)
+
+    df2_keyed = add_record_keys(df2_raw, "Sale Date", "Telephone No.")
+    keys.update(k for k in df2_keyed["_RecordKey"].tolist() if k)
+
+    return keys
+
+
+def canonicalize_advisor(raw_name):
+    """Map CRM usernames to the portal's login/agent names where possible."""
+    raw = str(raw_name).strip()
+    if not raw or raw.lower() in {"nan", "none", "null", "nat"}:
+        return ""
+
+    # Known API username variants seen in the CRM export.
+    aliases = {
+        "subhodeeproy": "Subhodeep",
+        "priyanshurathee": "Priyanshu",
+        "kunalupreti": "Kunal",
+    }
+
+    compact = re.sub(r"[^a-z0-9]", "", raw.lower())
+    if compact in aliases:
+        return aliases[compact]
+
+    candidates = []
+    try:
+        for value in ACCESS_KEYS.values():
+            name = str(value).strip()
+            if name:
+                candidates.append(name)
+    except Exception:
+        candidates = []
+
+    # Exact compact match.
+    for name in candidates:
+        if compact == re.sub(r"[^a-z0-9]", "", name.lower()):
+            return name
+
+    # Common CRM convention: username = agent name + surname/handle.
+    # Only map when the match is unique, avoiding accidental cross-agent merges.
+    prefix_matches = []
+    for name in candidates:
+        name_compact = re.sub(r"[^a-z0-9]", "", name.lower())
+        if len(name_compact) >= 5 and len(compact) >= len(name_compact):
+            if compact.startswith(name_compact):
+                prefix_matches.append(name)
+    if len(prefix_matches) == 1:
+        return prefix_matches[0]
+
+    return raw.strip().title()
+
+
+def clean_reason_text(value):
+    if pd.isna(value):
+        return ""
+    text = str(value).replace("<br>", " | ").replace("<br/>", " | ")
+    text = re.sub(r"\s+", " ", text).strip()
+    if text.lower() in {"nan", "none", "null"}:
+        return ""
+    return text
+
+
+def combine_api_cancellation_reasons(row):
+    fields = [
+        ("Quality", "Cancellation Reason - quality"),
+        ("Welcome", "Cancellation Reason - welcome"),
+        ("Provisioning", "Cancellation/Rejection Reason - Provisioning"),
+        ("Dispatch", "Cancellation/Rejection Reason - Dispatch"),
+        ("Confirmation", "Cancellation/Rejection Reason - Confirmation"),
+        ("Onboarding", "Cancellation/Rejection Reason - Onboarding"),
+        ("Potential Opportunity", "Cancellation/Rejection Reason - Potential Opportunity"),
+    ]
+    parts = []
+    for label, col in fields:
+        if col in row.index:
+            value = clean_reason_text(row[col])
+            if value:
+                parts.append(f"{label}: {value}")
+    return " | ".join(parts)
+
+
+def fetch_api_excel():
+    """Fetch the CRM Excel export. API failures never block the legacy source."""
+    if not SPARTA_API_TOKEN:
+        return pd.DataFrame(), "API not configured", 0, "API token missing"
+
+    headers = {
+        "Authorization": f"Bearer {SPARTA_API_TOKEN}",
+        "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream, */*",
+    }
+
+    last_error = None
+    for attempt in range(1, SPARTA_API_MAX_RETRIES + 2):
+        try:
+            response = requests.get(
+                SPARTA_API_URL,
+                headers=headers,
+                timeout=SPARTA_API_TIMEOUT,
+            )
+            response.raise_for_status()
+
+            if not response.content:
+                raise ValueError("API returned an empty response body.")
+
+            api_df = pd.read_excel(BytesIO(response.content), engine="openpyxl")
+            api_df.columns = [str(c).replace("\ufeff", "").strip() for c in api_df.columns]
+
+            missing = [c for c in API_REQUIRED_COLUMNS if c not in api_df.columns]
+            if missing:
+                raise ValueError(
+                    "API Excel is missing required columns: " + ", ".join(missing)
+                )
+
+            fetched_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            return api_df, fetched_at, len(api_df), ""
+
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt <= SPARTA_API_MAX_RETRIES:
+                time.sleep(min(2 ** (attempt - 1), 6))
+
+    return pd.DataFrame(), "API unavailable", 0, last_error or "Unknown API error"
+
+
+def normalize_api_records(api_df):
+    """Convert the consolidated API export into the old portal's two logical datasets."""
+    if api_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    api = api_df.copy()
+    for col in API_REQUIRED_COLUMNS:
+        if col not in api.columns:
+            api[col] = ""
+
+    api["Date_Parsed"] = parse_date_series(api["Sale Date"])
+    api["Advisor"] = api["Advisor (Created Username)"].apply(canonicalize_advisor)
+    api["Customer Name"] = api["Customer Name"].fillna("").astype(str).str.strip()
+    api["Phone Number"] = api["Phone Number"].apply(normalized_phone)
+    api["_RecordKey"] = [
+        make_record_key(d, p)
+        for d, p in zip(api["Sale Date"], api["Phone Number"])
+    ]
+
+    # A primary-key record cannot be reconciled safely if either component is missing.
+    api = api[api["_RecordKey"] != ""].copy()
+
+    # Keep the latest row when the API itself contains duplicate keys.
+    api = api.drop_duplicates(subset=["_RecordKey"], keep="last").reset_index(drop=True)
+
+    quality = api["Quality Status"].fillna("").astype(str).str.strip()
+    quality_remarks = api["Quality Remarks (Quality Comments)"].apply(clean_reason_text)
+    wc_status = api["Welcome Call Status"].fillna("").astype(str).str.strip()
+    wc_remarks = api["Welcome Call Remarks (Welcome Comments)"].apply(clean_reason_text)
+
+    # -----------------------------------------------------------------------
+    # Application-side representation (old Sparta sheet shape used by portal)
+    # -----------------------------------------------------------------------
+    app = pd.DataFrame(index=api.index)
+    app["Standardized_Date"] = api["Date_Parsed"]
+    app["Date_Parsed"] = api["Date_Parsed"]
+    app["Sale Date"] = api["Sale Date"]
+    app["Advisor"] = api["Advisor"]
+    app["Customer Name"] = api["Customer Name"]
+    app["CLI"] = api["Phone Number"]
+    app["Quality Status"] = quality
+    app["Quality Remarks"] = quality_remarks
+    app["Status"] = wc_status
+    app["Welcome call Remarks"] = wc_remarks
+    app["Source"] = "API"
+    app["_RecordKey"] = api["_RecordKey"]
+
+    # -----------------------------------------------------------------------
+    # Portal-side representation (old Sparta2 shape used by portal)
+    # -----------------------------------------------------------------------
+    portal = pd.DataFrame(index=api.index)
+    portal["Sale Date"] = api["Sale Date"]
+    portal["Date_Parsed"] = api["Date_Parsed"]
+    portal["Agent"] = api["Advisor"]
+    portal["Advisor"] = api["Advisor"]
+    portal["Customer Name"] = api["Customer Name"]
+    portal["Telephone No."] = api["Phone Number"]
+    portal["Status"] = api["Committed (Live) Status (Onboarding Status)"].fillna("").astype(str).str.strip()
+    portal["LetterStatus"] = api["LetterStatus (Dispatch Status)"].fillna("").astype(str).str.strip()
+    portal["CallStatus"] = api["Confirmation Status"].fillna("").astype(str).str.strip()
+    portal["Comments"] = api["Confirmation Comment"].apply(clean_reason_text)
+    portal["Voice of Customer"] = ""
+    portal["Cancellation Reason"] = api.apply(combine_api_cancellation_reasons, axis=1)
+    portal["Committed Date"] = pd.NaT
+    portal["Source"] = "API"
+    portal["_RecordKey"] = api["_RecordKey"]
+
+    return app.reset_index(drop=True), portal.reset_index(drop=True)
+
+
+@st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
 def fetch_data():
+    """Load Google history and API future records independently, then reconcile once."""
+    # =============================== GOOGLE ================================
     info = st.secrets["gcp_service_account"]
     creds = Credentials.from_service_account_info(
         info,
@@ -896,21 +1219,86 @@ def fetch_data():
     client = gspread.authorize(creds)
     ss = client.open_by_key(SPREADSHEET_ID)
 
+    # These are intentionally loaded exactly as the legacy portal expected.
     df1 = pd.DataFrame(ss.worksheet("Sparta").get_all_records())
-    df1["Date_Parsed"] = pd.to_datetime(df1["Standardized_Date"], errors="coerce")
+    if df1.empty:
+        df1 = pd.DataFrame(columns=["Standardized_Date", "Advisor", "Quality Status", "CLI", "Customer Name"])
+    if "Standardized_Date" not in df1.columns:
+        df1["Standardized_Date"] = pd.NaT
+    if "Advisor" not in df1.columns:
+        df1["Advisor"] = ""
+    if "CLI" not in df1.columns:
+        df1["CLI"] = ""
+    df1["Date_Parsed"] = parse_date_series(df1["Standardized_Date"])
     df1["Advisor"] = df1["Advisor"].astype(str).str.strip().str.title()
+    df1["Source"] = "Google - Sparta"
 
     df2_raw = pd.DataFrame(ss.worksheet("Sparta2").get_all_records())
-    df2_raw["Date_Parsed"] = df2_raw["Sale Date"].apply(robust_date_parser)
+    if df2_raw.empty:
+        df2_raw = pd.DataFrame(columns=["Sale Date", "Agent", "Status", "Telephone No."])
+    if "Sale Date" not in df2_raw.columns:
+        df2_raw["Sale Date"] = pd.NaT
+    if "Agent" not in df2_raw.columns:
+        df2_raw["Agent"] = ""
+    if "Telephone No." not in df2_raw.columns:
+        df2_raw["Telephone No."] = ""
+    df2_raw["Date_Parsed"] = parse_date_series(df2_raw["Sale Date"])
     df2_raw["Advisor"] = df2_raw["Agent"].astype(str).str.strip().str.title()
+    df2_raw["Source"] = "Google - Sparta2"
 
     try:
         meta = ss.worksheet("Meta").get_all_values()
-        last_sync = meta[0][1]
+        google_last_sync = meta[0][1] if meta and len(meta[0]) > 1 else "Unknown"
     except Exception:
-        last_sync = "Unknown"
+        google_last_sync = "Unknown"
 
-    return df1, df2_raw, last_sync
+    # ================================ API ==================================
+    api_df, api_fetched_at, api_row_count, api_error = fetch_api_excel()
+
+    # Never modify or deduplicate the Google history. It remains authoritative
+    # for records that already exist there.
+    existing_keys = existing_google_keys(df1, df2_raw)
+    api_app, api_portal = normalize_api_records(api_df)
+
+    if api_app.empty:
+        new_api_app = api_app
+        new_api_portal = api_portal
+        duplicate_count = 0
+    else:
+        api_keys = set(api_app["_RecordKey"].dropna().astype(str))
+        new_keys = api_keys - existing_keys
+        new_api_app = api_app[api_app["_RecordKey"].isin(new_keys)].copy()
+        new_api_portal = api_portal[api_portal["_RecordKey"].isin(new_keys)].copy()
+        duplicate_count = len(api_app) - len(new_api_app)
+
+    # Concatenate only NEW API records; existing Google rows remain untouched.
+    df1_combined = pd.concat([df1, new_api_app], ignore_index=True, sort=False)
+    df2_combined = pd.concat([df2_raw, new_api_portal], ignore_index=True, sort=False)
+
+    # Final date/advisor normalization after the merge.
+    df1_combined["Date_Parsed"] = parse_date_series(df1_combined["Date_Parsed"])
+    df2_combined["Date_Parsed"] = parse_date_series(df2_combined["Date_Parsed"])
+    df1_combined["Advisor"] = df1_combined["Advisor"].fillna("").astype(str).str.strip()
+    df2_combined["Advisor"] = df2_combined["Advisor"].fillna("").astype(str).str.strip()
+
+    status_lines = [
+        f"Google sync: {google_last_sync}",
+        f"API: {api_fetched_at}",
+        f"API rows fetched: {api_row_count:,}",
+        f"New API records added: {len(new_api_app):,}",
+    ]
+    if duplicate_count:
+        status_lines.append(f"API records already in Google: {duplicate_count:,}")
+
+    if api_error:
+        status_lines.append(f"API warning: {api_error}")
+        connection_status = "Google connected • API unavailable"
+    elif not SPARTA_API_TOKEN:
+        connection_status = "Google connected • API not configured"
+    else:
+        connection_status = "Google + API connected"
+
+    return df1_combined, df2_combined, "\n".join(status_lines), connection_status
 
 
 def map_quality(val):
@@ -932,7 +1320,7 @@ def map_portal(val):
         return "Live"
     if "com" in s:
         return "Committed"
-    if any(x in s for x in ["pend", "pnd"]):
+    if any(x in s for x in ["pend", "pnd", "other work", "delay"]):
         return "Pending"
     if any(x in s for x in ["can", "rej"]):
         return "Cancelled"
@@ -941,11 +1329,11 @@ def map_portal(val):
 
 def map_wc(val):
     s = str(val).lower().strip()
-    if any(x in s for x in ["done", "pass", "comp"]):
+    if any(x in s for x in ["done", "pass", "comp", "approved"]):
         return "Done"
     if any(x in s for x in ["follow", "f/u", "f u"]):
         return "Follow up"
-    if any(x in s for x in ["pend", "pnd"]):
+    if any(x in s for x in ["pend", "pnd", "other work", "delay"]):
         return "Pending"
     if any(x in s for x in ["paper", "ppw"]):
         return "Paperwork"
@@ -953,6 +1341,13 @@ def map_wc(val):
         return "Cancelled"
     return "Others"
 
+
+def date_range_mask(series, start_date, end_date):
+    """Safe timestamp comparison for pandas datetime64[s]/datetime64[ns]/object."""
+    parsed = pd.to_datetime(series, errors="coerce", format="mixed", dayfirst=True)
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date) + pd.Timedelta(days=1)
+    return (parsed >= start_ts) & (parsed < end_ts)
 
 def initials(name):
     parts = [p for p in str(name).split() if p]
@@ -1111,8 +1506,8 @@ def get_preset_dates(preset, today):
 
 
 def summary_for_period(base_apps, base_portal, start_date, end_date, welcome_col):
-    apps = base_apps[(base_apps["Date_Parsed"].dt.date >= start_date) & (base_apps["Date_Parsed"].dt.date <= end_date)].copy()
-    portal = base_portal[(base_portal["Date_Parsed"].dt.date >= start_date) & (base_portal["Date_Parsed"].dt.date <= end_date)].copy()
+    apps = base_apps[date_range_mask(base_apps["Date_Parsed"], start_date, end_date)].copy()
+    portal = base_portal[date_range_mask(base_portal["Date_Parsed"], start_date, end_date)].copy()
 
     if "Quality Status" in apps.columns:
         apps["Q_Status"] = apps["Quality Status"].apply(map_quality)
@@ -1231,9 +1626,11 @@ with st.sidebar:
 # DATA LOAD
 # ----------------------------------------------------------------------------
 try:
-    df1, df2_raw, last_sync = fetch_data()
-    ag1 = df1[df1["Advisor"] == agent].copy()
-    ag2 = df2_raw[df2_raw["Advisor"] == agent].copy()
+    df1, df2_raw, last_sync, connection_status = fetch_data()
+    # Agent login remains the control point: each agent only sees their own data.
+    agent_compact = re.sub(r"[^a-z0-9]", "", str(agent).lower())
+    ag1 = df1[df1["Advisor"].apply(lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower()) == agent_compact)].copy()
+    ag2 = df2_raw[df2_raw["Advisor"].apply(lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower()) == agent_compact)].copy()
 
     # ------------------------------------------------------------------------
     # HERO
@@ -1254,7 +1651,7 @@ try:
             f"""
             <div class="hero" style="height:100%;padding:21px 22px;">
                 <div class="hero-kicker">Data status</div>
-                <div style="font-size:.82rem;font-weight:800;margin-top:3px;"><span class="live-dot"></span>Connected</div>
+                <div style="font-size:.82rem;font-weight:800;margin-top:3px;"><span class="live-dot"></span>{escape(connection_status)}</div>
                 <div class="hero-sync" style="text-align:left;padding-top:7px;">
                     Last synced<br><strong>{escape(str(last_sync))}</strong>
                 </div>
@@ -1319,14 +1716,8 @@ try:
         st.warning("Start Date is after End Date. Please select a valid date range.")
         st.stop()
 
-    ag1_filtered = ag1[
-        (ag1["Date_Parsed"].dt.date >= start_date)
-        & (ag1["Date_Parsed"].dt.date <= end_date)
-    ].copy()
-    ag2_filtered = ag2[
-        (ag2["Date_Parsed"].dt.date >= start_date)
-        & (ag2["Date_Parsed"].dt.date <= end_date)
-    ].copy()
+    ag1_filtered = ag1[date_range_mask(ag1["Date_Parsed"], start_date, end_date)].copy()
+    ag2_filtered = ag2[date_range_mask(ag2["Date_Parsed"], start_date, end_date)].copy()
 
     ag1_filtered["Q_Status"] = ag1_filtered["Quality Status"].apply(map_quality)
     ag2_filtered["P_Status"] = ag2_filtered["Status"].apply(map_portal)
@@ -1980,13 +2371,19 @@ try:
         ag2_clean = ag2.copy()
         ag2_clean["Telephone No."] = ag2_clean["Telephone No."].astype(str).str.strip()
         ag2_clean = ag2_clean.rename(columns={"Status": "Portal Status", "Committed Date": "Live Date"})
-        ag2_unique = ag2_clean.sort_values("Date_Parsed").drop_duplicates("Telephone No.", keep="last")
+
+        # Use the same agreed Sale Date + Phone primary key in the detailed
+        # portal log. This prevents a customer with the same number on a later
+        # sale from receiving the wrong downstream status.
+        ag2_clean = add_record_keys(ag2_clean, "Sale Date", "Telephone No.")
+        ag2_unique = ag2_clean.sort_values("Date_Parsed").drop_duplicates("_RecordKey", keep="last")
 
         ag1_log_base = ag1.copy()
-        ag1_log_base["CLI_Key"] = ag1_log_base["CLI"].astype(str).str.strip()
+        ag1_log_base = add_record_keys(ag1_log_base, "Standardized_Date", "CLI")
         merged_log = ag1_log_base.merge(
             ag2_unique[
                 [
+                    "_RecordKey",
                     "Telephone No.",
                     "LetterStatus",
                     "CallStatus",
@@ -1997,8 +2394,7 @@ try:
                     "Live Date",
                 ]
             ],
-            left_on="CLI_Key",
-            right_on="Telephone No.",
+            on="_RecordKey",
             how="left",
         )
 
@@ -2058,8 +2454,7 @@ try:
                         key="log_end_date",
                     )
                 recent_log = merged_log[
-                    (merged_log["Date_Parsed"].dt.date >= log_start)
-                    & (merged_log["Date_Parsed"].dt.date <= log_end)
+                    date_range_mask(merged_log["Date_Parsed"], log_start, log_end)
                 ].sort_values(by="Date_Parsed", ascending=False)
             elif log_filter_type == "By Specific Month":
                 unique_months = sorted(
@@ -2453,7 +2848,7 @@ try:
     )
 
     st.html(
-        '<div class="footer-note">Sparta Agent Portal • Your performance data is refreshed automatically from the connected reporting sheets.</div>',
+        '<div class="footer-note">Sparta Agent Portal • Historical records remain sourced from Google Sheets; new records are added from the CRM API automatically.</div>',
     )
 
 except Exception as e:
