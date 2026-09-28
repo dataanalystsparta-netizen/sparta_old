@@ -1362,6 +1362,8 @@ def normalize_api_records(api_df):
     portal["Telephone No."] = api["Phone Number"]
     portal["Status"] = api["Committed (Live) Status (Onboarding Status)"].fillna("").astype(str).str.strip()
     portal["LetterStatus"] = api["LetterStatus (Dispatch Status)"].fillna("").astype(str).str.strip()
+    # Keep the API's provisioning fields under the dashboard's short internal
+    # names so the Recent Applications Log can use them directly.
     portal["Provisioning Status"] = api["Provisioning Status"].fillna("").astype(str).str.strip()
     portal["Provisioning Remarks"] = api["Provisioning Remarks (Provisioning Comments)"].apply(clean_reason_text)
     portal["CallStatus"] = api["Confirmation Status"].fillna("").astype(str).str.strip()
@@ -2620,8 +2622,8 @@ try:
             ("Welcome Call", "Status"),
             ("Welcome Call", "Welcome call Remarks"),
             ("Live Status", "LetterStatus"),
-            ("Live Status", "Provisioning Status"),
-            ("Live Status", "Provisioning Remarks"),
+            ("Provisioning", "Provisioning Status"),
+            ("Provisioning", "Provisioning Remarks"),
             ("Live Status", "CallStatus"),
             ("Live Status", "Portal Status"),
             ("Live Status", "Live Date"),
@@ -2787,7 +2789,8 @@ try:
                 recent_log,
                 [
                     "Customer Name", "CLI", "Quality Status", "Quality Remarks",
-                    "Status", "Welcome call Remarks", "LetterStatus", "CallStatus",
+                    "Status", "Welcome call Remarks", "LetterStatus",
+                    "Provisioning Status", "Provisioning Remarks", "CallStatus",
                     "Portal Status", "Comments", "Voice of Customer", "Cancellation Reason",
                 ],
             )
@@ -2933,6 +2936,10 @@ try:
 
                 if col == "LetterStatus":
                     current_style = f"background-color: {BG_BLUE};"
+                elif col == "Provisioning Status":
+                    current_style = f"background-color: {BG_BLUE};"
+                elif col == "Provisioning Remarks":
+                    current_style = f"background-color: {BG_BLUE};"
                 elif col == "CallStatus":
                     current_style = c_style
                 elif col in portal_group:
@@ -2954,7 +2961,7 @@ try:
                 if col == "S.No.":
                     current_style += "border-left: 3px solid #2563EB;"
 
-                if col in ["Customer Name", "Quality Remarks", "Welcome call Remarks", "Cancellation Reason"]:
+                if col in ["Customer Name", "Quality Remarks", "Welcome call Remarks", "Provisioning Remarks", "Cancellation Reason"]:
                     current_style += "border-right: 3px solid #E2E8F0;"
 
                 styles[i] = current_style
