@@ -7,19 +7,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 import calendar
 import math
-from html import escape, unescape as html_unescape
+from html import escape
 from io import BytesIO
 import re
 import time
 import requests
 import os
-import xml.etree.ElementTree as ET
-from email.utils import parsedate_to_datetime
-from datetime import timezone
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
 
 # ============================================================================
 # SPARTA AGENT PORTAL — PREMIUM UI REFRESH
@@ -837,101 +830,6 @@ st.html(
         margin: 10px 0;
     }
 
-    /* ----------------------------- UK NEWS -------------------------------- */
-    .news-box {
-        position: relative;
-        overflow: hidden;
-        margin: 12px 0 14px;
-        padding: 13px 17px 12px 17px;
-        border-radius: 15px;
-        background:
-            radial-gradient(circle at 100% 0%, rgba(37,99,235,.07), transparent 30%),
-            linear-gradient(180deg, #FFFFFF 0%, #F8FBFF 100%);
-        border: 1px solid #DDE7F3;
-        box-shadow: 0 7px 20px rgba(15,23,42,.045);
-    }
-
-    .news-box::before {
-        content: "";
-        position: absolute;
-        left: 0;
-        top: 0;
-        bottom: 0;
-        width: 4px;
-        background: linear-gradient(180deg, #2563EB, #06B6D4);
-    }
-
-    .news-head {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 10px;
-        margin-bottom: 4px;
-    }
-
-    .news-kicker {
-        color: #2563EB;
-        font-size: .62rem;
-        font-weight: 900;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
-
-    .news-time {
-        color: #94A3B8;
-        font-size: .61rem;
-        font-weight: 700;
-        white-space: nowrap;
-    }
-
-    .news-text {
-        color: #0F172A;
-        font-size: .82rem;
-        font-weight: 800;
-        line-height: 1.42;
-        margin: 0;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-
-    .news-meta {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        flex-wrap: wrap;
-        margin-top: 5px;
-        color: #64748B;
-        font-size: .62rem;
-        line-height: 1.3;
-    }
-
-    .news-link {
-        color: #2563EB !important;
-        text-decoration: none !important;
-        font-weight: 850;
-    }
-
-    .news-link:hover {
-        text-decoration: underline !important;
-    }
-
-    @media (max-width: 900px) {
-        .news-head {
-            align-items: flex-start;
-            flex-direction: column;
-            gap: 2px;
-        }
-
-        .news-time {
-            white-space: normal;
-        }
-
-        .news-text {
-            white-space: normal;
-        }
-    }
-
     /* --------------------------- RESPONSIVE ------------------------------ */
     @media (max-width: 900px) {
         .block-container { padding-left: 1rem; padding-right: 1rem; }
@@ -1014,17 +912,6 @@ SPARTA_API_AUTH_MODE = str(st.secrets.get("SPARTA_API_AUTH_MODE", "auto")).strip
 SPARTA_API_TIMEOUT = int(st.secrets.get("SPARTA_API_TIMEOUT_SECONDS", 60))
 SPARTA_API_MAX_RETRIES = int(st.secrets.get("SPARTA_API_MAX_RETRIES", 3))
 DATA_CACHE_TTL = int(st.secrets.get("DATA_CACHE_TTL_SECONDS", 300))
-
-# ---------------------------------------------------------------------------
-# UK NEWS CONFIGURATION
-# Sky News provides an official UK RSS feed which can be read directly by the
-# Streamlit application without requiring a separate news API key.
-# ---------------------------------------------------------------------------
-UK_NEWS_RSS_URL = st.secrets.get(
-    "UK_NEWS_RSS_URL",
-    "https://news.sky.com/uk?f=rss",
-)
-UK_NEWS_CACHE_TTL = int(st.secrets.get("UK_NEWS_CACHE_TTL_SECONDS", 3600))
 
 API_REQUIRED_COLUMNS = [
     "Sale Date",
@@ -1608,14 +1495,7 @@ def fetch_data():
 
 
 def map_quality(val):
-    s = str(val).lower().strip()
-
-    # Potential Opportunity is explicitly treated as Rework in the portal.
-    # This check must happen before rejected/cancelled checks because values
-    # such as "Potential Opportunity - Rejected" still belong to Rework.
-    if "potential opportunity" in s or s.startswith("potential"):
-        return "Rework"
-
+    s = str(val).lower()
     if any(x in s for x in ["appr", "pass"]):
         return "Approved"
     if any(x in s for x in ["rew", "repro"]):
@@ -1653,139 +1533,6 @@ def map_wc(val):
     if any(x in s for x in ["can", "rej"]):
         return "Cancelled"
     return "Others"
-
-
-# ----------------------------------------------------------------------------
-# RECENT APPLICATION LOG — CRM WORKFLOW COLOUR LOGIC
-# ----------------------------------------------------------------------------
-# These colours apply ONLY to current CRM Mirror records. The legacy Google /
-# older-Excel records continue to use the original colour rules unchanged.
-#
-# Green  = moves forward to the next workflow stage
-# Yellow = remains in the same workflow stage / needs continued work there
-# Blue   = backward / re-entry route (used because the workflow is not linear)
-# Red    = ends, is rejected, or is being cancelled from that stage
-
-WORKFLOW_GREEN = {
-    "background": "rgba(16, 185, 129, 0.18)",
-    "text": "#065F46",
-}
-WORKFLOW_YELLOW = {
-    "background": "rgba(245, 158, 11, 0.18)",
-    "text": "#92400E",
-}
-WORKFLOW_BLUE = {
-    "background": "rgba(59, 130, 246, 0.14)",
-    "text": "#1D4ED8",
-}
-WORKFLOW_RED = {
-    "background": "rgba(239, 68, 68, 0.18)",
-    "text": "#991B1B",
-}
-
-
-def normalize_workflow_status(value):
-    """Normalise CRM status text for exact workflow matching."""
-    s = str(value or "").strip().lower()
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def workflow_action(stage, status):
-    """Return green/yellow/blue/red meaning for a current CRM workflow status."""
-    s = normalize_workflow_status(status)
-    if not s or s in {"nan", "none"}:
-        return None
-
-    if stage == "quality":
-        if s in {"qa pending", "pending"}:
-            return WORKFLOW_YELLOW
-        if s in {"qa rejected", "qa reject", "rejected", "reject"}:
-            return WORKFLOW_RED
-        if "potential opportunity" in s or s.startswith("potential "):
-            return WORKFLOW_BLUE
-        if s in {"qa approved", "approved", "pass", "passed"}:
-            return WORKFLOW_GREEN
-
-    elif stage == "welcome":
-        if s in {"pending", "appointment missed", "followup", "follow up"}:
-            return WORKFLOW_YELLOW
-        if s in {"rejected", "reject"}:
-            return WORKFLOW_RED
-        if s in {"qa reassessment", "qa reassess"}:
-            return WORKFLOW_BLUE
-        if s in {"completed", "complete"}:
-            return WORKFLOW_GREEN
-
-    elif stage == "provisioning":
-        if s in {
-            "pending",
-            "provisioned",
-            "delayed",
-            "hold",
-            "to be extended",
-        }:
-            return WORKFLOW_YELLOW
-        if s in {"send for rework", "rework"}:
-            return WORKFLOW_BLUE
-        if s in {"to be cancelled", "cancelled", "canceled"}:
-            return WORKFLOW_RED
-        if s in {"completed", "complete"}:
-            return WORKFLOW_GREEN
-
-    elif stage == "dispatch":
-        if s == "pending":
-            return WORKFLOW_YELLOW
-        if s == "to be extended":
-            return WORKFLOW_BLUE
-        if s in {"to be cancelled", "cancelled", "canceled"}:
-            return WORKFLOW_RED
-        if s in {"completed", "complete"}:
-            return WORKFLOW_GREEN
-
-    elif stage == "committed":
-        if s in {"pending", "followup", "follow up"}:
-            return WORKFLOW_YELLOW
-        if s == "to be extended":
-            return WORKFLOW_BLUE
-        if s in {"to be cancelled", "cancelled", "canceled"}:
-            return WORKFLOW_RED
-        if s in {"satisfied", "completed", "complete"}:
-            return WORKFLOW_GREEN
-
-    elif stage == "onboarding":
-        if s in {
-            "installation pending",
-            "port pending",
-            "delayed",
-        }:
-            return WORKFLOW_YELLOW
-        if s in {"missed appointment", "to be extended"}:
-            return WORKFLOW_BLUE
-        if s in {"to be cancelled", "cancelled", "canceled"}:
-            return WORKFLOW_RED
-        if s in {"completed", "complete", "live"}:
-            return WORKFLOW_GREEN
-
-    elif stage == "potential":
-        if s in {"pending", "followup", "follow up"}:
-            return WORKFLOW_YELLOW
-        if s in {"rejected", "reject"}:
-            return WORKFLOW_RED
-        if s in {"qualified", "quality"}:
-            return WORKFLOW_GREEN
-
-    return None
-
-
-def workflow_style(action):
-    """Convert a workflow colour definition into a pandas Styler string."""
-    if not action:
-        return ""
-    return (
-        f"background-color: {action['background']}; "
-        f"color: {action['text']}; font-weight: 800;"
-    )
 
 
 def date_range_mask(series, start_date, end_date):
@@ -1939,214 +1686,6 @@ def add_date_strings(frame, source_col, output_col):
 
 def pick_existing(frame, candidates):
     return [c for c in candidates if c in frame.columns]
-
-
-# ----------------------------------------------------------------------------
-# UK NEWS
-# ----------------------------------------------------------------------------
-def _uk_timezone():
-    if ZoneInfo is not None:
-        try:
-            return ZoneInfo("Europe/London")
-        except Exception:
-            pass
-    return timezone.utc
-
-
-UK_TZ = _uk_timezone()
-
-
-def clean_news_text(value):
-    """Remove RSS HTML/whitespace and keep a compact, readable one-line summary."""
-    if value is None:
-        return ""
-    text_value = html_unescape(str(value))
-    text_value = re.sub(r"<[^>]+>", " ", text_value)
-    text_value = text_value.replace("\xa0", " ")
-    text_value = re.sub(r"\s+", " ", text_value).strip(" -–—|")
-    return text_value
-
-
-def parse_news_datetime(value):
-    """Parse common RSS publication dates and return a UK-localised datetime."""
-    if value is None:
-        return None
-
-    raw_value = str(value).strip()
-    if not raw_value:
-        return None
-
-    try:
-        parsed = parsedate_to_datetime(raw_value)
-    except Exception:
-        parsed = None
-
-    if parsed is None:
-        try:
-            parsed = pd.to_datetime(raw_value, errors="coerce", utc=True).to_pydatetime()
-            if pd.isna(parsed):
-                return None
-        except Exception:
-            return None
-
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-
-    try:
-        return parsed.astimezone(UK_TZ)
-    except Exception:
-        return parsed
-
-
-def make_one_line_news_summary(title, description):
-    """Prefer the feed summary, falling back to the headline, while enforcing one line."""
-    title = clean_news_text(title)
-    description = clean_news_text(description)
-
-    # A feed's description can be very short (or simply repeat the title).
-    if description and description.lower() != title.lower():
-        summary = description
-    else:
-        summary = title
-
-    if not summary:
-        return "UK news update unavailable."
-
-    # Keep the card compact while retaining a complete-looking sentence/headline.
-    max_chars = 260
-    if len(summary) > max_chars:
-        summary = summary[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
-
-    return summary
-
-
-@st.cache_data(ttl=UK_NEWS_CACHE_TTL, show_spinner=False)
-def fetch_uk_news(rss_url):
-    """Fetch the latest UK story from the configured RSS feed."""
-    headers = {
-        "User-Agent": "Sparta-Agent-Portal/1.0",
-        "Accept": "application/rss+xml, application/xml, text/xml, */*",
-    }
-
-    try:
-        response = requests.get(
-            rss_url,
-            headers=headers,
-            timeout=12,
-        )
-        response.raise_for_status()
-
-        root = ET.fromstring(response.content)
-        items = []
-
-        for item in root.findall(".//item"):
-            title = ""
-            description = ""
-            link = ""
-            pub_date = ""
-
-            for child in list(item):
-                tag = child.tag.split("}")[-1].lower()
-                value = child.text or ""
-
-                if tag == "title":
-                    title = value
-                elif tag in {"description", "summary"}:
-                    description = value
-                elif tag == "link":
-                    link = value
-                elif tag in {"pubdate", "published", "date"}:
-                    pub_date = value
-
-            title = clean_news_text(title)
-            description = clean_news_text(description)
-            link = str(link).strip()
-            published_uk = parse_news_datetime(pub_date)
-
-            if not title:
-                continue
-
-            items.append(
-                {
-                    "title": title,
-                    "description": description,
-                    "summary": make_one_line_news_summary(title, description),
-                    "link": link,
-                    "published_uk": published_uk,
-                }
-            )
-
-        if not items:
-            return {}, "No UK news items found."
-
-        # RSS feeds are normally newest-first. Sort explicitly so the portal does
-        # not depend on the source's ordering.
-        items.sort(
-            key=lambda row: row["published_uk"]
-            if row["published_uk"] is not None
-            else datetime.datetime.min.replace(tzinfo=timezone.utc),
-            reverse=True,
-        )
-
-        latest = items[0]
-        return latest, ""
-
-    except Exception as exc:
-        return {}, str(exc)
-
-
-def render_uk_news_box():
-    """Render a compact latest-UK-news card above the date filters."""
-    news_item, news_error = fetch_uk_news(UK_NEWS_RSS_URL)
-
-    if not news_item:
-        st.html(
-            """
-            <div class="news-box">
-                <div class="news-head">
-                    <div class="news-kicker">📰 UK News</div>
-                    <div class="news-time">Feed temporarily unavailable</div>
-                </div>
-                <p class="news-text">Latest UK news could not be loaded right now.</p>
-                <div class="news-meta">Your performance dashboard is still fully available.</div>
-            </div>
-            """
-        )
-        return
-
-    published = news_item.get("published_uk")
-    if published is not None:
-        published_text = published.strftime("%d %b %Y • %H:%M")
-    else:
-        published_text = "Publication time unavailable"
-
-    summary = escape(news_item.get("summary", "UK news update unavailable."))
-    source_link = news_item.get("link", "")
-    safe_link = escape(source_link, quote=True)
-
-    if source_link.startswith(("http://", "https://")):
-        link_html = (
-            f'<a class="news-link" href="{safe_link}" target="_blank" '
-            'rel="noopener noreferrer">Read full story →</a>'
-        )
-    else:
-        link_html = ""
-
-    st.html(
-        f"""
-        <div class="news-box">
-            <div class="news-head">
-                <div class="news-kicker">📰 UK News • Sky News</div>
-                <div class="news-time">{escape(published_text)} UK time</div>
-            </div>
-            <p class="news-text">{summary}</p>
-            <div class="news-meta">
-                <span>Latest UK update</span>
-                {link_html}
-            </div>
-        </div>
-        """
-    )
 
 
 def get_preset_dates(preset, today):
@@ -2317,11 +1856,6 @@ try:
             </div>
             """,
         )
-
-    # ------------------------------------------------------------------------
-    # UK NEWS
-    # ------------------------------------------------------------------------
-    render_uk_news_box()
 
     # ------------------------------------------------------------------------
     # GLOBAL DATE FILTER + QUICK PRESETS
@@ -3336,107 +2870,16 @@ try:
             end_idx = total_records
             display_df_page = display_df
 
-        # Row styling. IMPORTANT: CRM Mirror records use the new workflow-aware
-        # colours below. Older Google / legacy-Excel records retain the original
-        # portal colour rules exactly as they were.
+        # Row styling — same status meaning as the original portal, with a cleaner palette.
         def style_log_row(row):
             styles = [""] * len(row)
 
             def get_val(col_name):
                 for col in row.index:
                     if col[1] == col_name:
-                        return str(row[col]).lower().strip()
+                        return str(row[col]).lower()
                 return ""
 
-            # Source lives in the underlying recent_log row rather than the
-            # displayed MultiIndex, so it does not need to be shown as a column.
-            source = ""
-            try:
-                source = str(recent_log.loc[row.name, "Source"]).strip().lower()
-            except Exception:
-                pass
-
-            is_crm_mirror = source == "crm mirror"
-
-            # ----------------------------------------------------------------
-            # NEW CRM MIRROR WORKFLOW COLOURS
-            # ----------------------------------------------------------------
-            if is_crm_mirror:
-                quality_action = workflow_action("quality", get_val("Quality Status"))
-                welcome_action = workflow_action("welcome", get_val("Status"))
-                provisioning_action = workflow_action("provisioning", get_val("Provisioning Status"))
-                dispatch_action = workflow_action("dispatch", get_val("LetterStatus"))
-                committed_action = workflow_action("committed", get_val("CallStatus"))
-                onboarding_action = workflow_action("onboarding", get_val("Portal Status"))
-
-                quality_cols = {
-                    "Quality Status",
-                    "Quality Remarks",
-                }
-                welcome_cols = {
-                    "Status",
-                    "Welcome call Remarks",
-                }
-                provisioning_cols = {
-                    "Provisioning Status",
-                    "Provisioning Remarks",
-                }
-                dispatch_cols = {
-                    "LetterStatus",
-                }
-                committed_cols = {
-                    "CallStatus",
-                    "Comments",
-                }
-                onboarding_cols = {
-                    "Portal Status",
-                    "Live Date",
-                    "Voice of Customer",
-                    "Cancellation Reason",
-                }
-
-                action_by_col = {}
-                for col in quality_cols:
-                    action_by_col[col] = quality_action
-                for col in welcome_cols:
-                    action_by_col[col] = welcome_action
-                for col in provisioning_cols:
-                    action_by_col[col] = provisioning_action
-                for col in dispatch_cols:
-                    action_by_col[col] = dispatch_action
-                for col in committed_cols:
-                    action_by_col[col] = committed_action
-                for col in onboarding_cols:
-                    action_by_col[col] = onboarding_action
-
-                for i, col_tuple in enumerate(row.index):
-                    col = col_tuple[1]
-                    current_style = ""
-
-                    action = action_by_col.get(col)
-                    if action:
-                        current_style = workflow_style(action)
-
-                    if col == "S.No.":
-                        current_style += "border-left: 3px solid #2563EB;"
-
-                    if col in [
-                        "Customer Name",
-                        "Quality Remarks",
-                        "Welcome call Remarks",
-                        "Provisioning Remarks",
-                        "Comments",
-                        "Cancellation Reason",
-                    ]:
-                        current_style += "border-right: 3px solid #E2E8F0;"
-
-                    styles[i] = current_style
-
-                return styles
-
-            # ----------------------------------------------------------------
-            # LEGACY GOOGLE / OLDER-EXCEL COLOUR RULES — UNCHANGED
-            # ----------------------------------------------------------------
             DARK_GREEN = "#065F46"
             DARK_AMBER = "#92400E"
             DARK_RED = "#991B1B"
@@ -3524,12 +2967,6 @@ try:
                 styles[i] = current_style
 
             return styles
-
-        st.caption(
-            "CRM workflow colours: 🟢 moves forward  •  🟡 stays in the same stage  •  "
-            "🔵 backward / re-entry route  •  🔴 ends / rejected / cancelled  ·  "
-            "Legacy Excel records retain their existing colours."
-        )
 
         styled_log = display_df_page.style.apply(style_log_row, axis=1)
         st.dataframe(
