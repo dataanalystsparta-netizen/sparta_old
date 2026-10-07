@@ -2918,9 +2918,8 @@ try:
             display_df_page = display_df
 
         # Row/cell styling — CRM-aware status colouring.
-        # Status colours are intentionally applied to the status cells themselves
-        # rather than painting the entire record, so mixed downstream statuses
-        # remain visually distinguishable.
+        # Each status cell and its directly related remarks/detail cell share
+        # the same colour. Other unrelated cells remain neutral.
         def style_log_row(row):
             styles = [""] * len(row)
 
@@ -3043,18 +3042,22 @@ try:
                 col = col_tuple[1] if isinstance(col_tuple, tuple) and len(col_tuple) > 1 else str(col_tuple)
                 current_style = ""
 
-                if col == "Quality Status":
-                    current_style = q_style
-                elif col == "Status":
-                    current_style = wc_style
-                elif col == "LetterStatus":
-                    current_style = letter_style
-                elif col == "Provisioning Status":
-                    current_style = prov_style
-                elif col == "CallStatus":
-                    current_style = call_style
-                elif col == "Portal Status":
-                    current_style = portal_style
+                # Status + its directly related detail/remarks cell use the
+                # same colour, so the row's status context is immediately clear.
+                # The status cell remains the primary source of the colour.
+                style_by_col = {
+                    "Quality Status": q_style,
+                    "Quality Remarks": q_style,
+                    "Status": wc_style,
+                    "Welcome call Remarks": wc_style,
+                    "LetterStatus": letter_style,
+                    "Provisioning Status": prov_style,
+                    "Provisioning Remarks": prov_style,
+                    "CallStatus": call_style,
+                    "Comments": call_style,
+                    "Portal Status": portal_style,
+                }
+                current_style = style_by_col.get(col, "")
 
                 # Keep the established separators/layout accents.
                 if col == "S.No.":
