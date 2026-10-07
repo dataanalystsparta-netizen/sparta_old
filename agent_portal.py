@@ -851,6 +851,11 @@ CRM_MIRROR_SHEET_URL = st.secrets.get(
     "https://docs.google.com/spreadsheets/d/1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ/edit?gid=1647226826#gid=1647226826",
 )
 CRM_MIRROR_WORKSHEET_GID = int(st.secrets.get("CRM_MIRROR_WORKSHEET_GID", "1647226826"))
+ATTENDANCE_WORKSHEET_GID = int(st.secrets.get("ATTENDANCE_WORKSHEET_GID", "1036958145"))
+ATTENDANCE_SHEET_URL = st.secrets.get(
+    "ATTENDANCE_SHEET_URL",
+    "https://docs.google.com/spreadsheets/d/1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ/edit?gid=1036958145#gid=1036958145",
+)
 
 # ---------------------------------------------------------------------------
 # SOURCE CUTOVER
@@ -1404,6 +1409,64 @@ def fetch_crm_mirror(client):
     return crm_df, fetched_at, len(crm_df), ""
 
 
+def normalize_attendance_status(value):
+    """Convert the attendance sheet's raw value to the portal display code."""
+    if pd.isna(value):
+        return "-"
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null", "nat", "-"}:
+        return "-"
+    if text.upper() == "UL":
+        return "UL"
+
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return text.upper()
+
+    if number == 0:
+        return "Ab"
+    if number == 0.5:
+        return "HD"
+    if number == 1:
+        return "P"
+
+    # Preserve unexpected values rather than silently hiding them.
+    return str(value).strip()
+
+
+def fetch_attendance_sheet(client):
+    """Read the dedicated Attendance worksheet and normalize its fields."""
+    try:
+        ws = client.open_by_key(SPREADSHEET_ID).get_worksheet_by_id(ATTENDANCE_WORKSHEET_GID)
+        values = ws.get_all_records()
+        df = pd.DataFrame(values)
+    except Exception as exc:
+        return pd.DataFrame(), f"Attendance sheet unavailable: {exc}"
+
+    if df.empty:
+        return pd.DataFrame(), "Attendance sheet is empty"
+
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+
+    required = ["Name", "Date", "Attendance"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        return pd.DataFrame(), "Attendance sheet missing columns: " + ", ".join(missing)
+
+    df["Date_Parsed"] = parse_date_series(df["Date"])
+    df["Attendance_Code"] = df["Attendance"].apply(normalize_attendance_status)
+    df["Attendance_Agent"] = df["Name"].apply(canonicalize_advisor)
+    df["Name"] = df["Name"].fillna("").astype(str).str.strip()
+
+    # Keep only usable date rows. Duplicate Name/Date entries are reduced to
+    # the last supplied value, matching how the sheet is maintained.
+    df = df[df["Date_Parsed"].notna()].copy()
+    df = df.drop_duplicates(subset=["Attendance_Agent", "Date_Parsed"], keep="last")
+
+    return df.reset_index(drop=True), ""
+
+
 @st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
 def fetch_data():
     """Load legacy history through 17-Sep-2026 and newer records from CRM mirror.
@@ -1426,6 +1489,9 @@ def fetch_data():
     )
     client = gspread.authorize(creds)
     ss = client.open_by_key(SPREADSHEET_ID)
+
+    # Attendance is maintained in a dedicated worksheet in the same workbook.
+    attendance_df, attendance_error = fetch_attendance_sheet(client)
 
     # -----------------------------------------------------------------------
     # LEGACY SPARTA — inclusive through 17-Sep-2026 only
@@ -1538,7 +1604,12 @@ def fetch_data():
     else:
         connection_status = "Google history + CRM post-cutover connected"
 
-    return df1_combined, df2_combined, "\n".join(status_lines), connection_status
+    if attendance_error:
+        status_lines.append(f"Attendance warning: {attendance_error}")
+    else:
+        status_lines.append(f"Attendance rows: {len(attendance_df):,}")
+
+    return df1_combined, df2_combined, attendance_df, "\n".join(status_lines), connection_status
 
 
 def map_quality(val):
@@ -1871,11 +1942,19 @@ with st.sidebar:
 # DATA LOAD
 # ----------------------------------------------------------------------------
 try:
-    df1, df2_raw, last_sync, connection_status = fetch_data()
+    df1, df2_raw, attendance_df, last_sync, connection_status = fetch_data()
     # Agent login remains the control point: each agent only sees their own data.
     agent_compact = re.sub(r"[^a-z0-9]", "", str(agent).lower())
     ag1 = df1[df1["Advisor"].apply(lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower()) == agent_compact)].copy()
     ag2 = df2_raw[df2_raw["Advisor"].apply(lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower()) == agent_compact)].copy()
+    if not attendance_df.empty:
+        ag_attendance = attendance_df[
+            attendance_df["Attendance_Agent"].apply(
+                lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower()) == agent_compact
+            )
+        ].copy()
+    else:
+        ag_attendance = pd.DataFrame(columns=["Date_Parsed", "Attendance_Code", "Attendance_Agent", "Name"])
 
     # ------------------------------------------------------------------------
     # HERO
@@ -2494,7 +2573,7 @@ try:
             st.info("No application data for the selected date range.")
 
     with col_cal:
-        render_section("Sales activity heatmap", "▦", "Daily application intensity — darker cells mean more sales")
+        render_section("Sales activity heatmap", "▦", "Attendance + daily sales intensity — working-day cells show attendance and sales")
 
         def is_holiday(dt):
             wd = dt.weekday()  # 0=Mon, 6=Sun
@@ -2532,6 +2611,33 @@ try:
 
         daily_sales = ag1.groupby(ag1["Date_Parsed"].dt.date).size()
         calendar_max = int(daily_sales.max()) if not daily_sales.empty else 0
+
+        # Attendance is shown alongside the sales count in every working-day
+        # cell.  P = Present, HD = Half Day, Ab = Absent, UL = Unauthorised
+        # Leave.  Sales remain the heatmap intensity, so P/HD days can still
+        # show their corresponding sales count without changing the existing
+        # intensity logic.
+        attendance_by_date = {}
+        if not ag_attendance.empty:
+            for _, att_row in ag_attendance.iterrows():
+                dt = pd.to_datetime(att_row.get("Date_Parsed"), errors="coerce")
+                if pd.isna(dt):
+                    continue
+                attendance_by_date[dt.date()] = str(att_row.get("Attendance_Code", "-")).strip() or "-"
+
+        def cell_label(sales, attendance_code):
+            code = attendance_code if attendance_code and attendance_code != "-" else "-"
+            if sales > 0:
+                return f"{code}\n{int(sales)}"
+            return code
+
+        def cell_hover(day, kind, sales, attendance_code):
+            if kind == "Holiday":
+                return "Holiday"
+            pieces = [f"Attendance: {attendance_code if attendance_code else '-'}"]
+            pieces.append(f"Sales: {int(sales)}")
+            return "<br>".join(pieces)
+
         cal_df = pd.DataFrame(
             {
                 "Date": dates,
@@ -2539,11 +2645,16 @@ try:
                 "Weekday": [d.strftime("%a") for d in dates],
                 "WeekNum": [int(d.strftime("%V")) if d.strftime("%V").isdigit() else 0 for d in dates],
                 "Sales": [daily_sales.get(d, 0) for d in dates],
+                "Attendance": [attendance_by_date.get(d, "-") for d in dates],
                 "Type": ["Holiday" if is_holiday(d) else "Working" for d in dates],
             }
         )
+        cal_df["CellText"] = cal_df.apply(
+            lambda r: r["Day"] if r["Type"] == "Holiday" else cell_label(r["Sales"], r["Attendance"]),
+            axis=1,
+        )
         cal_df["HoverText"] = cal_df.apply(
-            lambda r: "Holiday" if r["Type"] == "Holiday" else f"{r['Sales']} sale(s)",
+            lambda r: cell_hover(r["Day"], r["Type"], r["Sales"], r["Attendance"]),
             axis=1,
         )
 
@@ -2554,11 +2665,11 @@ try:
                 x=working_days["Weekday"],
                 y=working_days["WeekNum"],
                 z=working_days["Sales"],
-                text=working_days["Day"],
+                text=working_days["CellText"],
                 customdata=working_days["HoverText"],
                 hovertemplate="%{customdata}<extra></extra>",
                 texttemplate="%{text}",
-                textfont=dict(color="#334155", size=11),
+                textfont=dict(color="#334155", size=10),
                 zmin=0,
                 zmax=max(calendar_max, 1),
                 colorscale=[[0, "#F8FAFC"], [0.15, "#E6F7EE"], [0.50, "#86EFAC"], [1, "#047857"]],
@@ -2607,7 +2718,8 @@ try:
         st.plotly_chart(fig_cal, use_container_width=True, config={"displayModeBar": False})
         st.caption(
             f"Showing {calendar.month_name[m_idx]} {sel_year} · peak day: {calendar_max:,} application(s) · "
-            "working day intensity  •  🔵 non-working / holiday"
+            "working day intensity by sales  •  P = Present  •  HD = Half Day  •  Ab = Absent  •  UL = Unauthorised Leave  •  "
+            "🔵 non-working / holiday"
         )
 
     # ------------------------------------------------------------------------
