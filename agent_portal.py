@@ -2612,72 +2612,166 @@ try:
         daily_sales = ag1.groupby(ag1["Date_Parsed"].dt.date).size()
         calendar_max = int(daily_sales.max()) if not daily_sales.empty else 0
 
-        # Attendance is shown alongside the sales count in every working-day
-        # cell.  P = Present, HD = Half Day, Ab = Absent, UL = Unauthorised
-        # Leave.  Sales remain the heatmap intensity, so P/HD days can still
-        # show their corresponding sales count without changing the existing
-        # intensity logic.
+        # -------------------------------------------------------------------
+        # ATTENDANCE + SALES HEATMAP
+        # -------------------------------------------------------------------
+        # Each working-day cell contains:
+        #   line 1 = day of month (1, 2, 3, ...)
+        #   line 2 = attendance + sales, e.g. P3 / HD1 / Ab / UL2
+        #
+        # Colour carries BOTH dimensions:
+        #   P  = green family
+        #   HD = yellow/amber family
+        #   Ab = red family
+        #   UL = blue/indigo family
+        # Within each attendance family, darker/more saturated cells mean
+        # more sales.  Thus P1, P2, P3, P4+ are visibly different, as are
+        # HD1, HD2, HD3, etc., without losing the attendance meaning.
+        #
+        # Existing holiday logic is unchanged: Sundays + 1st/3rd/5th
+        # Saturdays remain non-working/holiday cells.
         attendance_by_date = {}
         if not ag_attendance.empty:
             for _, att_row in ag_attendance.iterrows():
                 dt = pd.to_datetime(att_row.get("Date_Parsed"), errors="coerce")
                 if pd.isna(dt):
                     continue
-                attendance_by_date[dt.date()] = str(att_row.get("Attendance_Code", "-")).strip() or "-"
+                attendance_by_date[dt.date()] = str(
+                    att_row.get("Attendance_Code", "-")
+                ).strip() or "-"
 
-        def cell_label(sales, attendance_code):
-            code = attendance_code if attendance_code and attendance_code != "-" else "-"
-            if sales > 0:
-                return f"{code}\n{int(sales)}"
-            return code
+        def display_attendance_code(value):
+            code = str(value or "-").strip()
+            return code if code else "-"
+
+        def cell_label(day, sales, attendance_code):
+            code = display_attendance_code(attendance_code)
+            if code == "-":
+                second_line = f"-{int(sales)}" if sales > 0 else "-"
+            else:
+                second_line = f"{code}{int(sales)}" if sales > 0 else code
+            return f"{int(day)}<br>{second_line}"
 
         def cell_hover(day, kind, sales, attendance_code):
             if kind == "Holiday":
-                return "Holiday"
-            pieces = [f"Attendance: {attendance_code if attendance_code else '-'}"]
-            pieces.append(f"Sales: {int(sales)}")
-            return "<br>".join(pieces)
+                return f"Date: {day}<br>Holiday / Non-working day<br>Sales: {int(sales)}"
+            code = display_attendance_code(attendance_code)
+            return (
+                f"Date: {day}<br>Attendance: {escape(code)}<br>"
+                f"Sales: {int(sales)}"
+            )
 
         cal_df = pd.DataFrame(
             {
                 "Date": dates,
                 "Day": [d.day for d in dates],
                 "Weekday": [d.strftime("%a") for d in dates],
-                "WeekNum": [int(d.strftime("%V")) if d.strftime("%V").isdigit() else 0 for d in dates],
+                "WeekNum": [
+                    int(d.strftime("%V")) if d.strftime("%V").isdigit() else 0
+                    for d in dates
+                ],
                 "Sales": [daily_sales.get(d, 0) for d in dates],
-                "Attendance": [attendance_by_date.get(d, "-") for d in dates],
-                "Type": ["Holiday" if is_holiday(d) else "Working" for d in dates],
+                "Attendance": [
+                    attendance_by_date.get(d, "-") for d in dates
+                ],
+                "Type": [
+                    "Holiday" if is_holiday(d) else "Working" for d in dates
+                ],
             }
         )
         cal_df["CellText"] = cal_df.apply(
-            lambda r: r["Day"] if r["Type"] == "Holiday" else cell_label(r["Sales"], r["Attendance"]),
+            lambda r: cell_label(r["Day"], r["Sales"], r["Attendance"])
+            if r["Type"] == "Working"
+            else str(int(r["Day"])),
             axis=1,
         )
         cal_df["HoverText"] = cal_df.apply(
-            lambda r: cell_hover(r["Day"], r["Type"], r["Sales"], r["Attendance"]),
+            lambda r: cell_hover(
+                r["Day"], r["Type"], r["Sales"], r["Attendance"]
+            ),
             axis=1,
         )
 
+        # Base attendance colour families. The intensity inside each family is
+        # driven by the number of sales on that date.
+        attendance_palettes = {
+            "P": [
+                [0.00, "#ECFDF5"],
+                [0.25, "#BBF7D0"],
+                [0.50, "#6EE7B7"],
+                [0.75, "#34D399"],
+                [1.00, "#047857"],
+            ],
+            "HD": [
+                [0.00, "#FFFBEB"],
+                [0.25, "#FEF3C7"],
+                [0.50, "#FDE68A"],
+                [0.75, "#FBBF24"],
+                [1.00, "#B45309"],
+            ],
+            "Ab": [
+                [0.00, "#FEF2F2"],
+                [0.25, "#FECACA"],
+                [0.50, "#FCA5A5"],
+                [0.75, "#F87171"],
+                [1.00, "#B91C1C"],
+            ],
+            "UL": [
+                [0.00, "#EEF2FF"],
+                [0.25, "#C7D2FE"],
+                [0.50, "#A5B4FC"],
+                [0.75, "#818CF8"],
+                [1.00, "#4338CA"],
+            ],
+            "-": [
+                [0.00, "#F8FAFC"],
+                [0.25, "#E2E8F0"],
+                [0.50, "#CBD5E1"],
+                [0.75, "#94A3B8"],
+                [1.00, "#64748B"],
+            ],
+        }
+
+        attendance_order = ["P", "HD", "Ab", "UL", "-"]
+
+        # Split into one heatmap trace per attendance family. This lets each
+        # family retain its own meaningful colour scale while sales controls
+        # intensity within that family.
         fig_cal = go.Figure()
-        working_days = cal_df[cal_df["Type"] == "Working"]
-        fig_cal.add_trace(
-            go.Heatmap(
-                x=working_days["Weekday"],
-                y=working_days["WeekNum"],
-                z=working_days["Sales"],
-                text=working_days["CellText"],
-                customdata=working_days["HoverText"],
-                hovertemplate="%{customdata}<extra></extra>",
-                texttemplate="%{text}",
-                textfont=dict(color="#334155", size=10),
-                zmin=0,
-                zmax=max(calendar_max, 1),
-                colorscale=[[0, "#F8FAFC"], [0.15, "#E6F7EE"], [0.50, "#86EFAC"], [1, "#047857"]],
-                showscale=False,
-                xgap=3,
-                ygap=3,
+        working_days = cal_df[cal_df["Type"] == "Working"].copy()
+
+        sales_scale_max = max(calendar_max, 1)
+        for code in attendance_order:
+            subset = working_days[
+                working_days["Attendance"].apply(display_attendance_code) == code
+            ].copy()
+            if subset.empty:
+                continue
+
+            subset["SalesIntensity"] = subset["Sales"].clip(
+                lower=0, upper=sales_scale_max
             )
-        )
+
+            fig_cal.add_trace(
+                go.Heatmap(
+                    x=subset["Weekday"],
+                    y=subset["WeekNum"],
+                    z=subset["SalesIntensity"],
+                    text=subset["CellText"],
+                    customdata=subset["HoverText"],
+                    hovertemplate="%{customdata}<extra></extra>",
+                    texttemplate="%{text}",
+                    textfont=dict(color="#334155", size=10),
+                    zmin=0,
+                    zmax=sales_scale_max,
+                    colorscale=attendance_palettes[code],
+                    showscale=False,
+                    xgap=3,
+                    ygap=3,
+                    hoverongaps=False,
+                    name=code,
+                )
+            )
 
         holidays = cal_df[cal_df["Type"] == "Holiday"]
         fig_cal.add_trace(
@@ -2685,17 +2779,23 @@ try:
                 x=holidays["Weekday"],
                 y=holidays["WeekNum"],
                 mode="markers+text",
-                marker=dict(symbol="square", size=35, color="#DDEBFF", line=dict(color="#BFD7F7", width=1)),
+                marker=dict(
+                    symbol="square",
+                    size=35,
+                    color="#DDEBFF",
+                    line=dict(color="#BFD7F7", width=1),
+                ),
                 text=holidays["Day"],
                 customdata=holidays["HoverText"],
                 hovertemplate="%{customdata}<extra></extra>",
                 textfont=dict(color="#64748B", size=11),
                 showlegend=False,
+                name="Holiday",
             )
         )
 
         fig_cal.update_layout(
-            height=325,
+            height=340,
             margin=dict(l=0, r=0, t=2, b=4),
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(255,255,255,.72)",
@@ -2714,12 +2814,32 @@ try:
                 showticklabels=False,
                 fixedrange=True,
             ),
+            showlegend=False,
         )
-        st.plotly_chart(fig_cal, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(
+            fig_cal,
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )
+
+        # Compact legend: attendance determines hue, sales determine depth.
+        st.html(
+            """
+            <div style="display:flex;flex-wrap:wrap;gap:7px 14px;align-items:center;
+                        margin:2px 0 5px;font-size:.65rem;color:#475569;font-weight:750;">
+                <span style="font-weight:900;color:#334155;">Attendance + sales:</span>
+                <span><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:#34D399;vertical-align:-1px;margin-right:4px;"></span>P = Present</span>
+                <span><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:#FBBF24;vertical-align:-1px;margin-right:4px;"></span>HD = Half Day</span>
+                <span><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:#F87171;vertical-align:-1px;margin-right:4px;"></span>Ab = Absent</span>
+                <span><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:#818CF8;vertical-align:-1px;margin-right:4px;"></span>UL = Unauthorised Leave</span>
+                <span style="color:#64748B;">Darker = more sales</span>
+            </div>
+            """
+        )
         st.caption(
             f"Showing {calendar.month_name[m_idx]} {sel_year} · peak day: {calendar_max:,} application(s) · "
-            "working day intensity by sales  •  P = Present  •  HD = Half Day  •  Ab = Absent  •  UL = Unauthorised Leave  •  "
-            "🔵 non-working / holiday"
+            "cell format = date + attendance/sales (e.g. P3, HD1, Ab, UL2) · "
+            "Sundays + 1st/3rd/5th Saturdays remain non-working / holiday cells"
         )
 
     # ------------------------------------------------------------------------
