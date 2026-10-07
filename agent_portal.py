@@ -2917,6 +2917,18 @@ try:
             end_idx = total_records
             display_df_page = display_df
 
+        # Display cleanup: show a dash instead of missing/None-like values.
+        # This is intentionally applied only to the visible table, so source
+        # data and calculations remain unchanged.
+        display_df_page = display_df_page.copy()
+        for _col in display_df_page.columns:
+            display_df_page[_col] = display_df_page[_col].apply(
+                lambda _value: "-"
+                if pd.isna(_value)
+                or str(_value).strip().lower() in {"none", "nan", "nat", "null", ""}
+                else _value
+            )
+
         # Row/cell styling — CRM-aware status colouring.
         # Each status cell and its directly related remarks/detail cell share
         # the same colour. Other unrelated cells remain neutral.
@@ -2947,18 +2959,24 @@ try:
 
                 # ----------------------------- QUALITY ----------------------
                 if kind == "quality":
+                    # Explicit CRM / legacy values requested:
+                    # In-bound cancel, Quality Cancel and SOP are red.
+                    if any(x in v for x in [
+                        "in-bound cancel", "inbound cancel", "quality cancel",
+                        "sop", "rejected", "reject", "cancelled", "canceled",
+                    ]):
+                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
                     if any(x in v for x in ["approved", "approve", "pass", "qa approved", "satisfied"]):
                         return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
                     if any(x in v for x in ["rework", "re-work", "followup", "follow up", "pending"]):
                         return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
-                    if any(x in v for x in ["rejected", "reject", "cancelled", "canceled"]):
-                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
 
                 # ----------------------------- WELCOME ----------------------
                 if kind == "welcome":
+                    # Exact/common CRM values: Done = green, Cancel = red.
                     if any(x in v for x in [
                         "welcome approved", "welcome: approved", "approved", "welcome done",
-                        "completed", "complete", "pass", "satisfied",
+                        "done", "completed", "complete", "pass", "satisfied",
                     ]):
                         return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
                     if any(x in v for x in [
@@ -2968,6 +2986,7 @@ try:
                         return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
                     if any(x in v for x in [
                         "welcome rejected", "rejected", "reject", "cancelled", "canceled",
+                        "cancel",
                     ]):
                         return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
 
@@ -3022,6 +3041,9 @@ try:
 
                 # ------------------------------ LIVE ------------------------
                 if kind == "portal":
+                    # Missed / Delayed are operational attention statuses.
+                    if any(x in v for x in ["missed", "delayed", "delay"]):
+                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
                     if "live" in v:
                         return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
                     if any(x in v for x in ["committed", "pending", "followup", "follow-up"]):
