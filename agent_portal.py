@@ -852,6 +852,14 @@ CRM_MIRROR_SHEET_URL = st.secrets.get(
 )
 CRM_MIRROR_WORKSHEET_GID = int(st.secrets.get("CRM_MIRROR_WORKSHEET_GID", "1647226826"))
 
+# ---------------------------------------------------------------------------
+# SOURCE CUTOVER
+# ---------------------------------------------------------------------------
+# Legacy Sparta / Sparta2 data is used only through 17-Sep-2026 (inclusive).
+# All records after 17-Sep-2026 are taken only from the CRM mirror worksheet.
+LEGACY_SOURCE_CUTOFF = pd.Timestamp("2026-09-17")
+CRM_SOURCE_START = LEGACY_SOURCE_CUTOFF + pd.Timedelta(days=1)
+
 # Existing authentication remains unchanged.
 ACCESS_KEYS = st.secrets["agent_keys"]
 
@@ -1398,7 +1406,15 @@ def fetch_crm_mirror(client):
 
 @st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
 def fetch_data():
-    """Load Google history and API future records independently, then reconcile once."""
+    """Load legacy history through 17-Sep-2026 and newer records from CRM mirror.
+
+    Source rules:
+      * Sparta / Sparta2 legacy tabs: Sale Date <= 17-Sep-2026 only.
+      * CRM mirror worksheet: Sale Date >= 18-Sep-2026 only.
+
+    This prevents the same post-cutover record from being sourced from the
+    legacy tabs and ensures CRM is the sole source for newer records.
+    """
     # =============================== GOOGLE ================================
     info = st.secrets["gcp_service_account"]
     creds = Credentials.from_service_account_info(
@@ -1411,7 +1427,9 @@ def fetch_data():
     client = gspread.authorize(creds)
     ss = client.open_by_key(SPREADSHEET_ID)
 
-    # These are intentionally loaded exactly as the legacy portal expected.
+    # -----------------------------------------------------------------------
+    # LEGACY SPARTA — inclusive through 17-Sep-2026 only
+    # -----------------------------------------------------------------------
     df1 = pd.DataFrame(ss.worksheet("Sparta").get_all_records())
     if df1.empty:
         df1 = pd.DataFrame(columns=["Standardized_Date", "Advisor", "Quality Status", "CLI", "Customer Name"])
@@ -1425,6 +1443,15 @@ def fetch_data():
     df1["Advisor"] = df1["Advisor"].astype(str).str.strip().str.title()
     df1["Source"] = "Google - Sparta"
 
+    legacy_sparta_total = len(df1)
+    df1 = df1[
+        df1["Date_Parsed"].notna()
+        & (df1["Date_Parsed"] <= LEGACY_SOURCE_CUTOFF)
+    ].copy()
+
+    # -----------------------------------------------------------------------
+    # LEGACY SPARTA2 — inclusive through 17-Sep-2026 only
+    # -----------------------------------------------------------------------
     df2_raw = pd.DataFrame(ss.worksheet("Sparta2").get_all_records())
     if df2_raw.empty:
         df2_raw = pd.DataFrame(columns=["Sale Date", "Agent", "Status", "Telephone No."])
@@ -1438,6 +1465,12 @@ def fetch_data():
     df2_raw["Advisor"] = df2_raw["Agent"].astype(str).str.strip().str.title()
     df2_raw["Source"] = "Google - Sparta2"
 
+    legacy_sparta2_total = len(df2_raw)
+    df2_raw = df2_raw[
+        df2_raw["Date_Parsed"].notna()
+        & (df2_raw["Date_Parsed"] <= LEGACY_SOURCE_CUTOFF)
+    ].copy()
+
     try:
         meta = ss.worksheet("Meta").get_all_values()
         google_last_sync = meta[0][1] if meta and len(meta[0]) > 1 else "Unknown"
@@ -1445,28 +1478,36 @@ def fetch_data():
         google_last_sync = "Unknown"
 
     # ============================ CRM MIRROR ==============================
-    # The independent sync job fetches the CRM Excel and writes it to a
-    # dedicated Google worksheet every 5 minutes. The portal only reads that
-    # worksheet; it does not call the CRM API directly.
+    # The independent sync job writes the current CRM Excel export to the
+    # dedicated Google worksheet. The portal reads ONLY post-cutover records
+    # from this CRM mirror.
     api_df, api_fetched_at, api_row_count, api_error = fetch_crm_mirror(client)
 
-    # Never modify or deduplicate the Google history. It remains authoritative
-    # for records that already exist there.
-    existing_keys = existing_google_keys(df1, df2_raw)
+    crm_total_before_cutover = len(api_df)
+    crm_cutover_excluded = 0
+    crm_invalid_dates = 0
+
+    if not api_df.empty:
+        if "Sale Date" in api_df.columns:
+            crm_dates = parse_api_date_series(api_df["Sale Date"])
+            crm_invalid_dates = int(crm_dates.isna().sum())
+            crm_mask = crm_dates.notna() & (crm_dates >= CRM_SOURCE_START)
+            crm_cutover_excluded = int((crm_dates.notna() & (crm_dates < CRM_SOURCE_START)).sum())
+            api_df = api_df.loc[crm_mask].copy()
+        else:
+            api_df = pd.DataFrame()
+
     api_app, api_portal = normalize_api_records(api_df)
 
-    if api_app.empty:
-        new_api_app = api_app
-        new_api_portal = api_portal
-        duplicate_count = 0
-    else:
-        api_keys = set(api_app["_RecordKey"].dropna().astype(str))
-        new_keys = api_keys - existing_keys
-        new_api_app = api_app[api_app["_RecordKey"].isin(new_keys)].copy()
-        new_api_portal = api_portal[api_portal["_RecordKey"].isin(new_keys)].copy()
-        duplicate_count = len(api_app) - len(new_api_app)
+    # Since the legacy sources stop at 17-Sep-2026, CRM is the sole authority
+    # for all records from 18-Sep-2026 onward. Still guard against duplicate
+    # keys inside the CRM export itself (normalize_api_records already keeps
+    # the latest row for duplicate CRM keys).
+    new_api_app = api_app.copy()
+    new_api_portal = api_portal.copy()
 
-    # Concatenate only NEW API records; existing Google rows remain untouched.
+    # Concatenate the two logical datasets. No post-cutover legacy records can
+    # enter because of the explicit cutoff above.
     df1_combined = pd.concat([df1, new_api_app], ignore_index=True, sort=False)
     df2_combined = pd.concat([df2_raw, new_api_portal], ignore_index=True, sort=False)
 
@@ -1476,20 +1517,26 @@ def fetch_data():
     df1_combined["Advisor"] = df1_combined["Advisor"].fillna("").astype(str).str.strip()
     df2_combined["Advisor"] = df2_combined["Advisor"].fillna("").astype(str).str.strip()
 
+    # Keep the on-screen sync status useful without exposing the source token.
     status_lines = [
-        f"Google sync: {google_last_sync}",
-        f"CRM mirror: {api_fetched_at}",
+        f"Legacy cutoff: {LEGACY_SOURCE_CUTOFF.strftime('%d-%b-%Y')}",
+        f"Legacy Sparta rows: {len(df1):,} of {legacy_sparta_total:,}",
+        f"Legacy Sparta2 rows: {len(df2_raw):,} of {legacy_sparta2_total:,}",
+        f"CRM mirror sync: {api_fetched_at}",
         f"CRM mirror rows: {api_row_count:,}",
-        f"New CRM records added: {len(new_api_app):,}",
+        f"CRM post-cutover rows: {len(new_api_app):,}",
     ]
-    if duplicate_count:
-        status_lines.append(f"CRM records already in Google: {duplicate_count:,}")
+
+    if crm_cutover_excluded:
+        status_lines.append(f"CRM rows before cutover ignored: {crm_cutover_excluded:,}")
+    if crm_invalid_dates:
+        status_lines.append(f"CRM rows with invalid Sale Date ignored: {crm_invalid_dates:,}")
 
     if api_error:
         status_lines.append(f"CRM mirror warning: {api_error}")
         connection_status = "Google connected • CRM mirror unavailable"
     else:
-        connection_status = "Google + CRM mirror connected"
+        connection_status = "Google history + CRM post-cutover connected"
 
     return df1_combined, df2_combined, "\n".join(status_lines), connection_status
 
@@ -2870,99 +2917,156 @@ try:
             end_idx = total_records
             display_df_page = display_df
 
-        # Row styling — same status meaning as the original portal, with a cleaner palette.
+        # Row/cell styling — CRM-aware status colouring.
+        # Status colours are intentionally applied to the status cells themselves
+        # rather than painting the entire record, so mixed downstream statuses
+        # remain visually distinguishable.
         def style_log_row(row):
             styles = [""] * len(row)
 
             def get_val(col_name):
                 for col in row.index:
-                    if col[1] == col_name:
-                        return str(row[col]).lower()
+                    if isinstance(col, tuple) and len(col) > 1 and col[1] == col_name:
+                        return str(row[col]).strip().lower()
                 return ""
 
             DARK_GREEN = "#065F46"
             DARK_AMBER = "#92400E"
             DARK_RED = "#991B1B"
+            DARK_BLUE = "#1D4ED8"
 
             BG_GREEN = "rgba(16, 185, 129, 0.16)"
-            BG_AMBER = "rgba(245, 158, 11, 0.16)"
+            BG_AMBER = "rgba(245, 158, 11, 0.18)"
             BG_RED = "rgba(239, 68, 68, 0.16)"
-            BG_BLUE = "rgba(59, 130, 246, 0.12)"
+            BG_BLUE = "rgba(59, 130, 246, 0.10)"
 
-            q_val = get_val("Quality Status")
-            q_bg, q_txt = "", ""
-            if any(x in q_val for x in ["appr", "pass"]):
-                q_bg, q_txt = BG_GREEN, DARK_GREEN
-            elif any(x in q_val for x in ["rew", "repro"]):
-                q_bg, q_txt = BG_AMBER, DARK_AMBER
-            elif any(x in q_val for x in ["can", "rej"]):
-                q_bg, q_txt = BG_RED, DARK_RED
-            q_style = f"background-color: {q_bg}; color: {q_txt}; font-weight: 800;" if q_bg else ""
+            def status_style(value, kind):
+                """Return one precise cell style for a CRM/legacy status value."""
+                v = re.sub(r"\s+", " ", str(value or "").strip().lower())
+                if not v:
+                    return ""
 
-            wc_val = get_val("Status")
-            wc_bg, wc_txt = "", ""
-            if any(x in wc_val for x in ["done", "pass", "comp", "live"]):
-                wc_bg, wc_txt = BG_GREEN, DARK_GREEN
-            elif any(x in wc_val for x in ["pend", "pnd", "paper", "ppw", "com"]):
-                wc_bg, wc_txt = BG_AMBER, DARK_AMBER
-            elif any(x in wc_val for x in ["can", "rej"]):
-                wc_bg, wc_txt = BG_RED, DARK_RED
-            wc_style = f"background-color: {wc_bg}; color: {wc_txt}; font-weight: 800;" if wc_bg else ""
+                # ----------------------------- QUALITY ----------------------
+                if kind == "quality":
+                    if any(x in v for x in ["approved", "approve", "pass", "qa approved", "satisfied"]):
+                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
+                    if any(x in v for x in ["rework", "re-work", "followup", "follow up", "pending"]):
+                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
+                    if any(x in v for x in ["rejected", "reject", "cancelled", "canceled"]):
+                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
 
-            call_val = get_val("CallStatus")
-            c_bg, c_txt = "", ""
-            if "satisfied" in call_val:
-                c_bg, c_txt = BG_GREEN, DARK_GREEN
-            elif any(x in call_val for x in ["pend", "cancel"]):
-                c_bg, c_txt = BG_RED, DARK_RED
-            c_style = f"background-color: {c_bg}; color: {c_txt}; font-weight: 800;" if c_bg else ""
+                # ----------------------------- WELCOME ----------------------
+                if kind == "welcome":
+                    if any(x in v for x in [
+                        "welcome approved", "welcome: approved", "approved", "welcome done",
+                        "completed", "complete", "pass", "satisfied",
+                    ]):
+                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
+                    if any(x in v for x in [
+                        "welcome followup", "welcome follow-up", "followup", "follow up",
+                        "pending", "ringing", "chasing", "paperwork", "other work",
+                    ]):
+                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
+                    if any(x in v for x in [
+                        "welcome rejected", "rejected", "reject", "cancelled", "canceled",
+                    ]):
+                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
 
-            portal_val = get_val("Portal Status")
-            p_bg, p_txt = "", ""
-            if "live" in portal_val:
-                p_bg, p_txt = BG_GREEN, DARK_GREEN
-            elif "committed" in portal_val:
-                p_bg, p_txt = BG_AMBER, DARK_AMBER
-            elif any(x in portal_val for x in ["rej", "cancel"]):
-                p_bg, p_txt = BG_RED, DARK_RED
-            p_style = f"background-color: {p_bg}; color: {p_txt}; font-weight: 800;" if p_bg else ""
+                # --------------------------- CONFIRMATION -------------------
+                if kind == "confirmation":
+                    if any(x in v for x in [
+                        "confirmation approved", "approved", "confirmed", "satisfied",
+                    ]):
+                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
+                    if any(x in v for x in [
+                        "confirmation followup", "confirmation follow-up", "followup", "follow up",
+                        "pending", "ringing", "chasing",
+                    ]):
+                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
+                    if any(x in v for x in [
+                        "confirmation rejected", "rejected", "reject", "cancelled", "canceled",
+                        "to be cancelled", "to be canceled",
+                    ]):
+                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
 
-            quality_cols = ["S.No.", "Sale Date", "Customer Name", "Quality Status", "Quality Remarks"]
-            portal_group = ["Portal Status", "Live Date", "Comments", "Voice of Customer", "Cancellation Reason"]
+                # -------------------------- PROVISIONING --------------------
+                if kind == "provisioning":
+                    # Explicit CRM values requested: Connectivity: Committed
+                    # and Connectivity: Order Cancelled.
+                    if "connectivity: order cancelled" in v or "connectivity: order canceled" in v:
+                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
+                    if "connectivity: committed" in v:
+                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
+                    if any(x in v for x in [
+                        "provisioned", "provisioning complete", "order completed", "completed",
+                        "processed", "confirmed", "connected", "live",
+                    ]):
+                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
+                    if any(x in v for x in [
+                        "pending", "followup", "follow-up", "delay", "delayed", "in progress",
+                        "other work", "potential opportunity", "committed",
+                    ]):
+                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
+                    if any(x in v for x in [
+                        "order cancelled", "order canceled", "cancelled", "canceled", "rejected", "reject",
+                    ]):
+                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
+
+                # ------------------------------ LETTER ----------------------
+                if kind == "letter":
+                    if any(x in v for x in ["letter sent", "mail sent", "dispatched", "dispatch approved", "sent"]):
+                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
+                    if any(x in v for x in ["pending", "followup", "follow-up", "re-sent", "resend"]):
+                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
+                    if any(x in v for x in ["cancelled", "canceled", "rejected", "reject"]):
+                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
+
+                # ------------------------------ LIVE ------------------------
+                if kind == "portal":
+                    if "live" in v:
+                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
+                    if any(x in v for x in ["committed", "pending", "followup", "follow-up"]):
+                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
+                    if any(x in v for x in ["rejected", "reject", "cancelled", "canceled", "to be cancelled"]):
+                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
+
+                return ""
+
+            q_style = status_style(get_val("Quality Status"), "quality")
+            wc_style = status_style(get_val("Status"), "welcome")
+            letter_style = status_style(get_val("LetterStatus"), "letter")
+            prov_style = status_style(get_val("Provisioning Status"), "provisioning")
+            call_style = status_style(get_val("CallStatus"), "confirmation")
+            portal_style = status_style(get_val("Portal Status"), "portal")
 
             for i, col_tuple in enumerate(row.index):
-                col = col_tuple[1]
+                col = col_tuple[1] if isinstance(col_tuple, tuple) and len(col_tuple) > 1 else str(col_tuple)
                 current_style = ""
 
-                if col == "LetterStatus":
-                    current_style = f"background-color: {BG_BLUE};"
+                if col == "Quality Status":
+                    current_style = q_style
+                elif col == "Status":
+                    current_style = wc_style
+                elif col == "LetterStatus":
+                    current_style = letter_style
                 elif col == "Provisioning Status":
-                    current_style = f"background-color: {BG_BLUE};"
-                elif col == "Provisioning Remarks":
-                    current_style = f"background-color: {BG_BLUE};"
+                    current_style = prov_style
                 elif col == "CallStatus":
-                    current_style = c_style
-                elif col in portal_group:
-                    if col == "Portal Status":
-                        current_style = p_style
-                    else:
-                        current_style = f"background-color: {p_bg};" if p_bg else ""
-                elif col in quality_cols:
-                    if col == "Quality Status":
-                        current_style = q_style
-                    else:
-                        current_style = f"background-color: {q_bg};" if q_bg else ""
-                else:
-                    if col == "Status":
-                        current_style = wc_style
-                    else:
-                        current_style = f"background-color: {wc_bg};" if wc_bg else ""
+                    current_style = call_style
+                elif col == "Portal Status":
+                    current_style = portal_style
 
+                # Keep the established separators/layout accents.
                 if col == "S.No.":
-                    current_style += "border-left: 3px solid #2563EB;"
-
-                if col in ["Customer Name", "Quality Remarks", "Welcome call Remarks", "Provisioning Remarks", "Cancellation Reason"]:
-                    current_style += "border-right: 3px solid #E2E8F0;"
+                    current_style += "border-left:3px solid #2563EB;"
+                if col in [
+                    "Customer Name",
+                    "Quality Remarks",
+                    "Welcome call Remarks",
+                    "Provisioning Remarks",
+                    "Cancellation Reason",
+                ]:
+                    current_style += "border-right:3px solid #E2E8F0;"
 
                 styles[i] = current_style
 
@@ -3059,7 +3163,7 @@ try:
     )
 
     st.html(
-        '<div class="footer-note">Sparta Agent Portal • Historical records remain sourced from Google Sheets; new records are added from the CRM API automatically.</div>',
+        '<div class="footer-note">Sparta Agent Portal • Legacy records through 17-Sep-2026 remain sourced from Sparta/Sparta2; records from 18-Sep-2026 onward are sourced from the CRM mirror.</div>',
     )
 
 except Exception as e:
