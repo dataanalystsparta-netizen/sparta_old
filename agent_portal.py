@@ -2613,23 +2613,27 @@ try:
         calendar_max = int(daily_sales.max()) if not daily_sales.empty else 0
 
         # -------------------------------------------------------------------
-        # ATTENDANCE + SALES HEATMAP
+        # ATTENDANCE + SALES CALENDAR HEATMAP — FIXED GRID
         # -------------------------------------------------------------------
-        # Each working-day cell contains:
-        #   line 1 = day of month (1, 2, 3, ...)
+        # Use a single 7-column x 5/6-row heatmap matrix built from the actual
+        # month calendar.  This prevents Plotly from stacking multiple traces
+        # into the same categorical coordinates, which was causing:
+        #   * unequal-looking cell sizes
+        #   * labels appearing in neighbouring cells
+        #   * colours bleeding / appearing on the wrong date
+        #
+        # Each cell contains:
+        #   line 1 = day of month
         #   line 2 = attendance + sales, e.g. P3 / HD1 / Ab / UL2
         #
-        # Colour carries BOTH dimensions:
+        # Colour has BOTH meanings:
         #   P  = green family
-        #   HD = yellow/amber family
+        #   HD = amber family
         #   Ab = red family
-        #   UL = blue/indigo family
-        # Within each attendance family, darker/more saturated cells mean
-        # more sales.  Thus P1, P2, P3, P4+ are visibly different, as are
-        # HD1, HD2, HD3, etc., without losing the attendance meaning.
-        #
-        # Existing holiday logic is unchanged: Sundays + 1st/3rd/5th
-        # Saturdays remain non-working/holiday cells.
+        #   UL = indigo family
+        #   -  = neutral grey when attendance is missing
+        #   Holiday = light blue
+        # Within each family, sales 0 / 1 / 2 / 3 / 4+ controls intensity.
         attendance_by_date = {}
         if not ag_attendance.empty:
             for _, att_row in ag_attendance.iterrows():
@@ -2644,12 +2648,19 @@ try:
             code = str(value or "-").strip()
             return code if code else "-"
 
-        def cell_label(day, sales, attendance_code):
+        def sales_bucket(sales):
+            try:
+                n = int(sales)
+            except (TypeError, ValueError):
+                n = 0
+            return min(max(n, 0), 4)
+
+        def cell_label(day, sales, attendance_code, is_holiday=False):
+            if is_holiday:
+                return f"{int(day)}<br>Holiday"
             code = display_attendance_code(attendance_code)
-            if code == "-":
-                second_line = f"-{int(sales)}" if sales > 0 else "-"
-            else:
-                second_line = f"{code}{int(sales)}" if sales > 0 else code
+            n = int(sales)
+            second_line = code if n <= 0 else f"{code}{n}"
             return f"{int(day)}<br>{second_line}"
 
         def cell_hover(day, kind, sales, attendance_code):
@@ -2661,161 +2672,155 @@ try:
                 f"Sales: {int(sales)}"
             )
 
-        cal_df = pd.DataFrame(
-            {
-                "Date": dates,
-                "Day": [d.day for d in dates],
-                "Weekday": [d.strftime("%a") for d in dates],
-                "WeekNum": [
-                    int(d.strftime("%V")) if d.strftime("%V").isdigit() else 0
-                    for d in dates
-                ],
-                "Sales": [daily_sales.get(d, 0) for d in dates],
-                "Attendance": [
-                    attendance_by_date.get(d, "-") for d in dates
-                ],
-                "Type": [
-                    "Holiday" if is_holiday(d) else "Working" for d in dates
-                ],
-            }
-        )
-        cal_df["CellText"] = cal_df.apply(
-            lambda r: cell_label(r["Day"], r["Sales"], r["Attendance"])
-            if r["Type"] == "Working"
-            else str(int(r["Day"])),
-            axis=1,
-        )
-        cal_df["HoverText"] = cal_df.apply(
-            lambda r: cell_hover(
-                r["Day"], r["Type"], r["Sales"], r["Attendance"]
-            ),
-            axis=1,
-        )
+        # Build the exact calendar matrix: every date belongs to one fixed
+        # weekday column and one fixed calendar-week row. Padding cells are None.
+        month_weeks = calendar.monthdayscalendar(sel_year, m_idx)
+        weekday_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-        # Base attendance colour families. The intensity inside each family is
-        # driven by the number of sales on that date.
-        attendance_palettes = {
-            "P": [
-                [0.00, "#ECFDF5"],
-                [0.25, "#BBF7D0"],
-                [0.50, "#6EE7B7"],
-                [0.75, "#34D399"],
-                [1.00, "#047857"],
-            ],
-            "HD": [
-                [0.00, "#FFFBEB"],
-                [0.25, "#FEF3C7"],
-                [0.50, "#FDE68A"],
-                [0.75, "#FBBF24"],
-                [1.00, "#B45309"],
-            ],
-            "Ab": [
-                [0.00, "#FEF2F2"],
-                [0.25, "#FECACA"],
-                [0.50, "#FCA5A5"],
-                [0.75, "#F87171"],
-                [1.00, "#B91C1C"],
-            ],
-            "UL": [
-                [0.00, "#EEF2FF"],
-                [0.25, "#C7D2FE"],
-                [0.50, "#A5B4FC"],
-                [0.75, "#818CF8"],
-                [1.00, "#4338CA"],
-            ],
-            "-": [
-                [0.00, "#F8FAFC"],
-                [0.25, "#E2E8F0"],
-                [0.50, "#CBD5E1"],
-                [0.75, "#94A3B8"],
-                [1.00, "#64748B"],
-            ],
+        # Discrete colour classes.  Code 0 is reserved for padding / blank;
+        # code 1-5 are holidays; the remaining blocks are attendance families
+        # with sales intensity 0/1/2/3/4+.
+        palette_groups = {
+            "Holiday": ["#EAF2FF"] * 5,
+            "-": ["#F8FAFC", "#E2E8F0", "#CBD5E1", "#94A3B8", "#64748B"],
+            "P": ["#ECFDF5", "#BBF7D0", "#6EE7B7", "#34D399", "#047857"],
+            "HD": ["#FFFBEB", "#FEF3C7", "#FDE68A", "#FBBF24", "#B45309"],
+            "Ab": ["#FEF2F2", "#FECACA", "#FCA5A5", "#F87171", "#B91C1C"],
+            "UL": ["#EEF2FF", "#C7D2FE", "#A5B4FC", "#818CF8", "#4338CA"],
         }
 
-        attendance_order = ["P", "HD", "Ab", "UL", "-"]
+        group_order = ["Holiday", "-", "P", "HD", "Ab", "UL"]
+        # Exact integer code for each (group, sales bucket).
+        code_lookup = {}
+        code_to_color = {}
+        next_code = 0
+        for group in group_order:
+            for bucket, color in enumerate(palette_groups[group]):
+                code_lookup[(group, bucket)] = next_code
+                code_to_color[next_code] = color
+                next_code += 1
 
-        # Split into one heatmap trace per attendance family. This lets each
-        # family retain its own meaningful colour scale while sales controls
-        # intensity within that family.
-        fig_cal = go.Figure()
-        working_days = cal_df[cal_df["Type"] == "Working"].copy()
+        # Code zero is deliberately a real colour only for the first holiday
+        # slot; padded cells are represented as None and therefore transparent.
+        n_colors = next_code
+        discrete_colorscale = []
+        if n_colors == 1:
+            discrete_colorscale = [[0.0, code_to_color[0]], [1.0, code_to_color[0]]]
+        else:
+            for code in range(n_colors):
+                pos = code / (n_colors - 1)
+                discrete_colorscale.append([pos, code_to_color[code]])
 
-        sales_scale_max = max(calendar_max, 1)
-        for code in attendance_order:
-            subset = working_days[
-                working_days["Attendance"].apply(display_attendance_code) == code
-            ].copy()
-            if subset.empty:
-                continue
+        z_matrix = []
+        text_matrix = []
+        hover_matrix = []
 
-            subset["SalesIntensity"] = subset["Sales"].clip(
-                lower=0, upper=sales_scale_max
-            )
+        for week in month_weeks:
+            z_row = []
+            text_row = []
+            hover_row = []
+            for day in week:
+                if day == 0:
+                    z_row.append(None)
+                    text_row.append("")
+                    hover_row.append("")
+                    continue
 
-            fig_cal.add_trace(
+                dt = datetime.date(sel_year, m_idx, day)
+                sales = int(daily_sales.get(dt, 0))
+
+                if is_holiday(dt):
+                    group = "Holiday"
+                    bucket = 0
+                    text_value = cell_label(day, sales, "-", is_holiday=True)
+                    hover_value = cell_hover(day, "Holiday", sales, "-")
+                else:
+                    attendance_code = display_attendance_code(
+                        attendance_by_date.get(dt, "-")
+                    )
+                    # Only known codes participate in the colour families.
+                    if attendance_code not in {"P", "HD", "Ab", "UL"}:
+                        attendance_code = "-"
+                    group = attendance_code
+                    bucket = sales_bucket(sales)
+                    text_value = cell_label(
+                        day, sales, attendance_code, is_holiday=False
+                    )
+                    hover_value = cell_hover(
+                        day, "Working", sales, attendance_code
+                    )
+
+                z_row.append(code_lookup[(group, bucket)])
+                text_row.append(text_value)
+                hover_row.append(hover_value)
+
+            z_matrix.append(z_row)
+            text_matrix.append(text_row)
+            hover_matrix.append(hover_row)
+
+        fig_cal = go.Figure(
+            data=[
                 go.Heatmap(
-                    x=subset["Weekday"],
-                    y=subset["WeekNum"],
-                    z=subset["SalesIntensity"],
-                    text=subset["CellText"],
-                    customdata=subset["HoverText"],
+                    x=list(range(7)),
+                    y=list(range(len(month_weeks))),
+                    z=z_matrix,
+                    text=text_matrix,
+                    customdata=hover_matrix,
                     hovertemplate="%{customdata}<extra></extra>",
                     texttemplate="%{text}",
-                    textfont=dict(color="#334155", size=10),
+                    textfont=dict(
+                        color="#334155",
+                        size=10,
+                    ),
                     zmin=0,
-                    zmax=sales_scale_max,
-                    colorscale=attendance_palettes[code],
+                    zmax=max(n_colors - 1, 1),
+                    colorscale=discrete_colorscale,
                     showscale=False,
-                    xgap=3,
-                    ygap=3,
+                    xgap=4,
+                    ygap=4,
                     hoverongaps=False,
-                    name=code,
+                    hoverlabel=dict(
+                        bgcolor="#0F172A",
+                        font=dict(color="#FFFFFF", size=11),
+                    ),
                 )
-            )
-
-        holidays = cal_df[cal_df["Type"] == "Holiday"]
-        fig_cal.add_trace(
-            go.Scatter(
-                x=holidays["Weekday"],
-                y=holidays["WeekNum"],
-                mode="markers+text",
-                marker=dict(
-                    symbol="square",
-                    size=35,
-                    color="#DDEBFF",
-                    line=dict(color="#BFD7F7", width=1),
-                ),
-                text=holidays["Day"],
-                customdata=holidays["HoverText"],
-                hovertemplate="%{customdata}<extra></extra>",
-                textfont=dict(color="#64748B", size=11),
-                showlegend=False,
-                name="Holiday",
-            )
+            ]
         )
 
+        # Give every day cell the same geometric footprint.  Using numeric
+        # coordinates rather than weekday strings avoids categorical spacing
+        # differences and ensures all 7 columns are perfectly equal.
+        fig_cal.update_xaxes(
+            side="top",
+            tickmode="array",
+            tickvals=list(range(7)),
+            ticktext=weekday_names,
+            range=[-0.5, 6.5],
+            showgrid=False,
+            zeroline=False,
+            fixedrange=True,
+            constrain="domain",
+        )
+        fig_cal.update_yaxes(
+            tickmode="array",
+            tickvals=list(range(len(month_weeks))),
+            ticktext=[f"Week {i+1}" for i in range(len(month_weeks))],
+            range=[len(month_weeks) - 0.5, -0.5],
+            showgrid=False,
+            zeroline=False,
+            fixedrange=True,
+            constrain="domain",
+            scaleanchor="x",
+            scaleratio=1,
+        )
         fig_cal.update_layout(
-            height=340,
-            margin=dict(l=0, r=0, t=2, b=4),
+            height=max(330, 92 * len(month_weeks) + 62),
+            margin=dict(l=42, r=8, t=28, b=8),
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(255,255,255,.72)",
-            xaxis=dict(
-                side="top",
-                categoryorder="array",
-                categoryarray=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-                showgrid=False,
-                zeroline=False,
-                fixedrange=True,
-            ),
-            yaxis=dict(
-                autorange="reversed",
-                showgrid=False,
-                zeroline=False,
-                showticklabels=False,
-                fixedrange=True,
-            ),
             showlegend=False,
         )
+
         st.plotly_chart(
             fig_cal,
             use_container_width=True,
