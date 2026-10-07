@@ -2674,7 +2674,7 @@ try:
 
         # Build the exact calendar matrix: every date belongs to one fixed
         # weekday column and one fixed calendar-week row. Padding cells are None.
-        month_weeks = calendar.monthdayscalendar(sel_year, m_idx)
+        month_weeks = calendar.Calendar(firstweekday=0).monthdayscalendar(sel_year, m_idx)
         weekday_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
         # Discrete colour classes.  Code 0 is reserved for padding / blank;
