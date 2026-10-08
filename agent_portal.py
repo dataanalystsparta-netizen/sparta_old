@@ -26,7 +26,6 @@ import os
 # - Quality / Welcome Call / Live KPIs
 # - Insight flags
 # - Daily / Monthly breakdowns
-# - Trend chart
 # - Sales activity calendar
 # - Recent applications log with hierarchical filters + pagination
 # - Existing disposition / performance tips
@@ -851,6 +850,11 @@ CRM_MIRROR_SHEET_URL = st.secrets.get(
     "https://docs.google.com/spreadsheets/d/1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ/edit?gid=1647226826#gid=1647226826",
 )
 CRM_MIRROR_WORKSHEET_GID = int(st.secrets.get("CRM_MIRROR_WORKSHEET_GID", "1647226826"))
+ATTENDANCE_WORKSHEET_GID = int(st.secrets.get("ATTENDANCE_WORKSHEET_GID", "1036958145"))
+ATTENDANCE_SHEET_URL = st.secrets.get(
+    "ATTENDANCE_SHEET_URL",
+    "https://docs.google.com/spreadsheets/d/1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ/edit?gid=1036958145#gid=1036958145",
+)
 
 # ---------------------------------------------------------------------------
 # SOURCE CUTOVER
@@ -1404,6 +1408,64 @@ def fetch_crm_mirror(client):
     return crm_df, fetched_at, len(crm_df), ""
 
 
+def normalize_attendance_status(value):
+    """Convert the attendance sheet's raw value to the portal display code."""
+    if pd.isna(value):
+        return "-"
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null", "nat", "-"}:
+        return "-"
+    if text.upper() == "UL":
+        return "UL"
+
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return text.upper()
+
+    if number == 0:
+        return "Ab"
+    if number == 0.5:
+        return "HD"
+    if number == 1:
+        return "P"
+
+    # Preserve unexpected values rather than silently hiding them.
+    return str(value).strip()
+
+
+def fetch_attendance_sheet(client):
+    """Read the dedicated Attendance worksheet and normalize its fields."""
+    try:
+        ws = client.open_by_key(SPREADSHEET_ID).get_worksheet_by_id(ATTENDANCE_WORKSHEET_GID)
+        values = ws.get_all_records()
+        df = pd.DataFrame(values)
+    except Exception as exc:
+        return pd.DataFrame(), f"Attendance sheet unavailable: {exc}"
+
+    if df.empty:
+        return pd.DataFrame(), "Attendance sheet is empty"
+
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+
+    required = ["Name", "Date", "Attendance"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        return pd.DataFrame(), "Attendance sheet missing columns: " + ", ".join(missing)
+
+    df["Date_Parsed"] = parse_date_series(df["Date"])
+    df["Attendance_Code"] = df["Attendance"].apply(normalize_attendance_status)
+    df["Attendance_Agent"] = df["Name"].apply(canonicalize_advisor)
+    df["Name"] = df["Name"].fillna("").astype(str).str.strip()
+
+    # Keep only usable date rows. Duplicate Name/Date entries are reduced to
+    # the last supplied value, matching how the sheet is maintained.
+    df = df[df["Date_Parsed"].notna()].copy()
+    df = df.drop_duplicates(subset=["Attendance_Agent", "Date_Parsed"], keep="last")
+
+    return df.reset_index(drop=True), ""
+
+
 @st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
 def fetch_data():
     """Load legacy history through 17-Sep-2026 and newer records from CRM mirror.
@@ -1426,6 +1488,9 @@ def fetch_data():
     )
     client = gspread.authorize(creds)
     ss = client.open_by_key(SPREADSHEET_ID)
+
+    # Attendance is maintained in a dedicated worksheet in the same workbook.
+    attendance_df, attendance_error = fetch_attendance_sheet(client)
 
     # -----------------------------------------------------------------------
     # LEGACY SPARTA — inclusive through 17-Sep-2026 only
@@ -1538,7 +1603,12 @@ def fetch_data():
     else:
         connection_status = "Google history + CRM post-cutover connected"
 
-    return df1_combined, df2_combined, "\n".join(status_lines), connection_status
+    if attendance_error:
+        status_lines.append(f"Attendance warning: {attendance_error}")
+    else:
+        status_lines.append(f"Attendance rows: {len(attendance_df):,}")
+
+    return df1_combined, df2_combined, attendance_df, "\n".join(status_lines), connection_status
 
 
 def map_quality(val):
@@ -1871,11 +1941,19 @@ with st.sidebar:
 # DATA LOAD
 # ----------------------------------------------------------------------------
 try:
-    df1, df2_raw, last_sync, connection_status = fetch_data()
+    df1, df2_raw, attendance_df, last_sync, connection_status = fetch_data()
     # Agent login remains the control point: each agent only sees their own data.
     agent_compact = re.sub(r"[^a-z0-9]", "", str(agent).lower())
     ag1 = df1[df1["Advisor"].apply(lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower()) == agent_compact)].copy()
     ag2 = df2_raw[df2_raw["Advisor"].apply(lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower()) == agent_compact)].copy()
+    if not attendance_df.empty:
+        ag_attendance = attendance_df[
+            attendance_df["Attendance_Agent"].apply(
+                lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower()) == agent_compact
+            )
+        ].copy()
+    else:
+        ag_attendance = pd.DataFrame(columns=["Date_Parsed", "Attendance_Code", "Attendance_Agent", "Name"])
 
     # ------------------------------------------------------------------------
     # HERO
@@ -2014,19 +2092,301 @@ try:
         ("Others", len(ag2_filtered[ag2_filtered["P_Status"] == "Others"]), live_total_denominator),
     ]
 
-    render_section("Performance snapshot", "✦", "Your selected date range at a glance")
+    # ------------------------------------------------------------------------
+    # TOP DASHBOARD: KPI AREA + ATTENDANCE / SALES HEATMAP
+    # ------------------------------------------------------------------------
+    top_left, top_right = st.columns([1.7, 1.0], gap="medium")
 
-    b1, b2, b3, b4 = st.columns([1.15, 2.6, 2.6, 2.35], gap="small")
-    with b1:
-        with st.container(border=True):
-            st.markdown("**Overview**")
-            render_kpi(group_1[0][0], group_1[0][1], group_1[0][2])
-    with b2:
-        kpi_panel("Quality audit status", group_2)
-    with b3:
-        kpi_panel("Welcome call status", group_3)
-    with b4:
-        kpi_panel("Live status", group_4)
+    with top_left:
+        render_section("Performance snapshot", "✦", "Your selected date range at a glance")
+
+        b1, b2, b3, b4 = st.columns([1.15, 2.6, 2.6, 2.35], gap="small")
+        with b1:
+            with st.container(border=True):
+                st.markdown("**Overview**")
+                render_kpi(group_1[0][0], group_1[0][1], group_1[0][2])
+        with b2:
+            kpi_panel("Quality audit status", group_2)
+        with b3:
+            kpi_panel("Welcome call status", group_3)
+        with b4:
+            kpi_panel("Live status", group_4)
+
+    with top_right:
+            render_section("Sales activity heatmap", "▦", "Attendance + daily sales intensity — working-day cells show attendance and sales")
+
+            def is_holiday(dt):
+                wd = dt.weekday()  # 0=Mon, 6=Sun
+                if wd == 6:
+                    return True
+                if wd == 5:
+                    week_num = (dt.day - 1) // 7 + 1
+                    return week_num in [1, 3, 5]
+                return False
+
+            c_month_col, c_year_col = st.columns(2)
+            with c_month_col:
+                sel_month = st.selectbox(
+                    "Month",
+                    list(calendar.month_name)[1:],
+                    index=start_date.month - 1,
+                    key="calendar_month",
+                )
+            with c_year_col:
+                year_options = list(range(max(2025, start_date.year - 2), max(2025, today_date.year) + 1))
+                if start_date.year not in year_options:
+                    year_options.append(start_date.year)
+                    year_options = sorted(set(year_options))
+                default_year_index = year_options.index(start_date.year) if start_date.year in year_options else len(year_options) - 1
+                sel_year = st.selectbox(
+                    "Year",
+                    year_options,
+                    index=default_year_index,
+                    key="calendar_year",
+                )
+
+            m_idx = list(calendar.month_name).index(sel_month)
+            num_days = calendar.monthrange(sel_year, m_idx)[1]
+            dates = [datetime.date(sel_year, m_idx, day) for day in range(1, num_days + 1)]
+
+            daily_sales = ag1.groupby(ag1["Date_Parsed"].dt.date).size()
+            calendar_max = int(daily_sales.max()) if not daily_sales.empty else 0
+
+            # -------------------------------------------------------------------
+            # ATTENDANCE + SALES CALENDAR HEATMAP — FIXED GRID
+            # -------------------------------------------------------------------
+            # Use a single 7-column x 5/6-row heatmap matrix built from the actual
+            # month calendar.  This prevents Plotly from stacking multiple traces
+            # into the same categorical coordinates, which was causing:
+            #   * unequal-looking cell sizes
+            #   * labels appearing in neighbouring cells
+            #   * colours bleeding / appearing on the wrong date
+            #
+            # Each cell contains:
+            #   line 1 = day of month
+            #   line 2 = attendance + sales, e.g. P3 / HD1 / Ab / UL2
+            #
+            # Colour has BOTH meanings:
+            #   P  = green family
+            #   HD = amber family
+            #   Ab = red family
+            #   UL = indigo family
+            #   -  = neutral grey when attendance is missing
+            #   Holiday = light blue
+            # Within each family, sales 0 / 1 / 2 / 3 / 4+ controls intensity.
+            attendance_by_date = {}
+            if not ag_attendance.empty:
+                for _, att_row in ag_attendance.iterrows():
+                    dt = pd.to_datetime(att_row.get("Date_Parsed"), errors="coerce")
+                    if pd.isna(dt):
+                        continue
+                    attendance_by_date[dt.date()] = str(
+                        att_row.get("Attendance_Code", "-")
+                    ).strip() or "-"
+
+            def display_attendance_code(value):
+                code = str(value or "-").strip()
+                return code if code else "-"
+
+            def sales_bucket(sales):
+                try:
+                    n = int(sales)
+                except (TypeError, ValueError):
+                    n = 0
+                return min(max(n, 0), 4)
+
+            def cell_label(day, sales, attendance_code, is_holiday=False):
+                if is_holiday:
+                    return f"{int(day)}<br>Holiday"
+                code = display_attendance_code(attendance_code)
+                n = int(sales)
+                second_line = code if n <= 0 else f"{code}{n}"
+                return f"{int(day)}<br>{second_line}"
+
+            def cell_hover(day, kind, sales, attendance_code):
+                if kind == "Holiday":
+                    return f"Date: {day}<br>Holiday / Non-working day<br>Sales: {int(sales)}"
+                code = display_attendance_code(attendance_code)
+                return (
+                    f"Date: {day}<br>Attendance: {escape(code)}<br>"
+                    f"Sales: {int(sales)}"
+                )
+
+            # Build the exact calendar matrix: every date belongs to one fixed
+            # weekday column and one fixed calendar-week row. Padding cells are None.
+            month_weeks = calendar.Calendar(firstweekday=0).monthdayscalendar(sel_year, m_idx)
+            weekday_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+            # Discrete colour classes.  Code 0 is reserved for padding / blank;
+            # code 1-5 are holidays; the remaining blocks are attendance families
+            # with sales intensity 0/1/2/3/4+.
+            palette_groups = {
+                "Holiday": ["#EAF2FF"] * 5,
+                "-": ["#F8FAFC", "#E2E8F0", "#CBD5E1", "#94A3B8", "#64748B"],
+                "P": ["#ECFDF5", "#BBF7D0", "#6EE7B7", "#34D399", "#047857"],
+                "HD": ["#FFFBEB", "#FEF3C7", "#FDE68A", "#FBBF24", "#B45309"],
+                "Ab": ["#FEF2F2", "#FECACA", "#FCA5A5", "#F87171", "#B91C1C"],
+                "UL": ["#EEF2FF", "#C7D2FE", "#A5B4FC", "#818CF8", "#4338CA"],
+            }
+
+            group_order = ["Holiday", "-", "P", "HD", "Ab", "UL"]
+            # Exact integer code for each (group, sales bucket).
+            code_lookup = {}
+            code_to_color = {}
+            next_code = 0
+            for group in group_order:
+                for bucket, color in enumerate(palette_groups[group]):
+                    code_lookup[(group, bucket)] = next_code
+                    code_to_color[next_code] = color
+                    next_code += 1
+
+            # Code zero is deliberately a real colour only for the first holiday
+            # slot; padded cells are represented as None and therefore transparent.
+            n_colors = next_code
+            discrete_colorscale = []
+            if n_colors == 1:
+                discrete_colorscale = [[0.0, code_to_color[0]], [1.0, code_to_color[0]]]
+            else:
+                for code in range(n_colors):
+                    pos = code / (n_colors - 1)
+                    discrete_colorscale.append([pos, code_to_color[code]])
+
+            z_matrix = []
+            text_matrix = []
+            hover_matrix = []
+
+            for week in month_weeks:
+                z_row = []
+                text_row = []
+                hover_row = []
+                for day in week:
+                    if day == 0:
+                        z_row.append(None)
+                        text_row.append("")
+                        hover_row.append("")
+                        continue
+
+                    dt = datetime.date(sel_year, m_idx, day)
+                    sales = int(daily_sales.get(dt, 0))
+
+                    if is_holiday(dt):
+                        group = "Holiday"
+                        bucket = 0
+                        text_value = cell_label(day, sales, "-", is_holiday=True)
+                        hover_value = cell_hover(day, "Holiday", sales, "-")
+                    else:
+                        attendance_code = display_attendance_code(
+                            attendance_by_date.get(dt, "-")
+                        )
+                        # Only known codes participate in the colour families.
+                        if attendance_code not in {"P", "HD", "Ab", "UL"}:
+                            attendance_code = "-"
+                        group = attendance_code
+                        bucket = sales_bucket(sales)
+                        text_value = cell_label(
+                            day, sales, attendance_code, is_holiday=False
+                        )
+                        hover_value = cell_hover(
+                            day, "Working", sales, attendance_code
+                        )
+
+                    z_row.append(code_lookup[(group, bucket)])
+                    text_row.append(text_value)
+                    hover_row.append(hover_value)
+
+                z_matrix.append(z_row)
+                text_matrix.append(text_row)
+                hover_matrix.append(hover_row)
+
+            fig_cal = go.Figure(
+                data=[
+                    go.Heatmap(
+                        x=list(range(7)),
+                        y=list(range(len(month_weeks))),
+                        z=z_matrix,
+                        text=text_matrix,
+                        customdata=hover_matrix,
+                        hovertemplate="%{customdata}<extra></extra>",
+                        texttemplate="%{text}",
+                        textfont=dict(
+                            color="#334155",
+                            size=10,
+                        ),
+                        zmin=0,
+                        zmax=max(n_colors - 1, 1),
+                        colorscale=discrete_colorscale,
+                        showscale=False,
+                        xgap=4,
+                        ygap=4,
+                        hoverongaps=False,
+                        hoverlabel=dict(
+                            bgcolor="#0F172A",
+                            font=dict(color="#FFFFFF", size=11),
+                        ),
+                    )
+                ]
+            )
+
+            # Give every day cell the same geometric footprint.  Using numeric
+            # coordinates rather than weekday strings avoids categorical spacing
+            # differences and ensures all 7 columns are perfectly equal.
+            fig_cal.update_xaxes(
+                side="top",
+                tickmode="array",
+                tickvals=list(range(7)),
+                ticktext=weekday_names,
+                range=[-0.5, 6.5],
+                showgrid=False,
+                zeroline=False,
+                fixedrange=True,
+                constrain="domain",
+            )
+            fig_cal.update_yaxes(
+                tickmode="array",
+                tickvals=list(range(len(month_weeks))),
+                ticktext=[f"Week {i+1}" for i in range(len(month_weeks))],
+                range=[len(month_weeks) - 0.5, -0.5],
+                showgrid=False,
+                zeroline=False,
+                fixedrange=True,
+                constrain="domain",
+                scaleanchor="x",
+                scaleratio=1,
+            )
+            fig_cal.update_layout(
+                height=max(330, 92 * len(month_weeks) + 62),
+                margin=dict(l=42, r=8, t=28, b=8),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(255,255,255,.72)",
+                showlegend=False,
+            )
+
+            st.plotly_chart(
+                fig_cal,
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+
+            # Compact legend: attendance determines hue, sales determine depth.
+            st.html(
+                """
+                <div style="display:flex;flex-wrap:wrap;gap:7px 14px;align-items:center;
+                            margin:2px 0 5px;font-size:.65rem;color:#475569;font-weight:750;">
+                    <span style="font-weight:900;color:#334155;">Attendance + sales:</span>
+                    <span><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:#34D399;vertical-align:-1px;margin-right:4px;"></span>P = Present</span>
+                    <span><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:#FBBF24;vertical-align:-1px;margin-right:4px;"></span>HD = Half Day</span>
+                    <span><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:#F87171;vertical-align:-1px;margin-right:4px;"></span>Ab = Absent</span>
+                    <span><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:#818CF8;vertical-align:-1px;margin-right:4px;"></span>UL = Unauthorised Leave</span>
+                    <span style="color:#64748B;">Darker = more sales</span>
+                </div>
+                """
+            )
+            st.caption(
+                f"Showing {calendar.month_name[m_idx]} {sel_year} · peak day: {calendar_max:,} application(s) · "
+                "cell format = date + attendance/sales (e.g. P3, HD1, Ab, UL2) · "
+                "Sundays + 1st/3rd/5th Saturdays remain non-working / holiday cells"
+            )
+
 
     # ========================================================================
     # ACTION CENTRE — CANCELLATION FIRST
@@ -2412,203 +2772,6 @@ try:
                     .map(lambda x: "background-color: transparent" if x == 0 else "")
                 )
                 st.dataframe(styled_port, use_container_width=True, height=370)
-
-    # ------------------------------------------------------------------------
-    # TREND + CALENDAR
-    # ------------------------------------------------------------------------
-    st.html('<div style="height:8px"></div>')
-    col_trend, col_cal = st.columns([3, 2], gap="large")
-
-    with col_trend:
-        render_section("My trend", "↗", "Applications compared with Quality Approved and Live")
-        if not ag1_filtered.empty:
-            d_apps = ag1_filtered.groupby(chart_group_col).size().to_frame("Total Apps")
-            d_appr = (
-                ag1_filtered[ag1_filtered["Q_Status"] == "Approved"]
-                .groupby(chart_group_col)
-                .size()
-                .to_frame("Approved")
-            )
-            d_live = (
-                ag2_filtered[ag2_filtered["P_Status"] == "Live"]
-                .groupby(chart_group_col)
-                .size()
-                .to_frame("Live")
-            )
-
-            i_comb = d_apps.join([d_appr, d_live], how="left").fillna(0).reset_index()
-            i_comb[chart_group_col] = i_comb[chart_group_col].astype(str)
-
-            fig = go.Figure()
-            fig.add_trace(
-                go.Bar(
-                    x=i_comb[chart_group_col],
-                    y=i_comb["Total Apps"],
-                    name="Total Applications",
-                    marker_color="#93C5FD",
-                    marker_line_width=0,
-                )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=i_comb[chart_group_col],
-                    y=i_comb["Approved"],
-                    name="Quality Approved Applications",
-                    mode="lines+markers",
-                    line=dict(color="#10B981", width=3),
-                    marker=dict(size=7),
-                )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=i_comb[chart_group_col],
-                    y=i_comb["Live"],
-                    name="Live Applications",
-                    mode="lines+markers",
-                    line=dict(color="#F59E0B", width=3),
-                    marker=dict(size=7),
-                )
-            )
-            fig.update_layout(
-                height=365,
-                hovermode="x unified",
-                margin=dict(l=8, r=8, t=22, b=8),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(255,255,255,.72)",
-                font=dict(color="#475569", size=11),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                xaxis=dict(
-                    title="Date" if view_mode == "Daily" else "Month",
-                    showgrid=False,
-                    zeroline=False,
-                    linecolor="#E2E8F0",
-                ),
-                yaxis=dict(
-                    title="Applications",
-                    gridcolor="#E7EDF5",
-                    zeroline=False,
-                ),
-            )
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-        else:
-            st.info("No application data for the selected date range.")
-
-    with col_cal:
-        render_section("Sales activity heatmap", "▦", "Daily application intensity — darker cells mean more sales")
-
-        def is_holiday(dt):
-            wd = dt.weekday()  # 0=Mon, 6=Sun
-            if wd == 6:
-                return True
-            if wd == 5:
-                week_num = (dt.day - 1) // 7 + 1
-                return week_num in [1, 3, 5]
-            return False
-
-        c_month_col, c_year_col = st.columns(2)
-        with c_month_col:
-            sel_month = st.selectbox(
-                "Month",
-                list(calendar.month_name)[1:],
-                index=start_date.month - 1,
-                key="calendar_month",
-            )
-        with c_year_col:
-            year_options = list(range(max(2025, start_date.year - 2), max(2025, today_date.year) + 1))
-            if start_date.year not in year_options:
-                year_options.append(start_date.year)
-                year_options = sorted(set(year_options))
-            default_year_index = year_options.index(start_date.year) if start_date.year in year_options else len(year_options) - 1
-            sel_year = st.selectbox(
-                "Year",
-                year_options,
-                index=default_year_index,
-                key="calendar_year",
-            )
-
-        m_idx = list(calendar.month_name).index(sel_month)
-        num_days = calendar.monthrange(sel_year, m_idx)[1]
-        dates = [datetime.date(sel_year, m_idx, day) for day in range(1, num_days + 1)]
-
-        daily_sales = ag1.groupby(ag1["Date_Parsed"].dt.date).size()
-        calendar_max = int(daily_sales.max()) if not daily_sales.empty else 0
-        cal_df = pd.DataFrame(
-            {
-                "Date": dates,
-                "Day": [d.day for d in dates],
-                "Weekday": [d.strftime("%a") for d in dates],
-                "WeekNum": [int(d.strftime("%V")) if d.strftime("%V").isdigit() else 0 for d in dates],
-                "Sales": [daily_sales.get(d, 0) for d in dates],
-                "Type": ["Holiday" if is_holiday(d) else "Working" for d in dates],
-            }
-        )
-        cal_df["HoverText"] = cal_df.apply(
-            lambda r: "Holiday" if r["Type"] == "Holiday" else f"{r['Sales']} sale(s)",
-            axis=1,
-        )
-
-        fig_cal = go.Figure()
-        working_days = cal_df[cal_df["Type"] == "Working"]
-        fig_cal.add_trace(
-            go.Heatmap(
-                x=working_days["Weekday"],
-                y=working_days["WeekNum"],
-                z=working_days["Sales"],
-                text=working_days["Day"],
-                customdata=working_days["HoverText"],
-                hovertemplate="%{customdata}<extra></extra>",
-                texttemplate="%{text}",
-                textfont=dict(color="#334155", size=11),
-                zmin=0,
-                zmax=max(calendar_max, 1),
-                colorscale=[[0, "#F8FAFC"], [0.15, "#E6F7EE"], [0.50, "#86EFAC"], [1, "#047857"]],
-                showscale=False,
-                xgap=3,
-                ygap=3,
-            )
-        )
-
-        holidays = cal_df[cal_df["Type"] == "Holiday"]
-        fig_cal.add_trace(
-            go.Scatter(
-                x=holidays["Weekday"],
-                y=holidays["WeekNum"],
-                mode="markers+text",
-                marker=dict(symbol="square", size=35, color="#DDEBFF", line=dict(color="#BFD7F7", width=1)),
-                text=holidays["Day"],
-                customdata=holidays["HoverText"],
-                hovertemplate="%{customdata}<extra></extra>",
-                textfont=dict(color="#64748B", size=11),
-                showlegend=False,
-            )
-        )
-
-        fig_cal.update_layout(
-            height=325,
-            margin=dict(l=0, r=0, t=2, b=4),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(255,255,255,.72)",
-            xaxis=dict(
-                side="top",
-                categoryorder="array",
-                categoryarray=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-                showgrid=False,
-                zeroline=False,
-                fixedrange=True,
-            ),
-            yaxis=dict(
-                autorange="reversed",
-                showgrid=False,
-                zeroline=False,
-                showticklabels=False,
-                fixedrange=True,
-            ),
-        )
-        st.plotly_chart(fig_cal, use_container_width=True, config={"displayModeBar": False})
-        st.caption(
-            f"Showing {calendar.month_name[m_idx]} {sel_year} · peak day: {calendar_max:,} application(s) · "
-            "working day intensity  •  🔵 non-working / holiday"
-        )
 
     # ------------------------------------------------------------------------
     # RECENT APPLICATIONS LOG
