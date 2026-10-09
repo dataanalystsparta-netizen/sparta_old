@@ -84,8 +84,8 @@ st.html(
 
     .block-container {
         max-width: 1500px;
-        padding-top: 1.0rem;
-        padding-bottom: 1.8rem;
+        padding-top: 0.55rem;
+        padding-bottom: 0.8rem;
         padding-left: 2rem;
         padding-right: 2rem;
     }
@@ -166,7 +166,7 @@ st.html(
         font-size: 1.02rem;
         font-weight: 800;
         color: var(--slate-900);
-        margin: 2px 0 7px 0;
+        margin: 1px 0 4px 0;
     }
 
     .section-title .icon {
@@ -185,7 +185,7 @@ st.html(
     .section-subtitle {
         color: var(--slate-500);
         font-size: .78rem;
-        margin: -3px 0 9px 43px;
+        margin: -2px 0 5px 43px;
     }
 
     /* ------------------------------ LOGIN -------------------------------- */
@@ -276,7 +276,7 @@ st.html(
         letter-spacing: 1.7px;
         font-weight: 850;
         color: #8DB4FF;
-        margin-bottom: 4px;
+        margin-bottom: 2px;
     }
 
     .hero-title {
@@ -290,7 +290,7 @@ st.html(
     .hero-subtitle {
         color: #C5D4F3;
         font-size: .82rem;
-        margin-top: 6px;
+        margin-top: 4px;
     }
 
     .hero-sync {
@@ -321,8 +321,8 @@ st.html(
 
     /* ------------------------------- FILTERS ---------------------------- */
     .filter-card {
-        margin: 14px 0 16px;
-        padding: 12px 15px 2px;
+        margin: 8px 0 10px;
+        padding: 8px 12px 0;
         border-radius: 15px;
         background: rgba(255,255,255,.76);
         border: 1px solid rgba(226,232,240,.95);
@@ -376,8 +376,8 @@ st.html(
     }
 
     .kpi-card {
-        min-height: 91px;
-        padding: 11px 7px 10px;
+        min-height: 72px;
+        padding: 8px 6px 7px;
         border-radius: 12px;
         text-align: center;
         background: linear-gradient(180deg, #FFFFFF, #F8FAFC);
@@ -398,13 +398,13 @@ st.html(
         font-size: .61rem;
         color: var(--slate-500);
         font-weight: 800;
-        margin-bottom: 4px;
+        margin-bottom: 2px;
         text-transform: uppercase;
         letter-spacing: .55px;
     }
 
     .kpi-value {
-        font-size: 1.25rem;
+        font-size: 1.10rem;
         color: var(--slate-900);
         font-weight: 900;
         margin: 0;
@@ -416,7 +416,7 @@ st.html(
         font-size: .65rem;
         color: var(--blue);
         font-weight: 800;
-        margin-top: 6px;
+        margin-top: 4px;
         background: #EAF1FF;
         display: inline-block;
         padding: 3px 7px;
@@ -515,7 +515,7 @@ st.html(
         background: linear-gradient(135deg, #FFFDF5 0%, #FFFBEB 100%);
         border: 1px solid #FDE68A;
         border-left: 5px solid var(--amber);
-        padding: 18px 19px;
+        padding: 13px 15px;
         border-radius: 15px;
         margin-top: 8px;
         box-shadow: 0 7px 20px rgba(180,83,9,.05);
@@ -612,7 +612,7 @@ st.html(
     }
 
     .action-copy {
-        margin-top: 6px;
+        margin-top: 4px;
         color: #64748B;
         font-size: .70rem;
         line-height: 1.4;
@@ -621,7 +621,7 @@ st.html(
 
     /* --------------------------- FUNNEL --------------------------------- */
     .funnel-shell {
-        padding: 16px 17px;
+        padding: 11px 13px;
         border-radius: 15px;
         background: rgba(255,255,255,.93);
         border: 1px solid #E2E8F0;
@@ -640,7 +640,7 @@ st.html(
         grid-template-columns: 98px 1fr 58px;
         gap: 9px;
         align-items: center;
-        margin: 10px 0;
+        margin: 7px 0;
     }
 
     .funnel-name {
@@ -685,8 +685,8 @@ st.html(
     }
 
     .comparison-card {
-        min-height: 84px;
-        padding: 10px 12px;
+        min-height: 72px;
+        padding: 8px 10px;
         border-radius: 13px;
         background: linear-gradient(180deg, #FFFFFF, #F8FAFC);
         border: 1px solid #E2E8F0;
@@ -703,7 +703,7 @@ st.html(
 
     .comparison-value {
         color: #0F172A;
-        font-size: 1.06rem;
+        font-size: .98rem;
         font-weight: 900;
         margin-top: 4px;
     }
@@ -719,7 +719,7 @@ st.html(
         margin-top: 7px;
         padding: 3px 7px;
         border-radius: 99px;
-        font-size: .60rem;
+        font-size: .56rem;
         font-weight: 900;
     }
 
@@ -746,7 +746,7 @@ st.html(
     }
 
     .mini-stat {
-        padding: 10px 11px;
+        padding: 7px 9px;
         border-radius: 12px;
         background: rgba(255,255,255,.92);
         border: 1px solid #E2E8F0;
@@ -754,7 +754,7 @@ st.html(
 
     .mini-stat-label {
         color: #64748B;
-        font-size: .60rem;
+        font-size: .56rem;
         font-weight: 900;
         text-transform: uppercase;
         letter-spacing: .65px;
@@ -762,7 +762,7 @@ st.html(
 
     .mini-stat-value {
         color: #0F172A;
-        font-size: 1.06rem;
+        font-size: .98rem;
         font-weight: 900;
         margin-top: 4px;
     }
@@ -778,7 +778,7 @@ st.html(
         background: rgba(255,255,255,.72);
         border: 1px solid #E2E8F0;
         border-radius: 16px;
-        padding: 12px;
+        padding: 8px 10px;
         box-shadow: 0 7px 20px rgba(15,23,42,.035);
     }
 
@@ -787,7 +787,7 @@ st.html(
         align-items: center;
         justify-content: space-between;
         gap: 12px;
-        margin-bottom: 9px;
+        margin-bottom: 6px;
     }
 
     .pulse-title {
@@ -826,7 +826,7 @@ st.html(
     .pulse-separator {
         height: 1px;
         background: #E8EEF5;
-        margin: 10px 0;
+        margin: 7px 0;
     }
 
     /* --------------------------- RESPONSIVE ------------------------------ */
@@ -2095,7 +2095,7 @@ try:
     # ------------------------------------------------------------------------
     # TOP DASHBOARD: KPI AREA + ATTENDANCE / SALES HEATMAP
     # ------------------------------------------------------------------------
-    top_left, top_right = st.columns([1.7, 1.0], gap="medium")
+    top_left, top_right = st.columns([1.75, 1.0], gap="small")
 
     with top_left:
         render_section("Performance snapshot", "✦", "Your selected date range at a glance")
@@ -2112,6 +2112,111 @@ try:
         with b4:
             kpi_panel("Live status", group_4)
 
+        # Compact performance pulse / activity consistency sits directly under
+        # the KPI cards so the top dashboard reads as one cohesive block.
+        period_days = (end_date - start_date).days + 1
+        prev_start = start_date - datetime.timedelta(days=period_days)
+        prev_end = start_date - datetime.timedelta(days=1)
+
+        current_summary = {
+            "apps": total_apps,
+            "approval_rate": pct(len(ag1_filtered[ag1_filtered["Q_Status"] == "Approved"]), total_apps),
+            "wc_done_rate": pct(
+                len(ag1_filtered[ag1_filtered["WC_Clean"] == "Done"])
+                if wc_col and "WC_Clean" in ag1_filtered.columns else 0,
+                total_apps,
+            ),
+            "live_rate": pct(
+                len(ag2_filtered[ag2_filtered["P_Status"] == "Live"]),
+                total_ag2 if total_ag2 > 0 else total_apps,
+            ),
+        }
+        previous_summary = summary_for_period(ag1, ag2, prev_start, prev_end, wc_col)
+
+        # Working-day / activity calculations.
+        def portal_is_holiday(dt):
+            wd = dt.weekday()
+            if wd == 6:
+                return True
+            if wd == 5:
+                week_num = (dt.day - 1) // 7 + 1
+                return week_num in [1, 3, 5]
+            return False
+
+        range_dates = [
+            start_date + datetime.timedelta(days=i)
+            for i in range((end_date - start_date).days + 1)
+        ]
+        working_days = [d for d in range_dates if not portal_is_holiday(d)]
+        daily_activity = (
+            ag1_filtered.groupby(ag1_filtered["Date_Parsed"].dt.date).size()
+            if not ag1_filtered.empty
+            else pd.Series(dtype="int64")
+        )
+        active_days = sum(1 for d in working_days if daily_activity.get(d, 0) > 0)
+        zero_sales_days = sum(1 for d in working_days if daily_activity.get(d, 0) == 0)
+        best_day_text = "—"
+        best_day_count = 0
+        if not daily_activity.empty:
+            best_day = daily_activity.idxmax()
+            best_day_count = int(daily_activity.max())
+            best_day_text = pd.Timestamp(best_day).strftime("%d %b")
+        avg_active_day = (total_apps / active_days) if active_days > 0 else 0
+        avg_working_day = (total_apps / len(working_days)) if working_days else 0
+
+        st.html(
+            f"""
+            <div class="pulse-shell">
+                <div class="pulse-head">
+                    <div class="pulse-title">Performance pulse</div>
+                    <div class="pulse-note">
+                        Selected period: {escape(start_date.strftime('%d %b'))} – {escape(end_date.strftime('%d %b %Y'))}
+                    </div>
+                </div>
+                <div class="pulse-subtitle"><span></span>Period momentum</div>
+            </div>
+            """
+        )
+
+        render_comparison_cards(
+            [
+                ("Applications", current_summary["apps"], previous_summary["apps"], False, f"Previous: {previous_summary['apps']:,}"),
+                ("QA approval", current_summary["approval_rate"], previous_summary["approval_rate"], True, f"Previous: {previous_summary['approval_rate']:.1f}%"),
+                ("WC completion", current_summary["wc_done_rate"], previous_summary["wc_done_rate"], True, f"Previous: {previous_summary['wc_done_rate']:.1f}%"),
+                ("Live rate", current_summary["live_rate"], previous_summary["live_rate"], True, f"Previous: {previous_summary['live_rate']:.1f}%"),
+            ]
+        )
+
+        st.html(
+            """
+            <div class="pulse-separator"></div>
+            <div class="pulse-subtitle"><span></span>Activity consistency</div>
+            """
+        )
+
+        activity_cards = [
+            ("Working days", len(working_days), "in selected range"),
+            ("Active days", active_days, f"of {len(working_days)} working days"),
+            ("Avg apps / working day", f"{avg_working_day:.1f}", "applications"),
+            ("Avg apps / active day", f"{avg_active_day:.1f}", "applications"),
+            ("Best sales day", best_day_text, f"{best_day_count:,} applications" if best_day_count else "no activity"),
+        ]
+        activity_html = []
+        for label, value, sub in activity_cards:
+            activity_html.append(
+                f"""
+                <div class="mini-stat">
+                    <div class="mini-stat-label">{escape(str(label))}</div>
+                    <div class="mini-stat-value">{escape(str(value))}</div>
+                    <div class="mini-stat-sub">{escape(str(sub))}</div>
+                </div>
+                """
+            )
+        st.html('<div class="mini-stat-grid">' + ''.join(activity_html) + '</div>')
+
+        if len(working_days) > 0 and zero_sales_days > 0:
+            st.caption(f"{zero_sales_days} working day(s) had no applications in the selected period.")
+
     with top_right:
             render_section("Sales activity heatmap", "▦", "Attendance + daily sales intensity — working-day cells show attendance and sales")
 
@@ -2124,15 +2229,18 @@ try:
                     return week_num in [1, 3, 5]
                 return False
 
-            c_month_col, c_year_col = st.columns(2)
+            c_month_col, c_year_col = st.columns([1.25, 1.0], gap="small")
             with c_month_col:
+                st.caption("MONTH")
                 sel_month = st.selectbox(
                     "Month",
                     list(calendar.month_name)[1:],
                     index=start_date.month - 1,
                     key="calendar_month",
+                    label_visibility="collapsed",
                 )
             with c_year_col:
+                st.caption("YEAR")
                 year_options = list(range(max(2025, start_date.year - 2), max(2025, today_date.year) + 1))
                 if start_date.year not in year_options:
                     year_options.append(start_date.year)
@@ -2143,6 +2251,7 @@ try:
                     year_options,
                     index=default_year_index,
                     key="calendar_year",
+                    label_visibility="collapsed",
                 )
 
             m_idx = list(calendar.month_name).index(sel_month)
@@ -2354,8 +2463,8 @@ try:
                 scaleratio=1,
             )
             fig_cal.update_layout(
-                height=max(330, 92 * len(month_weeks) + 62),
-                margin=dict(l=42, r=8, t=28, b=8),
+                height=max(290, 70 * len(month_weeks) + 48),
+                margin=dict(l=34, r=4, t=8, b=3),
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(255,255,255,.72)",
                 showlegend=False,
@@ -2382,9 +2491,8 @@ try:
                 """
             )
             st.caption(
-                f"Showing {calendar.month_name[m_idx]} {sel_year} · peak day: {calendar_max:,} application(s) · "
-                "cell format = date + attendance/sales (e.g. P3, HD1, Ab, UL2) · "
-                "Sundays + 1st/3rd/5th Saturdays remain non-working / holiday cells"
+                f"{calendar.month_name[m_idx]} {sel_year} · peak: {calendar_max:,} sales · "
+                "format: date + attendance/sales · Sundays + 1st/3rd/5th Saturdays are holidays"
             )
 
 
@@ -2398,7 +2506,7 @@ try:
     live_cancel_count = len(ag2_filtered[ag2_filtered["P_Status"] == "Cancelled"]) if not ag2_filtered.empty else 0
     total_cancel_count = quality_cancel_count + wc_cancel_count + live_cancel_count
 
-    st.divider()
+    st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
     render_section(
         "Action centre",
         "⚡",
@@ -2483,7 +2591,7 @@ try:
     # PIPELINE SNAPSHOT + PERFORMANCE PULSE
     # ========================================================================
     st.divider()
-    funnel_col, pulse_col = st.columns([1.0, 2.0], gap="medium")
+    funnel_col = st.container()
 
     with funnel_col:
         render_section(
@@ -2522,110 +2630,6 @@ try:
             + ''.join(funnel_rows)
             + '</div>'
         )
-
-    with pulse_col:
-        period_days = (end_date - start_date).days + 1
-        prev_start = start_date - datetime.timedelta(days=period_days)
-        prev_end = start_date - datetime.timedelta(days=1)
-
-        current_summary = {
-            "apps": total_apps,
-            "approval_rate": pct(len(ag1_filtered[ag1_filtered["Q_Status"] == "Approved"]), total_apps),
-            "wc_done_rate": pct(
-                len(ag1_filtered[ag1_filtered["WC_Clean"] == "Done"])
-                if wc_col and "WC_Clean" in ag1_filtered.columns else 0,
-                total_apps,
-            ),
-            "live_rate": pct(
-                len(ag2_filtered[ag2_filtered["P_Status"] == "Live"]),
-                total_ag2 if total_ag2 > 0 else total_apps,
-            ),
-        }
-        previous_summary = summary_for_period(ag1, ag2, prev_start, prev_end, wc_col)
-
-        # Working-day / activity calculations.
-        def portal_is_holiday(dt):
-            wd = dt.weekday()
-            if wd == 6:
-                return True
-            if wd == 5:
-                week_num = (dt.day - 1) // 7 + 1
-                return week_num in [1, 3, 5]
-            return False
-
-        range_dates = [
-            start_date + datetime.timedelta(days=i)
-            for i in range((end_date - start_date).days + 1)
-        ]
-        working_days = [d for d in range_dates if not portal_is_holiday(d)]
-        daily_activity = (
-            ag1_filtered.groupby(ag1_filtered["Date_Parsed"].dt.date).size()
-            if not ag1_filtered.empty
-            else pd.Series(dtype="int64")
-        )
-        active_days = sum(1 for d in working_days if daily_activity.get(d, 0) > 0)
-        zero_sales_days = sum(1 for d in working_days if daily_activity.get(d, 0) == 0)
-        best_day_text = "—"
-        best_day_count = 0
-        if not daily_activity.empty:
-            best_day = daily_activity.idxmax()
-            best_day_count = int(daily_activity.max())
-            best_day_text = pd.Timestamp(best_day).strftime("%d %b")
-        avg_active_day = (total_apps / active_days) if active_days > 0 else 0
-        avg_working_day = (total_apps / len(working_days)) if working_days else 0
-
-        st.html(
-            f"""
-            <div class="pulse-shell">
-                <div class="pulse-head">
-                    <div class="pulse-title">Performance pulse</div>
-                    <div class="pulse-note">
-                        Selected period: {escape(start_date.strftime('%d %b'))} – {escape(end_date.strftime('%d %b %Y'))}
-                    </div>
-                </div>
-                <div class="pulse-subtitle"><span></span>Period momentum</div>
-            </div>
-            """
-        )
-
-        render_comparison_cards(
-            [
-                ("Applications", current_summary["apps"], previous_summary["apps"], False, f"Previous: {previous_summary['apps']:,}"),
-                ("QA approval", current_summary["approval_rate"], previous_summary["approval_rate"], True, f"Previous: {previous_summary['approval_rate']:.1f}%"),
-                ("WC completion", current_summary["wc_done_rate"], previous_summary["wc_done_rate"], True, f"Previous: {previous_summary['wc_done_rate']:.1f}%"),
-                ("Live rate", current_summary["live_rate"], previous_summary["live_rate"], True, f"Previous: {previous_summary['live_rate']:.1f}%"),
-            ]
-        )
-
-        st.html(
-            """
-            <div class="pulse-separator"></div>
-            <div class="pulse-subtitle"><span></span>Activity consistency</div>
-            """
-        )
-
-        activity_cards = [
-            ("Working days", len(working_days), "in selected range"),
-            ("Active days", active_days, f"of {len(working_days)} working days"),
-            ("Avg apps / working day", f"{avg_working_day:.1f}", "applications"),
-            ("Avg apps / active day", f"{avg_active_day:.1f}", "applications"),
-            ("Best sales day", best_day_text, f"{best_day_count:,} applications" if best_day_count else "no activity"),
-        ]
-        activity_html = []
-        for label, value, sub in activity_cards:
-            activity_html.append(
-                f"""
-                <div class="mini-stat">
-                    <div class="mini-stat-label">{escape(str(label))}</div>
-                    <div class="mini-stat-value">{escape(str(value))}</div>
-                    <div class="mini-stat-sub">{escape(str(sub))}</div>
-                </div>
-                """
-            )
-        st.html('<div class="mini-stat-grid">' + ''.join(activity_html) + '</div>')
-
-        if len(working_days) > 0 and zero_sales_days > 0:
-            st.caption(f"{zero_sales_days} working day(s) had no applications in the selected period.")
 
     # ------------------------------------------------------------------------
     # INSIGHT FLAGS
