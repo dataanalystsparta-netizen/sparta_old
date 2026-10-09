@@ -1,924 +1,85 @@
-import streamlit as st
-import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
-import datetime
-import plotly.express as px
-import plotly.graph_objects as go
-import calendar
-import math
-from html import escape
-from io import BytesIO
+"""
+Sparta Dashboard - updated with editable Projected Live Sales column
+and an Agent filter for the Monthly KPI Breakdown table.
+
+- New dropdown "Select Agent (Monthly table)" appears in the Monthly KPI section.
+- Default: "All Agents" (entire team). Selecting an agent filters the monthly table
+  to that agent's rows (both application and portal data, when available from the merged master dataset).
+- No other behavior changed.
+"""
+
+import logging
 import re
 import time
-import requests
-import os
+from datetime import datetime
+from html import escape
+from typing import List
 
-# ============================================================================
-# SPARTA AGENT PORTAL — PREMIUM UI REFRESH
-# Existing functionality retained:
-# - Agent access-key authentication
-# - Login logging to Google Sheets / Logs
-# - Existing Sparta + Sparta2 Google Sheet historical data
-# - CRM data mirrored into Google Sheets by a separate 5-minute sync job
-# - 5-minute data cache
-# - Start/end date filtering
-# - Quality / Welcome Call / Live KPIs
-# - Insight flags
-# - Daily / Monthly breakdowns
-# - Trend chart
-# - Sales activity calendar
-# - Recent applications log with hierarchical filters + pagination
-# - Existing disposition / performance tips
-# ============================================================================
+import numpy as np
+import pandas as pd
+import streamlit as st
+import streamlit.components.v1 as components
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
+# ----------------------------------------------------------
+# Basic logging
+# ----------------------------------------------------------
+logger = logging.getLogger("sparta_dash")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# ==========================================================
+# PAGE CONFIG
+# ==========================================================
 st.set_page_config(
-    page_title="Sparta Agent Portal",
+    page_title="Sparta Sales Dashboard",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-if not hasattr(st, "html"):
-    st.error("This portal requires Streamlit 1.37+ for the premium UI renderer.")
-    st.stop()
-
-# ----------------------------------------------------------------------------
-# Theme / UI
-# ----------------------------------------------------------------------------
-st.html(
+# Small base CSS
+st.markdown(
     """
-    <style>
-    /* --------------------------- GLOBAL SHELL ---------------------------- */
-    :root {
-        --navy: #0B1736;
-        --navy-2: #122451;
-        --blue: #2563EB;
-        --blue-2: #3B82F6;
-        --cyan: #06B6D4;
-        --green: #10B981;
-        --amber: #F59E0B;
-        --red: #EF4444;
-        --slate-900: #0F172A;
-        --slate-700: #334155;
-        --slate-600: #475569;
-        --slate-500: #64748B;
-        --slate-400: #94A3B8;
-        --slate-300: #CBD5E1;
-        --slate-200: #E2E8F0;
-        --slate-100: #F1F5F9;
-        --surface: #FFFFFF;
-        --page: #F4F7FB;
-    }
-
-    [data-testid="stAppViewContainer"] {
-        background:
-            radial-gradient(circle at 8% 0%, rgba(37,99,235,0.075), transparent 30%),
-            radial-gradient(circle at 95% 10%, rgba(6,182,212,0.06), transparent 28%),
-            var(--page);
-    }
-
-    [data-testid="stHeader"] {
-        background: rgba(244,247,251,0.80);
-        backdrop-filter: blur(14px);
-    }
-
-    .block-container {
-        max-width: 1500px;
-        padding-top: 1.0rem;
-        padding-bottom: 1.8rem;
-        padding-left: 2rem;
-        padding-right: 2rem;
-    }
-
-    /* ------------------------------ SIDEBAR ------------------------------ */
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #09132E 0%, #0D1B3D 55%, #0A1531 100%);
-        border-right: 1px solid rgba(255,255,255,0.06);
-    }
-
-    [data-testid="stSidebar"] * {
-        color: #EAF0FF;
-    }
-
-    [data-testid="stSidebar"] [data-testid="stButton"] button {
-        background: rgba(255,255,255,0.06);
-        border: 1px solid rgba(255,255,255,0.12);
-        color: #FFFFFF;
-        border-radius: 10px;
-        transition: all .2s ease;
-    }
-
-    [data-testid="stSidebar"] [data-testid="stButton"] button:hover {
-        background: rgba(255,255,255,0.11);
-        border-color: rgba(255,255,255,0.22);
-        transform: translateY(-1px);
-    }
-
-    .sidebar-profile {
-        margin: 0.5rem 0 1rem;
-        padding: 16px;
-        border: 1px solid rgba(255,255,255,0.10);
-        border-radius: 16px;
-        background: linear-gradient(135deg, rgba(255,255,255,0.085), rgba(255,255,255,0.035));
-        box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
-    }
-
-    .sidebar-avatar {
-        width: 42px;
-        height: 42px;
-        border-radius: 12px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: linear-gradient(135deg, #2563EB, #06B6D4);
-        font-size: 1.1rem;
-        font-weight: 800;
-        color: white;
-        box-shadow: 0 8px 20px rgba(37,99,235,0.24);
-    }
-
-    .sidebar-role {
-        font-size: .68rem;
-        text-transform: uppercase;
-        letter-spacing: 1.4px;
-        color: #9FB3DC !important;
-        font-weight: 800;
-        margin-top: 10px;
-    }
-
-    .sidebar-name {
-        font-size: 1.05rem;
-        font-weight: 750;
-        margin-top: 3px;
-        color: #FFFFFF !important;
-    }
-
-    /* ---------------------------- TYPOGRAPHY ----------------------------- */
-    h1, h2, h3, h4, h5, h6 {
-        color: var(--slate-900) !important;
-        letter-spacing: -0.025em;
-    }
-
-    .section-title {
-        display: flex;
-        align-items: center;
-        gap: 11px;
-        font-size: 1.02rem;
-        font-weight: 800;
-        color: var(--slate-900);
-        margin: 2px 0 7px 0;
-    }
-
-    .section-title .icon {
-        width: 32px;
-        height: 32px;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        border-radius: 9px;
-        background: #EAF1FF;
-        color: var(--blue);
-        font-size: .95rem;
-        box-shadow: inset 0 0 0 1px rgba(37,99,235,.08);
-    }
-
-    .section-subtitle {
-        color: var(--slate-500);
-        font-size: .78rem;
-        margin: -3px 0 9px 43px;
-    }
-
-    /* ------------------------------ LOGIN -------------------------------- */
-    .login-shell {
-        max-width: 530px;
-        margin: 7vh auto 0 auto;
-        padding: 7px;
-        border-radius: 26px;
-        background: linear-gradient(135deg, rgba(37,99,235,.18), rgba(6,182,212,.16));
-    }
-
-    .login-card {
-        background: rgba(255,255,255,.95);
-        border: 1px solid rgba(255,255,255,.85);
-        border-radius: 22px;
-        padding: 34px 34px 30px;
-        box-shadow: 0 24px 70px rgba(15,23,42,.14);
-    }
-
-    .login-brand {
-        display: flex;
-        align-items: center;
-        gap: 14px;
-        margin-bottom: 18px;
-    }
-
-    .login-brand img {
-        width: 56px;
-        height: 56px;
-        border-radius: 16px;
-        object-fit: cover;
-        box-shadow: 0 9px 25px rgba(15,23,42,.12);
-    }
-
-    .login-overline {
-        font-size: .68rem;
-        color: var(--blue);
-        font-weight: 900;
-        text-transform: uppercase;
-        letter-spacing: 1.6px;
-        margin-bottom: 2px;
-    }
-
-    .login-title {
-        font-size: 1.8rem;
-        line-height: 1.05;
-        font-weight: 850;
-        color: var(--slate-900);
-    }
-
-    .login-copy {
-        color: var(--slate-500);
-        font-size: .86rem;
-        line-height: 1.55;
-        margin: 10px 0 22px;
-    }
-
-    /* ----------------------------- HERO --------------------------------- */
-    .hero {
-        position: relative;
-        overflow: hidden;
-        padding: 24px 27px;
-        border-radius: 22px;
-        color: white;
-        background:
-            radial-gradient(circle at 82% 15%, rgba(6,182,212,.24), transparent 27%),
-            radial-gradient(circle at 0% 100%, rgba(59,130,246,.28), transparent 34%),
-            linear-gradient(135deg, #09142F 0%, #10275A 55%, #143A70 100%);
-        box-shadow: 0 18px 40px rgba(15,23,42,.13);
-        border: 1px solid rgba(255,255,255,.08);
-    }
-
-    .hero::after {
-        content: "";
-        position: absolute;
-        width: 240px;
-        height: 240px;
-        right: -80px;
-        top: -120px;
-        border-radius: 999px;
-        border: 1px solid rgba(255,255,255,.08);
-        box-shadow: 0 0 0 35px rgba(255,255,255,.025), 0 0 0 70px rgba(255,255,255,.018);
-    }
-
-    .hero-kicker {
-        font-size: .68rem;
-        text-transform: uppercase;
-        letter-spacing: 1.7px;
-        font-weight: 850;
-        color: #8DB4FF;
-        margin-bottom: 4px;
-    }
-
-    .hero-title {
-        font-size: 1.75rem;
-        font-weight: 850;
-        letter-spacing: -.035em;
-        margin: 0;
-        color: white;
-    }
-
-    .hero-subtitle {
-        color: #C5D4F3;
-        font-size: .82rem;
-        margin-top: 6px;
-    }
-
-    .hero-sync {
-        text-align: right;
-        font-size: .7rem;
-        color: #A9BDE2;
-        position: relative;
-        z-index: 2;
-        padding-top: 6px;
-    }
-
-    .hero-sync strong {
-        display: inline-block;
-        margin-top: 4px;
-        font-size: .82rem;
-        color: #FFFFFF;
-    }
-
-    .live-dot {
-        display: inline-block;
-        width: 7px;
-        height: 7px;
-        background: #34D399;
-        border-radius: 50%;
-        margin-right: 5px;
-        box-shadow: 0 0 0 4px rgba(52,211,153,.10);
-    }
-
-    /* ------------------------------- FILTERS ---------------------------- */
-    .filter-card {
-        margin: 14px 0 16px;
-        padding: 12px 15px 2px;
-        border-radius: 15px;
-        background: rgba(255,255,255,.76);
-        border: 1px solid rgba(226,232,240,.95);
-        box-shadow: 0 7px 20px rgba(15,23,42,.04);
-    }
-
-    .filter-label {
-        font-size: .64rem;
-        color: var(--slate-500);
-        font-weight: 850;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-        margin-bottom: 3px;
-    }
-
-    /* ------------------------------ KPI BOXES ---------------------------- */
-    .kpi-box {
-        height: 100%;
-        padding: 13px;
-        border-radius: 16px;
-        border: 1px solid var(--slate-200);
-        background: rgba(255,255,255,.88);
-        box-shadow: 0 8px 22px rgba(15,23,42,.045);
-        backdrop-filter: blur(9px);
-    }
-
-    .box-label {
-        font-size: .63rem;
-        font-weight: 900;
-        color: var(--slate-500);
-        text-transform: uppercase;
-        letter-spacing: 1.2px;
-        display: flex;
-        align-items: center;
-        gap: 7px;
-        margin: 0 0 10px;
-    }
-
-    .box-label::before {
-        content: "";
-        width: 4px;
-        height: 12px;
-        border-radius: 4px;
-        background: linear-gradient(180deg, var(--blue), var(--cyan));
-        display: inline-block;
-    }
-
-    .kpi-grid {
-        display: grid;
-        gap: 9px;
-    }
-
-    .kpi-card {
-        min-height: 91px;
-        padding: 11px 7px 10px;
-        border-radius: 12px;
-        text-align: center;
-        background: linear-gradient(180deg, #FFFFFF, #F8FAFC);
-        border: 1px solid #E7EDF5;
-        box-shadow: 0 4px 13px rgba(15,23,42,.045);
-        transition: transform .18s ease, box-shadow .18s ease;
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
-    }
-
-    .kpi-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 10px 24px rgba(15,23,42,.08);
-    }
-
-    .kpi-label {
-        font-size: .61rem;
-        color: var(--slate-500);
-        font-weight: 800;
-        margin-bottom: 4px;
-        text-transform: uppercase;
-        letter-spacing: .55px;
-    }
-
-    .kpi-value {
-        font-size: 1.25rem;
-        color: var(--slate-900);
-        font-weight: 900;
-        margin: 0;
-        line-height: 1;
-        letter-spacing: -.03em;
-    }
-
-    .kpi-pc {
-        font-size: .65rem;
-        color: var(--blue);
-        font-weight: 800;
-        margin-top: 6px;
-        background: #EAF1FF;
-        display: inline-block;
-        padding: 3px 7px;
-        border-radius: 99px;
-    }
-
-    /* ------------------------------ INSIGHTS ----------------------------- */
-    .insight-wrap {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 10px;
-        padding: 5px 1px 3px;
-    }
-
-    .insight-card {
-        flex: 1 1 235px;
-        max-width: 330px;
-        min-width: 220px;
-        padding: 13px 15px;
-        border-radius: 13px;
-        background: rgba(255,255,255,.92);
-        border: 1px solid var(--slate-200);
-        border-left: 4px solid var(--blue);
-        box-shadow: 0 6px 18px rgba(15,23,42,.045);
-    }
-
-    .insight-title { font-size: .61rem; font-weight: 900; color: var(--slate-500); margin: 0; text-transform: uppercase; letter-spacing: .8px; }
-    .insight-phrase { font-size: .84rem; font-weight: 850; color: var(--slate-900); margin: 4px 0 2px; }
-    .insight-comment { font-size: .71rem; color: var(--slate-600); margin: 0; line-height: 1.4; }
-
-    /* ------------------------------ PANELS ------------------------------- */
-    .panel-caption {
-        color: var(--slate-500);
-        font-size: .70rem;
-        margin-top: -5px;
-        margin-bottom: 8px;
-    }
-
-    .soft-divider {
-        height: 1px;
-        margin: 18px 0;
-        background: linear-gradient(90deg, transparent, #DCE4EE 15%, #DCE4EE 85%, transparent);
-    }
-
-    /* ------------------------------ TABS --------------------------------- */
-    button[data-baseweb="tab"] {
-        font-weight: 750;
-        color: var(--slate-500);
-    }
-
-    button[data-baseweb="tab"][aria-selected="true"] {
-        color: var(--blue) !important;
-    }
-
-    [data-baseweb="tab-highlight"] {
-        background-color: var(--blue) !important;
-    }
-
-    /* ------------------------------ INPUTS -------------------------------- */
-    div[data-baseweb="select"] > div,
-    div[data-baseweb="input"] > div,
-    [data-testid="stDateInput"] input {
-        border-radius: 10px !important;
-        border-color: #D8E1ED !important;
-        background: rgba(255,255,255,.92) !important;
-    }
-
-    [data-testid="stTextInput"] input {
-        border-radius: 11px;
-        border: 1px solid #D8E1ED;
-        background: #FFFFFF;
-    }
-
-    [data-testid="stButton"] button {
-        border-radius: 10px;
-        font-weight: 750;
-        transition: all .18s ease;
-    }
-
-    [data-testid="stButton"] button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 6px 16px rgba(15,23,42,.08);
-    }
-
-    /* ----------------------------- TABLES -------------------------------- */
-    [data-testid="stDataFrame"] {
-        border-radius: 13px;
-        overflow: hidden;
-        border: 1px solid #E2E8F0;
-        box-shadow: 0 5px 18px rgba(15,23,42,.035);
-        background: white;
-    }
-
-    /* --------------------------- TIPS PANEL ------------------------------ */
-    .tips-box {
-        background: linear-gradient(135deg, #FFFDF5 0%, #FFFBEB 100%);
-        border: 1px solid #FDE68A;
-        border-left: 5px solid var(--amber);
-        padding: 18px 19px;
-        border-radius: 15px;
-        margin-top: 8px;
-        box-shadow: 0 7px 20px rgba(180,83,9,.05);
-    }
-
-    .tips-title {
-        font-size: .76rem;
-        font-weight: 900;
-        color: #92400E;
-        margin-bottom: 8px;
-        text-transform: uppercase;
-        letter-spacing: .8px;
-    }
-
-    .tips-list {
-        margin: 0;
-        padding-left: 20px;
-        color: #78350F;
-        font-size: .76rem;
-        line-height: 1.55;
-    }
-
-    /* ----------------------------- FOOTER -------------------------------- */
-    .footer-note {
-        text-align: center;
-        color: var(--slate-400);
-        font-size: .66rem;
-        padding: 3px 0 0;
-    }
-
-    /* ------------------------ ACTION CENTRE ------------------------------ */
-    .action-wrap {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 12px;
-        margin: 4px 0 8px;
-    }
-
-    .action-card {
-        position: relative;
-        overflow: hidden;
-        min-height: 124px;
-        padding: 15px 16px;
-        border-radius: 15px;
-        background: rgba(255,255,255,.93);
-        border: 1px solid #E2E8F0;
-        box-shadow: 0 8px 22px rgba(15,23,42,.045);
-    }
-
-    .action-card::after {
-        content: "";
-        position: absolute;
-        width: 90px;
-        height: 90px;
-        right: -28px;
-        top: -35px;
-        border-radius: 999px;
-        border: 1px solid rgba(37,99,235,.08);
-    }
-
-    .action-top {
-        display: flex;
-        align-items: center;
-        gap: 9px;
-    }
-
-    .action-icon {
-        width: 31px;
-        height: 31px;
-        border-radius: 9px;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        font-size: .85rem;
-        font-weight: 900;
-        flex: 0 0 auto;
-    }
-
-    .action-label {
-        color: #475569;
-        font-size: .64rem;
-        text-transform: uppercase;
-        letter-spacing: .9px;
-        font-weight: 900;
-    }
-
-    .action-count {
-        margin-top: 8px;
-        color: #0F172A;
-        font-size: 1.45rem;
-        line-height: 1;
-        font-weight: 900;
-        letter-spacing: -.04em;
-    }
-
-    .action-copy {
-        margin-top: 6px;
-        color: #64748B;
-        font-size: .70rem;
-        line-height: 1.4;
-        max-width: 92%;
-    }
-
-    /* --------------------------- FUNNEL --------------------------------- */
-    .funnel-shell {
-        padding: 16px 17px;
-        border-radius: 15px;
-        background: rgba(255,255,255,.93);
-        border: 1px solid #E2E8F0;
-        box-shadow: 0 8px 22px rgba(15,23,42,.045);
-    }
-
-    .funnel-note {
-        color: #64748B;
-        font-size: .68rem;
-        line-height: 1.45;
-        margin-bottom: 12px;
-    }
-
-    .funnel-row {
-        display: grid;
-        grid-template-columns: 98px 1fr 58px;
-        gap: 9px;
-        align-items: center;
-        margin: 10px 0;
-    }
-
-    .funnel-name {
-        color: #334155;
-        font-size: .69rem;
-        font-weight: 800;
-    }
-
-    .funnel-companion {
-        margin-top: 3px;
-        color: #92400E;
-        font-size: .56rem;
-        font-weight: 800;
-        letter-spacing: .15px;
-    }
-
-    .funnel-track {
-        height: 10px;
-        border-radius: 99px;
-        background: #EDF2F7;
-        overflow: hidden;
-    }
-
-    .funnel-fill {
-        height: 100%;
-        border-radius: 99px;
-        min-width: 3px;
-    }
-
-    .funnel-value {
-        text-align: right;
-        color: #0F172A;
-        font-size: .68rem;
-        font-weight: 900;
-    }
-
-    /* ------------------------ COMPARISON -------------------------------- */
-    .comparison-grid {
-        display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 8px;
-    }
-
-    .comparison-card {
-        min-height: 84px;
-        padding: 10px 12px;
-        border-radius: 13px;
-        background: linear-gradient(180deg, #FFFFFF, #F8FAFC);
-        border: 1px solid #E2E8F0;
-        box-shadow: 0 6px 16px rgba(15,23,42,.035);
-    }
-
-    .comparison-label {
-        color: #64748B;
-        text-transform: uppercase;
-        letter-spacing: .65px;
-        font-size: .59rem;
-        font-weight: 900;
-    }
-
-    .comparison-value {
-        color: #0F172A;
-        font-size: 1.06rem;
-        font-weight: 900;
-        margin-top: 4px;
-    }
-
-    .comparison-base {
-        color: #94A3B8;
-        font-size: .63rem;
-        margin-top: 2px;
-    }
-
-    .delta {
-        display: inline-block;
-        margin-top: 7px;
-        padding: 3px 7px;
-        border-radius: 99px;
-        font-size: .60rem;
-        font-weight: 900;
-    }
-
-    .delta-up {
-        background: #ECFDF5;
-        color: #047857;
-    }
-
-    .delta-down {
-        background: #FEF2F2;
-        color: #B91C1C;
-    }
-
-    .delta-flat {
-        background: #F1F5F9;
-        color: #64748B;
-    }
-
-    /* ------------------------ MINI STATS -------------------------------- */
-    .mini-stat-grid {
-        display: grid;
-        grid-template-columns: repeat(5, minmax(0, 1fr));
-        gap: 8px;
-    }
-
-    .mini-stat {
-        padding: 10px 11px;
-        border-radius: 12px;
-        background: rgba(255,255,255,.92);
-        border: 1px solid #E2E8F0;
-    }
-
-    .mini-stat-label {
-        color: #64748B;
-        font-size: .60rem;
-        font-weight: 900;
-        text-transform: uppercase;
-        letter-spacing: .65px;
-    }
-
-    .mini-stat-value {
-        color: #0F172A;
-        font-size: 1.06rem;
-        font-weight: 900;
-        margin-top: 4px;
-    }
-
-    .mini-stat-sub {
-        color: #94A3B8;
-        font-size: .59rem;
-        margin-top: 1px;
-    }
-
-    /* ------------------------ PERFORMANCE PULSE ------------------------- */
-    .pulse-shell {
-        background: rgba(255,255,255,.72);
-        border: 1px solid #E2E8F0;
-        border-radius: 16px;
-        padding: 12px;
-        box-shadow: 0 7px 20px rgba(15,23,42,.035);
-    }
-
-    .pulse-head {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        margin-bottom: 9px;
-    }
-
-    .pulse-title {
-        font-size: .88rem;
-        font-weight: 900;
-        color: #0F172A;
-    }
-
-    .pulse-note {
-        color: #64748B;
-        font-size: .62rem;
-        line-height: 1.35;
-        text-align: right;
-    }
-
-    .pulse-subtitle {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        color: #475569;
-        font-size: .65rem;
-        font-weight: 900;
-        text-transform: uppercase;
-        letter-spacing: .7px;
-        margin: 0 0 7px;
-    }
-
-    .pulse-subtitle span {
-        width: 5px;
-        height: 16px;
-        border-radius: 999px;
-        background: linear-gradient(180deg, #2563EB, #06B6D4);
-        display: inline-block;
-    }
-
-    .pulse-separator {
-        height: 1px;
-        background: #E8EEF5;
-        margin: 10px 0;
-    }
-
-    /* --------------------------- RESPONSIVE ------------------------------ */
-    @media (max-width: 900px) {
-        .block-container { padding-left: 1rem; padding-right: 1rem; }
-        .hero-title { font-size: 1.45rem; }
-        .hero-sync { text-align: left; padding-top: 12px; }
-        .login-shell { margin-top: 4vh; }
-    }
-    </style>
-    """
+<style>
+[data-testid="stMetric"] { border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 4px !important; box-shadow: 0 1px 3px rgba(0,0,0,0.04); text-align: center !important; }
+[data-testid="stMetricLabel"] { font-size: 0.58rem !important; font-weight:700 !important; color:#475569; text-transform:uppercase; }
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
-# ----------------------------------------------------------------------------
-# CONSTANTS
-# ----------------------------------------------------------------------------
-LOGO_URL = "https://raw.githubusercontent.com/dataanalystsparta-netizen/logos/refs/heads/main/sparta-telecom-squarelogo-1663578233108%20(1).jpg"
-SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ")
-CRM_MIRROR_SHEET_URL = st.secrets.get(
-    "CRM_MIRROR_SHEET_URL",
-    "https://docs.google.com/spreadsheets/d/1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ/edit?gid=1647226826#gid=1647226826",
+# ==========================================================
+# CONFIG / CONSTANTS
+# ==========================================================
+SPREADSHEET_ID: str = st.secrets.get("SPREADSHEET_ID", "1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ")
+APPLICATION_SHEET: str = st.secrets.get("APPLICATION_SHEET", "Sparta")
+LIVE_SHEET: str = st.secrets.get("LIVE_SHEET", "Sparta2")
+SCOPES: List[str] = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
+# ==========================================================
+# HYBRID DATA SOURCE CONFIGURATION
+# ==========================================================
+# Historical / legacy (Excel-backed) data is authoritative through
+# 17-Sep-2026 inclusive. CRM is authoritative from 18-Sep-2026 onward.
+SOURCE_CUTOFF_DATE = pd.Timestamp("2026-09-17")
+CRM_START_DATE = pd.Timestamp("2026-09-18")
+
+CRM_MIRROR_WORKSHEET_GID = int(
+    st.secrets.get("CRM_MIRROR_WORKSHEET_GID", "1647226826")
 )
-CRM_MIRROR_WORKSHEET_GID = int(st.secrets.get("CRM_MIRROR_WORKSHEET_GID", "1647226826"))
 
-# ---------------------------------------------------------------------------
-# SOURCE CUTOVER
-# ---------------------------------------------------------------------------
-# Legacy Sparta / Sparta2 data is used only through 17-Sep-2026 (inclusive).
-# All records after 17-Sep-2026 are taken only from the CRM mirror worksheet.
-LEGACY_SOURCE_CUTOFF = pd.Timestamp("2026-09-17")
-CRM_SOURCE_START = LEGACY_SOURCE_CUTOFF + pd.Timedelta(days=1)
-
-# Existing authentication remains unchanged.
-ACCESS_KEYS = st.secrets["agent_keys"]
-
-# ---------------------------------------------------------------------------
-# HYBRID DATA-SOURCE CONFIGURATION
-# Google Sheets remains the historical/legacy source. A dedicated CRM mirror
-# worksheet supplies new CRM records, using Sale Date + Phone Number for
-# reconciliation. The direct API functions below are retained for reference
-# but are no longer called by the portal.
-# ---------------------------------------------------------------------------
-SPARTA_API_URL = st.secrets.get(
-    "SPARTA_API_URL",
-    "https://spartacrm.fastranking.cloud/api/dashboard/dashboard-data",
+# Daily attendance source used for SPD calculations.
+ATTENDANCE_WORKSHEET_GID = int(
+    st.secrets.get("ATTENDANCE_WORKSHEET_GID", "1036958145")
 )
-def resolve_api_secret():
-    """Read the API token from common Streamlit-secret layouts without exposing it."""
-    direct_names = [
-        "SPARTA_API_TOKEN",
-        "SPARTA_CRM_API_TOKEN",
-        "SPARTA_API_KEY",
-        "API_TOKEN",
-    ]
 
-    for name in direct_names:
-        try:
-            value = st.secrets.get(name, "")
-        except Exception:
-            value = ""
-        if value:
-            return str(value).strip()
-
-    # Also support a nested [sparta_api] / [SPARTA_API] secret block.
-    for section_name in ("sparta_api", "SPARTA_API", "api", "API"):
-        try:
-            section = st.secrets.get(section_name)
-        except Exception:
-            section = None
-        if section:
-            for key_name in ("token", "api_token", "key", "api_key"):
-                try:
-                    value = section.get(key_name, "")
-                except Exception:
-                    value = ""
-                if value:
-                    return str(value).strip()
-
-    # Local development fallback only. Streamlit Cloud should use secrets.
-    for env_name in ("SPARTA_API_TOKEN", "SPARTA_CRM_API_TOKEN", "SPARTA_API_KEY"):
-        value = os.getenv(env_name, "")
-        if value:
-            return value.strip()
-
-    return ""
-
-
-SPARTA_API_TOKEN = resolve_api_secret()
-SPARTA_API_AUTH_MODE = str(st.secrets.get("SPARTA_API_AUTH_MODE", "auto")).strip().lower()
-SPARTA_API_TIMEOUT = int(st.secrets.get("SPARTA_API_TIMEOUT_SECONDS", 60))
-SPARTA_API_MAX_RETRIES = int(st.secrets.get("SPARTA_API_MAX_RETRIES", 3))
 DATA_CACHE_TTL = int(st.secrets.get("DATA_CACHE_TTL_SECONDS", 300))
 
 API_REQUIRED_COLUMNS = [
@@ -945,186 +106,496 @@ API_REQUIRED_COLUMNS = [
     "Cancellation/Rejection Reason - Potential Opportunity",
 ]
 
-# ----------------------------------------------------------------------------
-# HELPERS
-# ----------------------------------------------------------------------------
-def log_agent_login(agent_name):
-    try:
-        info = st.secrets["gcp_service_account"]
-        creds = Credentials.from_service_account_info(
-            info,
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",
-            ],
+NEW_ADVISORS = ["Aryan", "Shivam"]
+CUSTOMER_SERVICE_ADVISORS = ["Aman", "Ravi Inbound", "Santosh Joshi", "Vijender", "Laxmi Narayan","Alex"]
+LEFT_ADVISORS = [
+    "Gaurav", "Guru", "Niki", "Shaheen", "Manmeet", "Gungun", "Rani", "Archana", "Deepali", "Sushanshu",
+    "Supreme", "Tokivi", "Sangeeta", "Vijay", "Khushbu", "Kushal", "Nishant", "Pawan", "Mehak", "Khushboo", "Ashima",
+    "Aarti", "Abhay", "Diwakar", "Manshay", "Khusboo", "Manmet", "Lakshay", "Sneha", "Swarali", "Monica", "Paras",
+    "Veer", "Yash", "Sudhanshu", "Rishabh", "Krrish", "Anshu", "Edwin", "Sravan", "Seema"
+]
+
+NEW_ADVISORS_SET = {a.strip().lower() for a in NEW_ADVISORS}
+CS_ADVISORS_SET = {a.strip().lower() for a in CUSTOMER_SERVICE_ADVISORS}
+LEFT_ADVISORS_SET = {a.strip().lower() for a in LEFT_ADVISORS}
+
+# ==========================================================
+# Google Sheets client (cached resource)
+# ==========================================================
+@st.cache_resource
+def get_google_service():
+    if "gcp_service_account" not in st.secrets:
+        raise RuntimeError("Missing gcp_service_account in Streamlit secrets.")
+    credentials = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
+    service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
+    logger.info("Google Sheets client created")
+    return service
+
+
+@st.cache_resource
+def get_crm_gspread_client():
+    """Cached gspread client for the dedicated CRM mirror worksheet."""
+    if "gcp_service_account" not in st.secrets:
+        raise RuntimeError("Missing gcp_service_account in Streamlit secrets.")
+    credentials = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    return gspread.authorize(credentials)
+
+def load_sheet(sheet_name: str, max_retries: int = 3, backoff: float = 1.0) -> pd.DataFrame:
+    service = get_google_service()
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range=sheet_name).execute()
+            values = result.get("values", [])
+            if not values:
+                return pd.DataFrame()
+            headers, rows = values[0], values[1:]
+            max_cols = len(headers)
+            cleaned_rows = [
+                r + [""] * (max_cols - len(r)) if len(r) < max_cols else r[:max_cols]
+                for r in rows
+            ]
+            df = pd.DataFrame(cleaned_rows, columns=headers)
+            logger.info("Loaded sheet '%s' with %d rows", sheet_name, len(df))
+            return df
+        except HttpError as e:
+            logger.warning("HttpError reading sheet %s (attempt %d/%d): %s", sheet_name, attempt, max_retries, e)
+        except Exception as e:
+            logger.exception("Unexpected error reading sheet %s (attempt %d/%d): %s", sheet_name, attempt, max_retries, e)
+        if attempt < max_retries:
+            time.sleep(backoff * (2 ** (attempt - 1)))
+    raise RuntimeError(f"Failed to load sheet {sheet_name} after {max_retries} attempts")
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_sheet_cached(sheet_name: str) -> pd.DataFrame:
+    return load_sheet(sheet_name)
+
+# ==========================================================
+# DATA CLEANING & VECTORIZED CATEGORIZATION
+# ==========================================================
+PHONE_RE = re.compile(r"\D")
+
+def clean_phone(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).str.replace(PHONE_RE, "", regex=True).str.lstrip("0").str.strip()
+
+def parse_mixed_dates_value(val) -> pd.Timestamp:
+    if pd.isna(val) or str(val).strip().lower() in {"", "(blank)", "nan", "none"}:
+        return pd.NaT
+    val_str = str(val).strip()
+    iso_match = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", val_str)
+    if iso_match:
+        year, month, day = iso_match.groups()
+        try:
+            return pd.Timestamp(year=int(year), month=int(month), day=int(day))
+        except ValueError:
+            pass
+    uk_match = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{4})", val_str)
+    if uk_match:
+        day, month, year = uk_match.groups()
+        try:
+            return pd.Timestamp(year=int(year), month=int(month), day=int(day))
+        except ValueError:
+            pass
+    return pd.to_datetime(val_str, errors="coerce", dayfirst=True)
+
+def parse_date_series(series: pd.Series) -> pd.Series:
+    return series.apply(parse_mixed_dates_value)
+
+def format_date_ddmmyyyy(series: pd.Series) -> pd.Series:
+    parsed = parse_date_series(series)
+    return parsed.dt.strftime("%d/%m/%Y").fillna("")
+
+def categorize_quality_status_series(s: pd.Series) -> pd.Series:
+    s_norm = s.fillna("").astype(str).str.strip().str.lower()
+    pending_mask = s_norm.isin(["", "(blank)", "nan", "none"])
+    approved_mask = s_norm.str.contains("appr", na=False)
+    rework_mask = s_norm.str.contains("rework", na=False)
+    cancelled_mask = s_norm.str.contains(r"cancel|reject|hold|duplicat|inbound|n/a|rec in accessible", na=False)
+    return pd.Series(
+        np.select(
+            [pending_mask, approved_mask, rework_mask, cancelled_mask],
+            ["Pending", "Approved", "Rework", "Cancelled"],
+            default="Cancelled"
+        ),
+        index=s.index,
+    )
+
+def categorize_welcome_status_series(s: pd.Series) -> pd.Series:
+    s_norm = s.fillna("").astype(str).str.strip().str.lower()
+    pending_mask = s_norm.isin(["", "(blank)", "nan", "none"]) | s_norm.str.contains(r"pending|follow|paperwork|wrong|ring", na=False)
+    done_mask = s_norm.str.contains("done", na=False)
+    cancelled_mask = s_norm.str.contains(r"cancel|reject|hold", na=False)
+    return pd.Series(
+        np.select([pending_mask, done_mask, cancelled_mask], ["Pending", "Done", "Cancelled"], default="Pending"),
+        index=s.index,
+    )
+
+def categorize_portal_status_series(s: pd.Series) -> pd.Series:
+    s_norm = s.fillna("").astype(str).str.strip().str.lower()
+    committed_mask = s_norm.isin(["", "(blank)", "nan", "none"]) | s_norm.str.contains(r"commit|in progress|processing", na=False)
+    cancelled_mask = s_norm.str.contains(r"cancel|reject", na=False)
+    live_mask = s_norm.str.contains(r"live|pending|active|completed", na=False)
+    return pd.Series(
+        np.select([cancelled_mask, live_mask, committed_mask], ["Cancelled", "Live", "Committed"], default="Committed"),
+        index=s.index,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CRM-SPECIFIC STATUS SEMANTICS
+# ---------------------------------------------------------------------------
+# The CRM mirror uses different terminology from the legacy Excel / Sparta
+# sheets. The legacy categorisers above are intentionally left untouched.
+
+
+def categorize_crm_quality_status_series(s: pd.Series) -> pd.Series:
+    """Map CRM Quality Status values to the executive dashboard taxonomy."""
+    s_norm = s.fillna("").astype(str).str.strip().str.lower()
+
+    # CRM-specific: QA-Pending must remain in QA Pending, not QA Cancelled.
+    pending_mask = s_norm.str.contains(r"^qa[- ]?pending$|^pending$", na=False)
+    approved_mask = s_norm.str.contains(r"qa[- ]?approved|approved", na=False)
+    rework_mask = s_norm.str.contains(r"rework", na=False)
+    cancelled_mask = s_norm.str.contains(
+        r"qa[- ]?reject|reject|cancel|hold|duplicate|inbound|n/a|rec in accessible",
+        na=False,
+    )
+
+    return pd.Series(
+        np.select(
+            [pending_mask, approved_mask, rework_mask, cancelled_mask],
+            ["Pending", "Approved", "Rework", "Cancelled"],
+            default="Cancelled",
+        ),
+        index=s.index,
+    )
+
+
+def categorize_crm_welcome_status_series(s: pd.Series) -> pd.Series:
+    """Map CRM Welcome Call Status values to Done / Cancelled / Pending.
+
+    CRM blanks are intentionally left uncategorized: a blank Welcome status is
+    NOT counted as Welcome Pending.
+    """
+    s_norm = s.fillna("").astype(str).str.strip().str.lower()
+
+    blank_mask = s_norm.isin(["", "(blank)", "nan", "none"])
+    pending_mask = (~blank_mask) & s_norm.str.contains(
+        r"pending|follow[- ]?up|paperwork|wrong|ring|chasing|think",
+        na=False,
+    )
+    done_mask = s_norm.str.contains(r"approved|done|complete", na=False)
+    cancelled_mask = s_norm.str.contains(
+        r"reject|cancel|declin|change of mind|hold",
+        na=False,
+    )
+
+    return pd.Series(
+        np.select(
+            [blank_mask, pending_mask, done_mask, cancelled_mask],
+            ["", "Pending", "Done", "Cancelled"],
+            default="",
+        ),
+        index=s.index,
+    )
+
+
+def derive_crm_portal_status(row: pd.Series) -> str:
+    """
+    Derive the executive dashboard Live / Committed / Cancelled taxonomy from
+    CRM's downstream provisioning, onboarding, dispatch and confirmation data.
+
+    A blank downstream section is NOT automatically "Committed" in CRM because
+    the CRM sheet contains the complete application population, unlike Sparta2.
+    """
+    onboarding = clean_reason_text(
+        row.get("Committed (Live) Status (Onboarding Status)", "")
+    ).lower()
+    provisioning = clean_reason_text(row.get("Provisioning Status", "")).lower()
+    dispatch = clean_reason_text(row.get("LetterStatus (Dispatch Status)", "")).lower()
+    confirmation = clean_reason_text(row.get("Confirmation Status", "")).lower()
+
+    prov_cancel_reason = clean_reason_text(
+        row.get("Cancellation/Rejection Reason - Provisioning", "")
+    ).lower()
+    dispatch_cancel_reason = clean_reason_text(
+        row.get("Cancellation/Rejection Reason - Dispatch", "")
+    ).lower()
+    confirmation_cancel_reason = clean_reason_text(
+        row.get("Cancellation/Rejection Reason - Confirmation", "")
+    ).lower()
+    onboarding_cancel_reason = clean_reason_text(
+        row.get("Cancellation/Rejection Reason - Onboarding", "")
+    ).lower()
+
+    # CRM-specific confirmation semantics:
+    # - Confirmation Approved / Followup / Pending -> Committed
+    # - Confirmation To Be Cancelled -> Live Cancelled
+    confirmation_is_cancelled = bool(
+        re.search(
+            r"to\s*be\s*cancelled|\bcancelled\b|\bcancel\b|reject(?:ed)?|rejection",
+            confirmation,
+            re.IGNORECASE,
         )
-        client = gspread.authorize(creds)
-        ss = client.open_by_key(SPREADSHEET_ID)
+    )
 
-        try:
-            log_sheet = ss.worksheet("Logs")
-        except gspread.WorksheetNotFound:
-            log_sheet = ss.add_worksheet(title="Logs", rows="1000", cols="3")
-            log_sheet.append_row(["Timestamp", "Agent Name", "Action"])
+    # Explicit cancellation/rejection wins over all other downstream signals.
+    cancelled_text = " | ".join(
+        [
+            provisioning,
+            dispatch,
+            confirmation,
+            onboarding,
+            prov_cancel_reason,
+            dispatch_cancel_reason,
+            confirmation_cancel_reason,
+            onboarding_cancel_reason,
+        ]
+    )
+    if confirmation_is_cancelled or re.search(
+        r"order\s*cancelled|to\s*be\s*cancelled|cancelled|cancellation|reject(?:ed)?|rejection",
+        cancelled_text,
+        re.IGNORECASE,
+    ):
+        return "Cancelled"
 
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_sheet.append_row([timestamp, agent_name, "Login"])
-    except Exception:
-        # Preserve original behaviour: login should not fail because logging fails.
-        pass
+    # CRM Onboarding Pending / Approved corresponds to the executive
+    # dashboard's Live bucket.
+    if re.search(
+        r"onboarding\s+(?:approved|pending)|\blive\b|\bactive\b|\bcompleted\b",
+        onboarding,
+        re.IGNORECASE,
+    ):
+        return "Live"
 
+    # CRM confirmation is a direct Committed-pipeline signal. These three
+    # statuses must all be counted under COMMITTED REM.
+    if re.search(
+        r"confirmation\s+(?:approved|follow[- ]?up|pending)",
+        confirmation,
+        re.IGNORECASE,
+    ):
+        return "Committed"
 
-def robust_date_parser(date_value):
-    """Parse legacy Google dates using the portal's day-first convention."""
-    if pd.isna(date_value):
-        return pd.NaT
-    if isinstance(date_value, (pd.Timestamp, datetime.datetime, datetime.date)):
-        return pd.Timestamp(date_value)
+    # Other genuine downstream order/provisioning signals that are not
+    # cancelled and not yet onboarding-live remain in the Committed pipeline.
+    committed_text = " | ".join([provisioning, dispatch, confirmation, onboarding])
+    if re.search(
+        r"connectivity:\s*committed|\bcommitted\b|processed|re[ -]?processed|in\s+progress|send\s+for\s+rework|dispatch\s+approved",
+        committed_text,
+        re.IGNORECASE,
+    ):
+        return "Committed"
 
-    value = str(date_value).strip()
-    if not value or value.lower() in {"nan", "nat", "none", "null"}:
-        return pd.NaT
-
-    # ISO / year-first values should remain year-first.
-    if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", value):
-        try:
-            return pd.to_datetime(value, errors="coerce", yearfirst=True)
-        except Exception:
-            return pd.NaT
-
-    # Legacy portal data uses day-first dates for slash/dash text values.
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y"):
-        try:
-            parsed = pd.to_datetime(value, format=fmt, errors="coerce")
-            if not pd.isna(parsed):
-                return parsed
-        except Exception:
-            pass
-
-    try:
-        return pd.to_datetime(value, errors="coerce", dayfirst=True, format="mixed")
-    except Exception:
-        try:
-            return pd.to_datetime(value, errors="coerce", dayfirst=True)
-        except Exception:
-            return pd.NaT
-
-
-def parse_date_series(series):
-    """Parse legacy Google dates consistently as day-first, without dtype comparison issues."""
-    result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
-    for idx, value in series.items():
-        result.loc[idx] = robust_date_parser(value)
-    return result
+    # No downstream pipeline state yet (for example a potential opportunity
+    # or a welcome-only record): do not include it in Live/Committed KPIs.
+    return ""
 
 
-def parse_api_date(value):
-    """Parse CRM API Sale Date, whose supplied export format is DD-MM-YYYY."""
+def build_crm_portal_frame(api: pd.DataFrame) -> pd.DataFrame:
+    """Build the CRM equivalent of the legacy Sparta2 frame."""
+    if api.empty:
+        return pd.DataFrame()
+
+    portal = pd.DataFrame(index=api.index)
+    portal["Sale Date"] = api["Sale Date Clean"].dt.strftime("%d/%m/%Y")
+    portal["Sale Date Clean"] = api["Sale Date Clean"]
+    portal["Telephone No."] = api["Telephone No."]
+    portal["Live Date"] = ""
+    # CRM-specific display column: preserve the exact Onboarding Status value.
+    portal["Final Status"] = api[
+        "Committed (Live) Status (Onboarding Status)"
+    ].fillna("").astype(str).str.strip()
+    portal["Portal Status"] = portal["Final Status"]
+    portal["Letter Status"] = api[
+        "LetterStatus (Dispatch Status)"
+    ].fillna("").astype(str).str.strip()
+    portal["Call Status"] = api[
+        "Confirmation Status"
+    ].fillna("").astype(str).str.strip()
+    # CRM-specific source field used by the Monthly KPI Breakdown.
+    portal["Confirmation Status"] = api[
+        "Confirmation Status"
+    ].fillna("").astype(str).str.strip()
+    portal["Comments"] = api["Confirmation Comment"].apply(clean_reason_text)
+    portal["Voice of Customer"] = ""
+    portal["Portal Cancellation"] = api.apply(
+        combine_crm_cancellation_reasons, axis=1
+    )
+    portal["Provisioning Status"] = api[
+        "Provisioning Status"
+    ].fillna("").astype(str).str.strip()
+    portal["Provisioning Remarks"] = api[
+        "Provisioning Remarks (Provisioning Comments)"
+    ].apply(clean_reason_text)
+    portal["Dashboard Month"] = api["Sale Date Clean"].dt.strftime("%B %Y")
+    portal["Standardized Date"] = portal["Sale Date"]
+    portal["Portal Status Clean"] = api.apply(derive_crm_portal_status, axis=1)
+    portal["Advisor"] = api["Advisor"]
+    portal["Source"] = "CRM"
+    portal["_RecordKey"] = api["_RecordKey"]
+
+    # Unlike Sparta2, CRM contains the entire application population. Only
+    # rows with an actual downstream pipeline state become portal rows.
+    portal = portal[portal["Portal Status Clean"] != ""].copy()
+    return portal.reset_index(drop=True)
+
+
+def get_raw_breakdown(df: pd.DataFrame, raw_col: str, clean_col: str, target_val: str):
+    if raw_col not in df.columns or clean_col not in df.columns:
+        return []
+    mask = df[clean_col] == target_val
+    raw_values = df.loc[mask, raw_col].fillna("(blank)").astype(str).str.strip().replace("", "(blank)")
+    if raw_values.empty:
+        return []
+    counts = raw_values.value_counts()
+    return [(str(rv), int(cnt)) for rv, cnt in counts.items()]
+
+def format_raw_breakdown(df: pd.DataFrame, raw_col: str, clean_col: str, target_val: str) -> str:
+    breakdown = get_raw_breakdown(df, raw_col, clean_col, target_val)
+    if not breakdown:
+        return ""
+    lines = [f"{raw}: {count}" for raw, count in breakdown]
+    total = sum(count for _, count in breakdown)
+    return "Raw Status Breakdown\n" + "\n".join(lines) + f"\nTotal: {total}"
+
+
+# ==========================================================
+# DATA LOADING
+# ==========================================================
+
+@st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
+def load_sparta() -> pd.DataFrame:
+    """Load the legacy / Excel-backed application history from Sparta."""
+    df = load_sheet_cached(APPLICATION_SHEET)
+    if df.empty:
+        return df
+
+    rename_map = {
+        "Advisor": "Advisor",
+        "Quality Officer": "Quality Officer",
+        "Welcome Call By": "Welcome Call By",
+        "Sale Date": "Sale Date",
+        "Customer Name": "Customer Name",
+        "CLI": "Telephone No.",
+        "Quality Date": "Quality Date",
+        "Quality Status": "Quality Status",
+        "Quality Remarks": "Quality Remarks",
+        "Welcome call Remarks": "Welcome Remarks",
+        "Status": "Welcome Status",
+        "Cancellation Sub-text": "Welcome Cancellation",
+        "WCD date": "Welcome Date",
+        "Provisioning": "Provisioning Status",
+        "Prov Date": "Provisioning Date",
+        "Current Provider": "Current Provider",
+        "Packageoffered": "Package",
+        "Dashboard_Month": "Dashboard Month",
+        "Standardized_Date": "Standardized Date",
+    }
+
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    keep_columns = [c for c in rename_map.values() if c in df.columns]
+    df = df[keep_columns].copy()
+
+    if "Telephone No." in df.columns:
+        df["Telephone No."] = clean_phone(df["Telephone No."])
+
+    if "Sale Date" in df.columns:
+        df["Sale Date Clean"] = parse_date_series(df["Sale Date"])
+        df["Sale Date"] = format_date_ddmmyyyy(df["Sale Date"])
+
+    for col in ["Quality Date", "Welcome Date", "Provisioning Date", "Standardized Date"]:
+        if col in df.columns:
+            df[col] = format_date_ddmmyyyy(df[col])
+
+    if "Quality Status" in df.columns:
+        df["Quality Status Clean"] = categorize_quality_status_series(df["Quality Status"])
+
+    if "Welcome Status" in df.columns:
+        df["Welcome Status Clean"] = categorize_welcome_status_series(df["Welcome Status"])
+
+    return df
+
+
+@st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
+def load_sparta2() -> pd.DataFrame:
+    """Load the legacy / Excel-backed portal history from Sparta2."""
+    df = load_sheet_cached(LIVE_SHEET)
+    if df.empty:
+        return df
+
+    rename_map = {
+        "Sale Date": "Sale Date",
+        "Telephone No.": "Telephone No.",
+        "Committed Date": "Live Date",
+        "Status": "Portal Status",
+        "LetterStatus": "Letter Status",
+        "CallStatus": "Call Status",
+        "Comments": "Comments",
+        "Voice of Customer": "Voice of Customer",
+        "Cancellation Reason": "Portal Cancellation",
+        "Dashboard_Month": "Dashboard Month",
+        "Standardized_Date": "Standardized Date",
+    }
+
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    keep_columns = [c for c in rename_map.values() if c in df.columns]
+    df = df[keep_columns].copy()
+
+    if "Telephone No." in df.columns:
+        df["Telephone No."] = clean_phone(df["Telephone No."])
+
+    if "Sale Date" in df.columns:
+        df["Sale Date Clean"] = parse_date_series(df["Sale Date"])
+        df["Sale Date"] = format_date_ddmmyyyy(df["Sale Date"])
+
+    for date_col in ["Live Date", "Standardized Date"]:
+        if date_col in df.columns:
+            df[date_col] = format_date_ddmmyyyy(df[date_col])
+
+    if "Portal Status" in df.columns:
+        df["Portal Status Clean"] = categorize_portal_status_series(df["Portal Status"])
+
+    return df
+
+
+def clean_reason_text(value) -> str:
     if pd.isna(value):
-        return pd.NaT
-    if isinstance(value, (pd.Timestamp, datetime.datetime, datetime.date)):
-        return pd.Timestamp(value)
-
-    text_value = str(value).strip()
-    if not text_value or text_value.lower() in {"nan", "nat", "none", "null"}:
-        return pd.NaT
-
-    # The CRM workbook examples are explicitly DD-MM-YYYY.
-    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y", "%d/%m/%y"):
-        try:
-            parsed = pd.to_datetime(text_value, format=fmt, errors="coerce")
-            if not pd.isna(parsed):
-                return parsed
-        except Exception:
-            pass
-
-    # ISO fallback for future API changes.
-    try:
-        return pd.to_datetime(text_value, errors="coerce", yearfirst=True, format="mixed")
-    except Exception:
-        return pd.to_datetime(text_value, errors="coerce", yearfirst=True)
+        return ""
+    value = str(value).replace("<br>", " | ").replace("<br/>", " | ")
+    value = re.sub(r"\s+", " ", value).strip()
+    if value.lower() in {"nan", "none", "null", "nat"}:
+        return ""
+    return value
 
 
-def parse_api_date_series(series):
-    """Parse every API date row using the CRM's DD-MM-YYYY contract."""
-    result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
-    for idx, value in series.items():
-        result.loc[idx] = parse_api_date(value)
-    return result
-
-def normalized_phone(value):
-    """Normalize phone numbers for the agreed Sale Date + Phone key."""
+def normalized_phone_value(value) -> str:
+    """Normalize CRM phone values consistently within the CRM source."""
     if pd.isna(value):
         return ""
     value = str(value).strip()
     if not value or value.lower() in {"nan", "none", "null", "nat"}:
         return ""
     value = re.sub(r"\.0+$", "", value)
-
     digits = re.sub(r"\D", "", value)
     if not digits:
         return ""
-
-    # UK-friendly normalization: +44XXXXXXXXXX -> 0XXXXXXXXXX.
     if digits.startswith("44") and len(digits) in {11, 12}:
         digits = "0" + digits[2:]
-
     return digits
 
 
-def date_key_value(value):
-    parsed = robust_date_parser(value)
-    if pd.isna(parsed):
-        return ""
-    return pd.Timestamp(parsed).strftime("%Y-%m-%d")
-
-
-def make_record_key(date_value, phone_value):
-    """Primary key agreed for source reconciliation."""
-    date_key = date_key_value(date_value)
-    phone_key = normalized_phone(phone_value)
-    if not date_key or not phone_key:
-        return ""
-    return f"{date_key}|{phone_key}"
-
-
-def add_record_keys(frame, date_col, phone_col):
-    result = frame.copy()
-    if date_col in result.columns:
-        date_values = result[date_col]
-    else:
-        date_values = pd.Series([pd.NaT] * len(result), index=result.index)
-    if phone_col in result.columns:
-        phone_values = result[phone_col]
-    else:
-        phone_values = pd.Series([""] * len(result), index=result.index)
-
-    result["_RecordKey"] = [
-        make_record_key(d, p) for d, p in zip(date_values, phone_values)
-    ]
-    return result
-
-
-def existing_google_keys(df1, df2_raw):
-    """Return keys from BOTH legacy Google tabs without modifying them."""
-    keys = set()
-
-    df1_keyed = add_record_keys(df1, "Standardized_Date", "CLI")
-    keys.update(k for k in df1_keyed["_RecordKey"].tolist() if k)
-
-    df2_keyed = add_record_keys(df2_raw, "Sale Date", "Telephone No.")
-    keys.update(k for k in df2_keyed["_RecordKey"].tolist() if k)
-
-    return keys
-
-
-def canonicalize_advisor(raw_name):
-    """Map CRM usernames to the portal's login/agent names where possible."""
+def canonicalize_crm_advisor(raw_name) -> str:
+    """Map CRM usernames to dashboard advisor names where there is a safe match."""
     raw = str(raw_name).strip()
     if not raw or raw.lower() in {"nan", "none", "null", "nat"}:
         return ""
 
-    # Known API username variants seen in the CRM export.
     aliases = {
         "subhodeeproy": "Subhodeep",
         "priyanshurathee": "Priyanshu",
@@ -1135,45 +606,35 @@ def canonicalize_advisor(raw_name):
     if compact in aliases:
         return aliases[compact]
 
-    candidates = []
-    try:
-        for value in ACCESS_KEYS.values():
-            name = str(value).strip()
-            if name:
-                candidates.append(name)
-    except Exception:
-        candidates = []
+    known_names = list(dict.fromkeys(
+        NEW_ADVISORS + CUSTOMER_SERVICE_ADVISORS + LEFT_ADVISORS
+    ))
 
-    # Exact compact match.
-    for name in candidates:
+    for name in known_names:
         if compact == re.sub(r"[^a-z0-9]", "", name.lower()):
             return name
 
-    # Common CRM convention: username = agent name + surname/handle.
-    # Only map when the match is unique, avoiding accidental cross-agent merges.
     prefix_matches = []
-    for name in candidates:
+    for name in known_names:
         name_compact = re.sub(r"[^a-z0-9]", "", name.lower())
         if len(name_compact) >= 5 and len(compact) >= len(name_compact):
             if compact.startswith(name_compact):
                 prefix_matches.append(name)
+
     if len(prefix_matches) == 1:
         return prefix_matches[0]
 
-    return raw.strip().title()
+    return raw.title()
 
 
-def clean_reason_text(value):
-    if pd.isna(value):
-        return ""
-    text = str(value).replace("<br>", " | ").replace("<br/>", " | ")
-    text = re.sub(r"\s+", " ", text).strip()
-    if text.lower() in {"nan", "none", "null"}:
-        return ""
-    return text
+def get_first_existing_column(df: pd.DataFrame, candidates: List[str]) -> str:
+    for candidate in candidates:
+        if candidate in df.columns:
+            return candidate
+    return ""
 
 
-def combine_api_cancellation_reasons(row):
+def combine_crm_cancellation_reasons(row: pd.Series) -> str:
     fields = [
         ("Quality", "Cancellation Reason - quality"),
         ("Welcome", "Cancellation Reason - welcome"),
@@ -1184,2012 +645,2878 @@ def combine_api_cancellation_reasons(row):
         ("Potential Opportunity", "Cancellation/Rejection Reason - Potential Opportunity"),
     ]
     parts = []
-    for label, col in fields:
-        if col in row.index:
-            value = clean_reason_text(row[col])
+    for label, column in fields:
+        if column in row.index:
+            value = clean_reason_text(row[column])
             if value:
                 parts.append(f"{label}: {value}")
     return " | ".join(parts)
 
 
-def fetch_api_excel():
-    """Fetch the CRM Excel export.
+def make_source_record_key(date_value, phone_value) -> str:
+    parsed = parse_mixed_dates_value(date_value)
+    phone = normalized_phone_value(phone_value)
+    if pd.isna(parsed) or not phone:
+        return ""
+    return f"{pd.Timestamp(parsed).strftime('%Y-%m-%d')}|{phone}"
 
-    The CRM endpoint is known to return an XLSX file.  In practice the API may
-    be configured with a Bearer token, X-API-Key, or a raw Authorization token,
-    so ``SPARTA_API_AUTH_MODE = "auto"`` tries those common formats only when
-    the previous format is rejected with HTTP 401/403.
-    """
-    if not SPARTA_API_TOKEN:
-        return pd.DataFrame(), "API not configured", 0, "API token missing"
 
-    base_headers = {
-        "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream, */*",
-        "User-Agent": "Sparta-Agent-Portal/1.0",
-    }
-
-    auth_mode = SPARTA_API_AUTH_MODE
-    if auth_mode == "auto":
-        auth_variants = [
-            ("bearer", {"Authorization": f"Bearer {SPARTA_API_TOKEN}"}),
-            ("x-api-key", {"X-API-Key": SPARTA_API_TOKEN}),
-            ("authorization-token", {"Authorization": SPARTA_API_TOKEN}),
-            ("authorization-token-prefix", {"Authorization": f"Token {SPARTA_API_TOKEN}"}),
-        ]
-    elif auth_mode in {"bearer", "x-api-key", "authorization-token", "authorization-token-prefix"}:
-        auth_variants = []
-        if auth_mode == "bearer":
-            auth_variants.append((auth_mode, {"Authorization": f"Bearer {SPARTA_API_TOKEN}"}))
-        elif auth_mode == "x-api-key":
-            auth_variants.append((auth_mode, {"X-API-Key": SPARTA_API_TOKEN}))
-        elif auth_mode == "authorization-token":
-            auth_variants.append((auth_mode, {"Authorization": SPARTA_API_TOKEN}))
-        else:
-            auth_variants.append((auth_mode, {"Authorization": f"Token {SPARTA_API_TOKEN}"}))
-    else:
-        return (
-            pd.DataFrame(),
-            "API unavailable",
-            0,
-            f"Invalid SPARTA_API_AUTH_MODE: {SPARTA_API_AUTH_MODE}",
+def fetch_crm_mirror():
+    """Read the CRM Excel mirror from the dedicated Google worksheet."""
+    try:
+        client = get_crm_gspread_client()
+        crm_ws = client.open_by_key(SPREADSHEET_ID).get_worksheet_by_id(
+            CRM_MIRROR_WORKSHEET_GID
         )
+        values = crm_ws.get_all_records()
+        crm_df = pd.DataFrame(values)
+        fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    last_error = None
-    last_status = None
+        if crm_df.empty:
+            return crm_df, fetched_at, "CRM mirror sheet is empty"
 
-    for auth_name, auth_headers in auth_variants:
-        headers = {**base_headers, **auth_headers}
+        crm_df.columns = [
+            str(c).replace("\ufeff", "").strip()
+            for c in crm_df.columns
+        ]
 
-        for attempt in range(1, SPARTA_API_MAX_RETRIES + 2):
-            try:
-                response = requests.get(
-                    SPARTA_API_URL,
-                    headers=headers,
-                    timeout=SPARTA_API_TIMEOUT,
-                )
+        missing = [c for c in API_REQUIRED_COLUMNS if c not in crm_df.columns]
+        if missing:
+            return (
+                pd.DataFrame(),
+                fetched_at,
+                "CRM mirror is missing required columns: " + ", ".join(missing),
+            )
 
-                last_status = response.status_code
-
-                if response.status_code in (401, 403) and auth_mode == "auto":
-                    body = (response.text or "").strip().replace("\\n", " ")
-                    last_error = (
-                        f"HTTP {response.status_code} using {auth_name}"
-                        + (f": {body[:250]}" if body else "")
-                    )
-                    break
-
-                response.raise_for_status()
-
-                if not response.content:
-                    raise ValueError("API returned an empty response body.")
-
-                content_type = (response.headers.get("Content-Type") or "").lower()
-                if "spreadsheet" not in content_type and "excel" not in content_type and not response.content.startswith(b"PK"):
-                    preview = (response.text or "").strip().replace("\\n", " ")[:250]
-                    raise ValueError(
-                        f"API returned unexpected content type '{content_type}'"
-                        + (f": {preview}" if preview else "")
-                    )
-
-                api_df = pd.read_excel(BytesIO(response.content), engine="openpyxl")
-                api_df.columns = [str(c).replace("\\ufeff", "").strip() for c in api_df.columns]
-
-                missing = [c for c in API_REQUIRED_COLUMNS if c not in api_df.columns]
-                if missing:
-                    raise ValueError(
-                        "API Excel is missing required columns: " + ", ".join(missing)
-                    )
-
-                fetched_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                return api_df, fetched_at, len(api_df), ""
-
-            except requests.RequestException as exc:
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                last_status = status or last_status
-                body = ""
-                try:
-                    body = (exc.response.text or "").strip().replace("\\n", " ")[:250]
-                except Exception:
-                    pass
-                last_error = str(exc) + (f" | {body}" if body else "")
-                if status in (401, 403) and auth_mode == "auto":
-                    break
-                if attempt <= SPARTA_API_MAX_RETRIES:
-                    time.sleep(min(2 ** (attempt - 1), 6))
-            except Exception as exc:
-                last_error = str(exc)
-                if attempt <= SPARTA_API_MAX_RETRIES:
-                    time.sleep(min(2 ** (attempt - 1), 6))
-
-        # In auto mode, move to the next auth scheme after an auth rejection.
-        if auth_mode != "auto":
-            break
-
-    if last_status in (401, 403) and last_error:
-        return pd.DataFrame(), "API forbidden", 0, last_error
-
-    return pd.DataFrame(), "API unavailable", 0, last_error or "Unknown API error"
+        return crm_df, fetched_at, ""
+    except Exception as exc:
+        logger.exception("CRM mirror load failed: %s", exc)
+        return pd.DataFrame(), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(exc)
 
 
-def normalize_api_records(api_df):
-    """Convert the consolidated API export into the old portal's two logical datasets."""
-    if api_df.empty:
+def normalize_crm_records(crm_df: pd.DataFrame):
+    """Convert CRM mirror rows into the executive dashboard's two frames."""
+    if crm_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    api = api_df.copy()
+    api = crm_df.copy()
+
     for col in API_REQUIRED_COLUMNS:
         if col not in api.columns:
             api[col] = ""
 
-    api["Date_Parsed"] = parse_api_date_series(api["Sale Date"])
-    api["Advisor"] = api["Advisor (Created Username)"].apply(canonicalize_advisor)
+    # CRM source becomes authoritative from 18-Sep-2026 onward.
+    api["Sale Date Clean"] = api["Sale Date"].apply(parse_mixed_dates_value)
+    api = api[api["Sale Date Clean"] >= CRM_START_DATE].copy()
+
+    if api.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    api["Advisor"] = api["Advisor (Created Username)"].apply(canonicalize_crm_advisor)
     api["Customer Name"] = api["Customer Name"].fillna("").astype(str).str.strip()
-    api["Phone Number"] = api["Phone Number"].apply(normalized_phone)
+    api["Telephone No."] = api["Phone Number"].apply(normalized_phone_value)
     api["_RecordKey"] = [
-        make_record_key(d, p)
-        for d, p in zip(api["Sale Date"], api["Phone Number"])
+        make_source_record_key(d, p)
+        for d, p in zip(api["Sale Date Clean"], api["Telephone No."])
     ]
 
-    # A primary-key record cannot be reconciled safely if either component is missing.
+    # Stable Sale Date + Phone key is required for downstream reconciliation.
     api = api[api["_RecordKey"] != ""].copy()
-
-    # Keep the latest row when the API itself contains duplicate keys.
     api = api.drop_duplicates(subset=["_RecordKey"], keep="last").reset_index(drop=True)
 
-    quality = api["Quality Status"].fillna("").astype(str).str.strip()
-    quality_remarks = api["Quality Remarks (Quality Comments)"].apply(clean_reason_text)
-    wc_status = api["Welcome Call Status"].fillna("").astype(str).str.strip()
-    wc_remarks = api["Welcome Call Remarks (Welcome Comments)"].apply(clean_reason_text)
+    quality_owner_col = get_first_existing_column(
+        api,
+        [
+            "Quality Officer",
+            "Quality Officer (Username)",
+            "Quality Officer (Created Username)",
+            "Quality Officer Username",
+        ],
+    )
+    welcome_owner_col = get_first_existing_column(
+        api,
+        [
+            "Welcome Call By",
+            "Welcome Call By (Username)",
+            "Welcome Caller",
+            "Welcome Call Username",
+        ],
+    )
 
-    # -----------------------------------------------------------------------
-    # Application-side representation (old Sparta sheet shape used by portal)
-    # -----------------------------------------------------------------------
+    if quality_owner_col:
+        quality_owner = api[quality_owner_col].fillna("").astype(str).str.strip()
+    else:
+        quality_owner = pd.Series([""] * len(api), index=api.index)
+
+    if welcome_owner_col:
+        welcome_owner = api[welcome_owner_col].fillna("").astype(str).str.strip()
+    else:
+        welcome_owner = pd.Series([""] * len(api), index=api.index)
+
+    # --------------------------- APPLICATION FRAME -------------------------
     app = pd.DataFrame(index=api.index)
-    app["Standardized_Date"] = api["Date_Parsed"]
-    app["Date_Parsed"] = api["Date_Parsed"]
-    app["Sale Date"] = api["Sale Date"]
     app["Advisor"] = api["Advisor"]
+    app["Quality Officer"] = quality_owner
+    app["Welcome Call By"] = welcome_owner
+    app["Sale Date"] = api["Sale Date Clean"].dt.strftime("%d/%m/%Y")
+    app["Sale Date Clean"] = api["Sale Date Clean"]
     app["Customer Name"] = api["Customer Name"]
-    app["CLI"] = api["Phone Number"]
-    app["Quality Status"] = quality
-    app["Quality Remarks"] = quality_remarks
-    app["Status"] = wc_status
-    app["Welcome call Remarks"] = wc_remarks
-    app["Source"] = "CRM Mirror"
+    app["Telephone No."] = api["Telephone No."]
+    app["Quality Status"] = api["Quality Status"].fillna("").astype(str).str.strip()
+    app["Quality Remarks"] = api[
+        "Quality Remarks (Quality Comments)"
+    ].apply(clean_reason_text)
+    app["Welcome Status"] = api["Welcome Call Status"].fillna("").astype(str).str.strip()
+    app["Welcome Remarks"] = api[
+        "Welcome Call Remarks (Welcome Comments)"
+    ].apply(clean_reason_text)
+    app["Welcome Cancellation"] = ""
+    app["Provisioning Status"] = api[
+        "Provisioning Status"
+    ].fillna("").astype(str).str.strip()
+    app["Provisioning Date"] = ""
+    app["Quality Date"] = ""
+    app["Welcome Date"] = ""
+    app["Current Provider"] = ""
+    app["Package"] = ""
+    app["Dashboard Month"] = api["Sale Date Clean"].dt.strftime("%B %Y")
+    app["Standardized Date"] = app["Sale Date"]
+    # CRM-only source field: exact onboarding/final status from CRM.
+    app["Final Status"] = api[
+        "Committed (Live) Status (Onboarding Status)"
+    ].fillna("").astype(str).str.strip()
+
+    # CRM terminology is normalized explicitly here.
+    app["Quality Status Clean"] = categorize_crm_quality_status_series(
+        app["Quality Status"]
+    )
+    app["Welcome Status Clean"] = categorize_crm_welcome_status_series(
+        app["Welcome Status"]
+    )
+    app["Source"] = "CRM"
     app["_RecordKey"] = api["_RecordKey"]
 
-    # -----------------------------------------------------------------------
-    # Portal-side representation (old Sparta2 shape used by portal)
-    # -----------------------------------------------------------------------
-    portal = pd.DataFrame(index=api.index)
-    portal["Sale Date"] = api["Sale Date"]
-    portal["Date_Parsed"] = api["Date_Parsed"]
-    portal["Agent"] = api["Advisor"]
-    portal["Advisor"] = api["Advisor"]
-    portal["Customer Name"] = api["Customer Name"]
-    portal["Telephone No."] = api["Phone Number"]
-    portal["Status"] = api["Committed (Live) Status (Onboarding Status)"].fillna("").astype(str).str.strip()
-    portal["LetterStatus"] = api["LetterStatus (Dispatch Status)"].fillna("").astype(str).str.strip()
-    # Keep the API's provisioning fields under the dashboard's short internal
-    # names so the Recent Applications Log can use them directly.
-    portal["Provisioning Status"] = api["Provisioning Status"].fillna("").astype(str).str.strip()
-    portal["Provisioning Remarks"] = api["Provisioning Remarks (Provisioning Comments)"].apply(clean_reason_text)
-    portal["CallStatus"] = api["Confirmation Status"].fillna("").astype(str).str.strip()
-    portal["Comments"] = api["Confirmation Comment"].apply(clean_reason_text)
-    portal["Voice of Customer"] = ""
-    portal["Cancellation Reason"] = api.apply(combine_api_cancellation_reasons, axis=1)
-    portal["Committed Date"] = pd.NaT
-    portal["Source"] = "CRM Mirror"
-    portal["_RecordKey"] = api["_RecordKey"]
+    # ----------------------------- PORTAL FRAME ----------------------------
+    portal = build_crm_portal_frame(api)
 
     return app.reset_index(drop=True), portal.reset_index(drop=True)
 
 
-def fetch_crm_mirror(client):
-    """Read the CRM Excel mirror from the dedicated Google worksheet."""
-    crm_ws = client.open_by_key(SPREADSHEET_ID).get_worksheet_by_id(CRM_MIRROR_WORKSHEET_GID)
-    values = crm_ws.get_all_records()
-    crm_df = pd.DataFrame(values)
-    if crm_df.empty:
-        return crm_df, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 0, "CRM mirror sheet is empty"
+@st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
+def load_hybrid_data():
+    """
+    Load the two sources independently and enforce the explicit date boundary.
 
-    crm_df.columns = [str(c).replace("\ufeff", "").strip() for c in crm_df.columns]
-    missing = [c for c in API_REQUIRED_COLUMNS if c not in crm_df.columns]
-    if missing:
-        return pd.DataFrame(), "CRM mirror invalid", 0, (
-            "CRM mirror is missing required columns: " + ", ".join(missing)
+    Legacy / Excel-backed source: Sale Date <= 17-Sep-2026
+    CRM source: Sale Date >= 18-Sep-2026
+    """
+    # ------------------------- LEGACY / EXCEL -------------------------
+    legacy_app = load_sparta()
+    legacy_portal = load_sparta2()
+
+    if "Sale Date Clean" in legacy_app.columns:
+        legacy_app = legacy_app[
+            legacy_app["Sale Date Clean"].notna()
+            & (legacy_app["Sale Date Clean"] <= SOURCE_CUTOFF_DATE)
+        ].copy()
+    else:
+        legacy_app = legacy_app.iloc[0:0].copy()
+
+    if "Sale Date Clean" in legacy_portal.columns:
+        legacy_portal = legacy_portal[
+            legacy_portal["Sale Date Clean"].notna()
+            & (legacy_portal["Sale Date Clean"] <= SOURCE_CUTOFF_DATE)
+        ].copy()
+    else:
+        legacy_portal = legacy_portal.iloc[0:0].copy()
+
+    legacy_app["Source"] = "Excel / Legacy"
+    legacy_portal["Source"] = "Excel / Legacy"
+
+    # ------------------------------- CRM -------------------------------
+    crm_raw, crm_fetched_at, crm_error = fetch_crm_mirror()
+    crm_app, crm_portal = normalize_crm_records(crm_raw)
+
+    app_df = pd.concat([legacy_app, crm_app], ignore_index=True, sort=False)
+    portal_df = pd.concat([legacy_portal, crm_portal], ignore_index=True, sort=False)
+
+    if "Sale Date Clean" in app_df.columns:
+        app_df["Sale Date Clean"] = pd.to_datetime(
+            app_df["Sale Date Clean"], errors="coerce"
+        )
+    if "Sale Date Clean" in portal_df.columns:
+        portal_df["Sale Date Clean"] = pd.to_datetime(
+            portal_df["Sale Date Clean"], errors="coerce"
         )
 
-    fetched_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return crm_df, fetched_at, len(crm_df), ""
+    if "Telephone No." in app_df.columns:
+        app_df["Telephone No."] = (
+            app_df["Telephone No."].fillna("").astype(str).str.strip()
+        )
+    if "Telephone No." in portal_df.columns:
+        portal_df["Telephone No."] = (
+            portal_df["Telephone No."].fillna("").astype(str).str.strip()
+        )
+
+    source_status = {
+        "cutoff": "17 Sep 2026",
+        "crm_start": "18 Sep 2026",
+        "legacy_app_rows": int(len(legacy_app)),
+        "legacy_portal_rows": int(len(legacy_portal)),
+        "crm_app_rows": int(len(crm_app)),
+        "crm_portal_rows": int(len(crm_portal)),
+        "crm_mirror_rows": int(len(crm_raw)),
+        "crm_fetched_at": crm_fetched_at,
+        "crm_error": crm_error,
+    }
+
+    return app_df.reset_index(drop=True), portal_df.reset_index(drop=True), source_status
+
+
+
+# ==========================================================
+# ATTENDANCE / SPD DATA
+# ==========================================================
+
+def normalize_person_key(value) -> str:
+    if pd.isna(value):
+        return ""
+    return re.sub(r"[^a-z0-9]", "", str(value).strip().lower())
+
+
+def normalize_attendance_value(value) -> float:
+    """Map 0, 0.5, 1 and UL into FTE-days; UL is treated as 0."""
+    if pd.isna(value):
+        return 0.0
+    text = str(value).strip().lower()
+    if text in {"", "nan", "none", "null", "nat", "ul", "unauthorised leave"}:
+        return 0.0
+    try:
+        numeric = float(text)
+    except Exception:
+        return 0.0
+    if numeric <= 0:
+        return 0.0
+    if numeric >= 1:
+        return 1.0
+    return 0.5
+
+
+def build_attendance_agent_mapping(attendance_names, dashboard_agents):
+    """Match attendance names to dashboard Advisor names."""
+    attendance_names = [
+        str(x).strip() for x in attendance_names
+        if str(x).strip() and str(x).strip().lower() not in {"nan", "none"}
+    ]
+    dashboard_agents = [
+        str(x).strip() for x in dashboard_agents
+        if str(x).strip() and str(x).strip().lower() not in {"nan", "none", "unassigned"}
+    ]
+
+    explicit_aliases = {
+        "frogh": "Frogh Hassani",
+        "krrish": "Krrish Sadana",
+        "animesh": "Animesh Mishra",
+    }
+
+    att_by_key = {normalize_person_key(x): x for x in attendance_names if normalize_person_key(x)}
+    mapping = {}
+
+    for advisor in dashboard_agents:
+        adv_key = normalize_person_key(advisor)
+        if not adv_key:
+            continue
+
+        alias_target = explicit_aliases.get(adv_key)
+        if alias_target:
+            alias_key = normalize_person_key(alias_target)
+            if alias_key in att_by_key:
+                mapping[advisor] = att_by_key[alias_key]
+                continue
+
+        if adv_key in att_by_key:
+            mapping[advisor] = att_by_key[adv_key]
+            continue
+
+        candidates = []
+        for attendance_name in attendance_names:
+            att_key = normalize_person_key(attendance_name)
+            if att_key and (att_key.startswith(adv_key) or adv_key.startswith(att_key)):
+                candidates.append(attendance_name)
+
+        if len(candidates) == 1:
+            mapping[advisor] = candidates[0]
+
+    return mapping
 
 
 @st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
-def fetch_data():
-    """Load legacy history through 17-Sep-2026 and newer records from CRM mirror.
-
-    Source rules:
-      * Sparta / Sparta2 legacy tabs: Sale Date <= 17-Sep-2026 only.
-      * CRM mirror worksheet: Sale Date >= 18-Sep-2026 only.
-
-    This prevents the same post-cutover record from being sourced from the
-    legacy tabs and ensures CRM is the sole source for newer records.
+def load_attendance_data():
     """
-    # =============================== GOOGLE ================================
-    info = st.secrets["gcp_service_account"]
-    creds = Credentials.from_service_account_info(
-        info,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-    client = gspread.authorize(creds)
-    ss = client.open_by_key(SPREADSHEET_ID)
+    Load attendance from worksheet GID 1036958145.
 
-    # -----------------------------------------------------------------------
-    # LEGACY SPARTA — inclusive through 17-Sep-2026 only
-    # -----------------------------------------------------------------------
-    df1 = pd.DataFrame(ss.worksheet("Sparta").get_all_records())
-    if df1.empty:
-        df1 = pd.DataFrame(columns=["Standardized_Date", "Advisor", "Quality Status", "CLI", "Customer Name"])
-    if "Standardized_Date" not in df1.columns:
-        df1["Standardized_Date"] = pd.NaT
-    if "Advisor" not in df1.columns:
-        df1["Advisor"] = ""
-    if "CLI" not in df1.columns:
-        df1["CLI"] = ""
-    df1["Date_Parsed"] = parse_date_series(df1["Standardized_Date"])
-    df1["Advisor"] = df1["Advisor"].astype(str).str.strip().str.title()
-    df1["Source"] = "Google - Sparta"
-
-    legacy_sparta_total = len(df1)
-    df1 = df1[
-        df1["Date_Parsed"].notna()
-        & (df1["Date_Parsed"] <= LEGACY_SOURCE_CUTOFF)
-    ].copy()
-
-    # -----------------------------------------------------------------------
-    # LEGACY SPARTA2 — inclusive through 17-Sep-2026 only
-    # -----------------------------------------------------------------------
-    df2_raw = pd.DataFrame(ss.worksheet("Sparta2").get_all_records())
-    if df2_raw.empty:
-        df2_raw = pd.DataFrame(columns=["Sale Date", "Agent", "Status", "Telephone No."])
-    if "Sale Date" not in df2_raw.columns:
-        df2_raw["Sale Date"] = pd.NaT
-    if "Agent" not in df2_raw.columns:
-        df2_raw["Agent"] = ""
-    if "Telephone No." not in df2_raw.columns:
-        df2_raw["Telephone No."] = ""
-    df2_raw["Date_Parsed"] = parse_date_series(df2_raw["Sale Date"])
-    df2_raw["Advisor"] = df2_raw["Agent"].astype(str).str.strip().str.title()
-    df2_raw["Source"] = "Google - Sparta2"
-
-    legacy_sparta2_total = len(df2_raw)
-    df2_raw = df2_raw[
-        df2_raw["Date_Parsed"].notna()
-        & (df2_raw["Date_Parsed"] <= LEGACY_SOURCE_CUTOFF)
-    ].copy()
-
+    Attendance values:
+        0   = absent
+        0.5 = half-day
+        1   = present
+        UL  = 0 for SPD calculations
+    """
     try:
-        meta = ss.worksheet("Meta").get_all_values()
-        google_last_sync = meta[0][1] if meta and len(meta[0]) > 1 else "Unknown"
-    except Exception:
-        google_last_sync = "Unknown"
+        client = get_crm_gspread_client()
+        worksheet = client.open_by_key(SPREADSHEET_ID).get_worksheet_by_id(
+            ATTENDANCE_WORKSHEET_GID
+        )
+        values = worksheet.get_all_records()
+        attendance = pd.DataFrame(values)
 
-    # ============================ CRM MIRROR ==============================
-    # The independent sync job writes the current CRM Excel export to the
-    # dedicated Google worksheet. The portal reads ONLY post-cutover records
-    # from this CRM mirror.
-    api_df, api_fetched_at, api_row_count, api_error = fetch_crm_mirror(client)
+        if attendance.empty:
+            return pd.DataFrame()
 
-    crm_total_before_cutover = len(api_df)
-    crm_cutover_excluded = 0
-    crm_invalid_dates = 0
+        attendance.columns = [
+            str(c).replace("\ufeff", "").strip()
+            for c in attendance.columns
+        ]
 
-    if not api_df.empty:
-        if "Sale Date" in api_df.columns:
-            crm_dates = parse_api_date_series(api_df["Sale Date"])
-            crm_invalid_dates = int(crm_dates.isna().sum())
-            crm_mask = crm_dates.notna() & (crm_dates >= CRM_SOURCE_START)
-            crm_cutover_excluded = int((crm_dates.notna() & (crm_dates < CRM_SOURCE_START)).sum())
-            api_df = api_df.loc[crm_mask].copy()
-        else:
-            api_df = pd.DataFrame()
+        required = {"Name", "Date", "Attendance"}
+        missing = sorted(required.difference(attendance.columns))
+        if missing:
+            logger.warning(
+                "Attendance sheet is missing required columns: %s",
+                ", ".join(missing),
+            )
+            return pd.DataFrame()
 
-    api_app, api_portal = normalize_api_records(api_df)
+        if "Working Days" not in attendance.columns:
+            attendance["Working Days"] = np.nan
 
-    # Since the legacy sources stop at 17-Sep-2026, CRM is the sole authority
-    # for all records from 18-Sep-2026 onward. Still guard against duplicate
-    # keys inside the CRM export itself (normalize_api_records already keeps
-    # the latest row for duplicate CRM keys).
-    new_api_app = api_app.copy()
-    new_api_portal = api_portal.copy()
+        attendance["Date Clean"] = attendance["Date"].apply(parse_mixed_dates_value)
+        attendance["Attendance Value"] = attendance["Attendance"].apply(
+            normalize_attendance_value
+        )
+        attendance["Name"] = attendance["Name"].fillna("").astype(str).str.strip()
+        attendance["Agent Key"] = attendance["Name"].apply(normalize_person_key)
+        attendance["Month Period"] = attendance["Date Clean"].dt.to_period("M")
+        attendance["Working Days"] = pd.to_numeric(
+            attendance["Working Days"], errors="coerce"
+        )
+        attendance = attendance.dropna(subset=["Date Clean"]).copy()
 
-    # Concatenate the two logical datasets. No post-cutover legacy records can
-    # enter because of the explicit cutoff above.
-    df1_combined = pd.concat([df1, new_api_app], ignore_index=True, sort=False)
-    df2_combined = pd.concat([df2_raw, new_api_portal], ignore_index=True, sort=False)
-
-    # Final date/advisor normalization after the merge.
-    df1_combined["Date_Parsed"] = parse_date_series(df1_combined["Date_Parsed"])
-    df2_combined["Date_Parsed"] = parse_date_series(df2_combined["Date_Parsed"])
-    df1_combined["Advisor"] = df1_combined["Advisor"].fillna("").astype(str).str.strip()
-    df2_combined["Advisor"] = df2_combined["Advisor"].fillna("").astype(str).str.strip()
-
-    # Keep the on-screen sync status useful without exposing the source token.
-    status_lines = [
-        f"Legacy cutoff: {LEGACY_SOURCE_CUTOFF.strftime('%d-%b-%Y')}",
-        f"Legacy Sparta rows: {len(df1):,} of {legacy_sparta_total:,}",
-        f"Legacy Sparta2 rows: {len(df2_raw):,} of {legacy_sparta2_total:,}",
-        f"CRM mirror sync: {api_fetched_at}",
-        f"CRM mirror rows: {api_row_count:,}",
-        f"CRM post-cutover rows: {len(new_api_app):,}",
-    ]
-
-    if crm_cutover_excluded:
-        status_lines.append(f"CRM rows before cutover ignored: {crm_cutover_excluded:,}")
-    if crm_invalid_dates:
-        status_lines.append(f"CRM rows with invalid Sale Date ignored: {crm_invalid_dates:,}")
-
-    if api_error:
-        status_lines.append(f"CRM mirror warning: {api_error}")
-        connection_status = "Google connected • CRM mirror unavailable"
-    else:
-        connection_status = "Google history + CRM post-cutover connected"
-
-    return df1_combined, df2_combined, "\n".join(status_lines), connection_status
-
-
-def map_quality(val):
-    s = str(val).lower()
-    if any(x in s for x in ["appr", "pass"]):
-        return "Approved"
-    if any(x in s for x in ["rew", "repro"]):
-        return "Rework"
-    if any(x in s for x in ["can"]):
-        return "Cancelled"
-    if any(x in s for x in ["rej"]):
-        return "Rejected"
-    return "Others"
-
-
-def map_portal(val):
-    s = str(val).lower().strip()
-    if "live" in s:
-        return "Live"
-    if "com" in s:
-        return "Committed"
-    if any(x in s for x in ["pend", "pnd", "other work", "delay"]):
-        return "Pending"
-    if any(x in s for x in ["can", "rej"]):
-        return "Cancelled"
-    return "Others"
-
-
-def map_wc(val):
-    s = str(val).lower().strip()
-    if any(x in s for x in ["done", "pass", "comp", "approved"]):
-        return "Done"
-    if any(x in s for x in ["follow", "f/u", "f u"]):
-        return "Follow up"
-    if any(x in s for x in ["pend", "pnd", "other work", "delay"]):
-        return "Pending"
-    if any(x in s for x in ["paper", "ppw"]):
-        return "Paperwork"
-    if any(x in s for x in ["can", "rej"]):
-        return "Cancelled"
-    return "Others"
-
-
-def date_range_mask(series, start_date, end_date):
-    """Safe timestamp comparison for pandas datetime64[s]/datetime64[ns]/object."""
-    parsed = pd.to_datetime(series, errors="coerce", format="mixed", dayfirst=True)
-    start_ts = pd.Timestamp(start_date)
-    end_ts = pd.Timestamp(end_date) + pd.Timedelta(days=1)
-    return (parsed >= start_ts) & (parsed < end_ts)
-
-def initials(name):
-    parts = [p for p in str(name).split() if p]
-    if not parts:
-        return "A"
-    return "".join(p[0] for p in parts[:2]).upper()
-
-
-def render_section(title, icon="◆", subtitle=None):
-    subtitle_html = (
-        f'<div class="section-subtitle">{escape(subtitle)}</div>'
-        if subtitle else ""
-    )
-    st.html(
-        f"""
-        <div class="section-title">
-            <span class="icon">{escape(icon)}</span>
-            <span>{escape(title)}</span>
-        </div>
-        {subtitle_html}
-        """
-    )
-
-
-def render_kpi(label, value, total):
-    lbl = str(label).lower()
-    accent = "#94A3B8"
-
-    if "total" in lbl:
-        accent = "#3B82F6"
-    elif any(x in lbl for x in ["appr", "done", "live"]):
-        accent = "#10B981"
-    elif any(x in lbl for x in ["rew", "pend", "paper", "comm"]):
-        accent = "#F59E0B"
-    elif "can" in lbl or "rej" in lbl:
-        accent = "#EF4444"
-
-    percent = (value / total * 100) if total > 0 else 0
-    pc_html = (
-        f'<div><span class="kpi-pc">{percent:.1f}%</span></div>'
-        if "total apps" not in lbl
-        else ""
-    )
-
-    st.html(
-        f"""
-        <div class="kpi-card" style="border-top:4px solid {accent};">
-            <p class="kpi-label">{escape(str(label))}</p>
-            <p class="kpi-value">{value:,}</p>
-            {pc_html}
-        </div>
-        """
-    )
-
-
-def kpi_panel(title, kpis):
-    active = [x for x in kpis if x[1] > 0]
-    if not active:
-        return
-
-    with st.container(border=True):
-        st.markdown(f"**{escape(title)}**")
-        cols = st.columns(len(active))
-        for i, kpi in enumerate(active):
-            with cols[i]:
-                render_kpi(kpi[0], kpi[1], kpi[2])
-
-
-def pct(value, total):
-    if not total:
-        return 0.0
-    return (value / total) * 100
-
-
-def comparison_delta(current, previous, is_rate=False):
-    if is_rate:
-        delta = current - previous
-        if abs(delta) < 0.05:
-            return "→ 0.0 pp", "flat"
-        return (f"↑ {abs(delta):.1f} pp" if delta > 0 else f"↓ {abs(delta):.1f} pp"), ("up" if delta > 0 else "down")
-
-    delta = current - previous
-    if delta == 0:
-        return "→ 0", "flat"
-    return (f"↑ {abs(delta):,}" if delta > 0 else f"↓ {abs(delta):,}"), ("up" if delta > 0 else "down")
-
-
-def render_comparison_cards(metrics):
-    cards = []
-    for label, current, previous, is_rate, base_text in metrics:
-        value_text = f"{current:.1f}%" if is_rate else f"{int(current):,}"
-        delta_text, direction = comparison_delta(current, previous, is_rate=is_rate)
-        cards.append(
-            f"""
-            <div class="comparison-card">
-                <div class="comparison-label">{escape(label)}</div>
-                <div class="comparison-value">{value_text}</div>
-                <div class="comparison-base">{escape(base_text)}</div>
-                <span class="delta delta-{direction}">{delta_text}</span>
-            </div>
-            """
+        # Prevent duplicate rows for the same agent/date from inflating SPD.
+        attendance = (
+            attendance.sort_values(["Agent Key", "Date Clean"])
+            .groupby(["Agent Key", "Date Clean"], as_index=False)
+            .agg(
+                Name=("Name", "last"),
+                Attendance_Value=("Attendance Value", "max"),
+                Month_Period=("Month Period", "last"),
+                Working_Days=("Working Days", "max"),
+            )
+            .rename(columns={
+                "Attendance_Value": "Attendance Value",
+                "Month_Period": "Month Period",
+                "Working_Days": "Working Days",
+            })
         )
 
-    st.html('<div class="comparison-grid">' + ''.join(cards) + '</div>')
+        # Keep the exact attendance schema expected by the SPD helpers.
+        if "Working Days" not in attendance.columns:
+            attendance["Working Days"] = np.nan
+
+        return attendance.reset_index(drop=True)
+
+    except Exception as exc:
+        logger.exception("Attendance sheet load failed: %s", exc)
+        return pd.DataFrame()
 
 
-def stage_snapshot(apps_df, portal_df, welcome_col):
-    """Return the four true funnel stages.
-
-    Committed is intentionally NOT treated as a fifth downstream stage.
-    It sits at the same level as Live, so it is returned separately only as
-    companion information for the Live stage.
-    """
-    total = len(apps_df)
-    quality_approved = len(apps_df[apps_df["Q_Status"] == "Approved"])
-    wc_done = 0
-    if welcome_col and "WC_Clean" in apps_df.columns:
-        wc_done = len(apps_df[apps_df["WC_Clean"] == "Done"])
-    live = len(portal_df[portal_df["P_Status"] == "Live"]) if not portal_df.empty else 0
-    committed = len(portal_df[portal_df["P_Status"] == "Committed"]) if not portal_df.empty else 0
-
-    stages = [
-        ("Applications", total, "#3B82F6"),
-        ("Quality", quality_approved, "#10B981"),
-        ("Welcome", wc_done, "#06B6D4"),
-        ("Live", live, "#047857"),
-    ]
-
-    return stages, committed
+def get_month_working_days(attendance_df: pd.DataFrame, period) -> int:
+    if attendance_df.empty or period is None:
+        return 0
+    month_df = attendance_df[attendance_df["Month Period"] == period].copy()
+    if month_df.empty:
+        return 0
+    working_col = "Working Days" if "Working Days" in month_df.columns else (
+        "Working_Days" if "Working_Days" in month_df.columns else ""
+    )
+    if working_col:
+        wd = pd.to_numeric(month_df[working_col], errors="coerce").dropna()
+        if not wd.empty:
+            return int(round(float(wd.max())))
+    # Robust fallback: count distinct attendance dates for the month.
+    return int(month_df["Date Clean"].dt.normalize().nunique())
 
 
-def add_date_strings(frame, source_col, output_col):
-    frame = frame.copy()
-    if "Date_Parsed" in frame.columns:
-        parsed = frame["Date_Parsed"]
-    elif source_col in frame.columns:
-        parsed = parse_date_series(frame[source_col])
-    else:
-        parsed = pd.Series(pd.NaT, index=frame.index)
-    frame[output_col] = pd.to_datetime(parsed, errors="coerce").dt.strftime("%d-%m-%Y").fillna("")
-    return frame
+def attach_attendance_advisors(attendance_df: pd.DataFrame, master_df: pd.DataFrame):
+    if attendance_df.empty or master_df.empty or "Advisor" not in master_df.columns:
+        return attendance_df.copy(), {}
 
+    dashboard_agents = (
+        master_df["Advisor"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .replace("", np.nan)
+        .dropna()
+        .unique()
+        .tolist()
+    )
 
-def pick_existing(frame, candidates):
-    return [c for c in candidates if c in frame.columns]
+    advisor_to_attendance = build_attendance_agent_mapping(
+        attendance_df["Name"].dropna().unique().tolist(),
+        dashboard_agents,
+    )
 
-
-def get_preset_dates(preset, today):
-    if preset == "Today":
-        return today, today
-    if preset == "This Week":
-        start = today - datetime.timedelta(days=today.weekday())
-        return start, today
-    if preset == "This Month":
-        return today.replace(day=1), today
-    if preset == "Last Month":
-        first_this = today.replace(day=1)
-        last_prev = first_this - datetime.timedelta(days=1)
-        return last_prev.replace(day=1), last_prev
-    return st.session_state.get("main_start_date", today.replace(day=1)), st.session_state.get("main_end_date", today)
-
-
-def summary_for_period(base_apps, base_portal, start_date, end_date, welcome_col):
-    apps = base_apps[date_range_mask(base_apps["Date_Parsed"], start_date, end_date)].copy()
-    portal = base_portal[date_range_mask(base_portal["Date_Parsed"], start_date, end_date)].copy()
-
-    if "Quality Status" in apps.columns:
-        apps["Q_Status"] = apps["Quality Status"].apply(map_quality)
-    else:
-        apps["Q_Status"] = "Others"
-
-    if "Status" in portal.columns:
-        portal["P_Status"] = portal["Status"].apply(map_portal)
-    else:
-        portal["P_Status"] = "Others"
-
-    total_apps = len(apps)
-    total_portal = len(portal)
-    approved = len(apps[apps["Q_Status"] == "Approved"])
-
-    wc_done = 0
-    if welcome_col and welcome_col in apps.columns:
-        apps["WC_Clean"] = apps[welcome_col].apply(map_wc)
-        wc_done = len(apps[apps["WC_Clean"] == "Done"])
-
-    live = len(portal[portal["P_Status"] == "Live"])
-    live_denominator = total_portal if total_portal > 0 else total_apps
-
-    return {
-        "apps": total_apps,
-        "approval_rate": pct(approved, total_apps),
-        "wc_done_rate": pct(wc_done, total_apps),
-        "live_rate": pct(live, live_denominator),
+    reverse_mapping = {
+        normalize_person_key(attendance_name): advisor
+        for advisor, attendance_name in advisor_to_attendance.items()
     }
 
+    out = attendance_df.copy()
+    out["Dashboard Advisor"] = out["Agent Key"].map(reverse_mapping).fillna("")
+    return out, advisor_to_attendance
 
-# ----------------------------------------------------------------------------
-# SESSION STATE
-# ----------------------------------------------------------------------------
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-    st.session_state.agent_name = ""
 
-if "current_page" not in st.session_state:
-    st.session_state.current_page = 1
+def get_team_month_spd(
+    attendance_df: pd.DataFrame,
+    period,
+    applications: int,
+    selected_agent: str = "All Agents",
+):
+    """Return (SPD, working-days capacity, present-days) for one month.
 
-# ----------------------------------------------------------------------------
-# LOGIN
-# ----------------------------------------------------------------------------
-if not st.session_state.authenticated:
-    left, center, right = st.columns([1, 1.4, 1])
+    Team view:
+        SPD = Applications / total present FTE-days in the month.
+        Working Days = matched agents * calendar working days.
 
-    with center:
-        with st.container(border=True):
-            st.image(LOGO_URL, width=65)
-            st.caption("SPARTA TELECOM • AGENT PERFORMANCE")
-            st.markdown("# Agent Portal")
-            st.write(
-                "Secure access to your applications, quality results, welcome-call progress, "
-                "live conversions and detailed sales activity."
-            )
+    Selected-agent view:
+        SPD = Applications / that agent's present FTE-days.
+        Working Days = calendar working days in the month.
+    """
+    if attendance_df.empty or period is None:
+        return 0.0, 0.0, 0.0
 
-            user_key = st.text_input(
-                "Access Key",
-                type="password",
-                placeholder="Enter your access key",
-            )
+    month_att = attendance_df[attendance_df["Month Period"] == period].copy()
+    if month_att.empty:
+        return 0.0, 0.0, 0.0
 
-            if st.button(
-                "Sign in to my dashboard →",
-                use_container_width=True,
-                type="primary",
-            ):
-                if user_key.upper() in ACCESS_KEYS:
-                    st.session_state.authenticated = True
-                    st.session_state.agent_name = ACCESS_KEYS[user_key.upper()]
-                    st.session_state.current_page = 1
-                    log_agent_login(ACCESS_KEYS[user_key.upper()])
-                    st.rerun()
-                else:
-                    st.error("Invalid Access Key. Try again!")
+    eligible = month_att[
+        month_att["Dashboard Advisor"].fillna("").astype(str).str.strip() != ""
+    ].copy()
+    working_days_calendar = float(get_month_working_days(month_att, period))
 
-            st.caption(
-                "Your dashboard displays only the performance data assigned to your login."
-            )
+    if selected_agent != "All Agents":
+        selected_key = normalize_person_key(selected_agent)
+        matched = eligible[
+            eligible["Dashboard Advisor"].apply(normalize_person_key) == selected_key
+        ]
+        present_days = float(matched["Attendance Value"].sum())
+        working_days_capacity = working_days_calendar if not matched.empty else 0.0
+    else:
+        present_days = float(eligible["Attendance Value"].sum())
+        total_agents = int(eligible["Dashboard Advisor"].nunique())
+        working_days_capacity = float(total_agents * working_days_calendar)
 
-    st.stop()
+    spd = applications / present_days if applications > 0 and present_days > 0 else 0.0
+    return spd, working_days_capacity, present_days
 
-# ----------------------------------------------------------------------------
-# AUTHENTICATED PORTAL
-# ----------------------------------------------------------------------------
-agent = st.session_state.agent_name
-today_date = datetime.date.today()
 
-# Sidebar
-with st.sidebar:
-    st.html(
-        f"""
-        <div class="sidebar-profile">
-            <div class="sidebar-avatar">{escape(initials(agent))}</div>
-            <div class="sidebar-role">Signed in as</div>
-            <div class="sidebar-name">{escape(agent)}</div>
-        </div>
-        """,
-        )
-    st.html(
-        '<div style="font-size:.67rem;color:#7E93BF;text-transform:uppercase;letter-spacing:1px;font-weight:800;margin:18px 0 8px;">Portal</div>',
-        )
-    if st.button("↪  Logout", use_container_width=True):
-        st.session_state.authenticated = False
-        st.session_state.agent_name = ""
-        st.rerun()
+def get_daily_spd(
+    attendance_df: pd.DataFrame,
+    day,
+    applications: int,
+    selected_agent: str = "All Agents",
+):
+    """Return (SPD, working-days capacity, present-days) for one date.
 
-    st.html(
-        '<div style="position:fixed;bottom:20px;width:220px;color:#6F86B7;font-size:.64rem;line-height:1.45;">'
-        "Sparta Agent Portal<br>Performance & activity centre"
-        "</div>"
-    )
+    Team view:
+        Working Days = number of mapped agents scheduled on that date.
+        Present Days = sum of 0 / 0.5 / 1 attendance values.
 
-# ----------------------------------------------------------------------------
-# DATA LOAD
-# ----------------------------------------------------------------------------
-try:
-    df1, df2_raw, last_sync, connection_status = fetch_data()
-    # Agent login remains the control point: each agent only sees their own data.
-    agent_compact = re.sub(r"[^a-z0-9]", "", str(agent).lower())
-    ag1 = df1[df1["Advisor"].apply(lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower()) == agent_compact)].copy()
-    ag2 = df2_raw[df2_raw["Advisor"].apply(lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower()) == agent_compact)].copy()
+    Selected-agent view:
+        Working Days = 1 when the date is a scheduled attendance date.
+        Present Days = that agent's attendance value.
+    """
+    if attendance_df.empty or pd.isna(day):
+        return 0.0, 0.0, 0.0
 
-    # ------------------------------------------------------------------------
-    # HERO
-    # ------------------------------------------------------------------------
-    hero_left, hero_right = st.columns([3.1, 1.15])
-    with hero_left:
-        st.html(
-            f"""
-            <div class="hero">
-                <div class="hero-kicker">Sparta Telecom • Agent Performance</div>
-                <div class="hero-title">Welcome back, {escape(agent)}</div>
-                <div class="hero-subtitle">A clear view of applications, quality, welcome calls and live conversion.</div>
-            </div>
-            """,
-        )
-    with hero_right:
-        st.html(
-            f"""
-            <div class="hero" style="height:100%;padding:21px 22px;">
-                <div class="hero-kicker">Data status</div>
-                <div style="font-size:.82rem;font-weight:800;margin-top:3px;"><span class="live-dot"></span>{escape(connection_status)}</div>
-                <div class="hero-sync" style="text-align:left;padding-top:7px;">
-                    Last synced<br><strong>{escape(str(last_sync))}</strong>
-                </div>
-            </div>
-            """,
-        )
+    day_ts = pd.Timestamp(day).normalize()
+    day_att = attendance_df[
+        attendance_df["Date Clean"].dt.normalize() == day_ts
+    ].copy()
+    if day_att.empty:
+        return 0.0, 0.0, 0.0
 
-    # ------------------------------------------------------------------------
-    # GLOBAL DATE FILTER + QUICK PRESETS
-    # ------------------------------------------------------------------------
-    if "main_start_date" not in st.session_state:
-        st.session_state.main_start_date = today_date.replace(day=1)
-    if "main_end_date" not in st.session_state:
-        st.session_state.main_end_date = today_date
-    if "date_preset" not in st.session_state:
-        st.session_state.date_preset = "This Month"
+    eligible = day_att[
+        day_att["Dashboard Advisor"].fillna("").astype(str).str.strip() != ""
+    ].copy()
 
-    def apply_date_preset():
-        # Streamlit callbacks can run before the main script body is rerun.
-        # Use a safe fallback so an existing/stale callback can never crash
-        # when the widget key is temporarily absent from session state.
-        preset = st.session_state.get("date_preset", "This Month")
-        st.session_state.date_preset = preset
-        if preset != "Custom":
-            preset_start, preset_end = get_preset_dates(preset, today_date)
-            st.session_state.main_start_date = preset_start
-            st.session_state.main_end_date = preset_end
+    if selected_agent != "All Agents":
+        selected_key = normalize_person_key(selected_agent)
+        matched = eligible[
+            eligible["Dashboard Advisor"].apply(normalize_person_key) == selected_key
+        ]
+        working_days_capacity = 1.0 if not matched.empty else 0.0
+        present_days = float(matched["Attendance Value"].sum())
+    else:
+        working_days_capacity = float(eligible["Dashboard Advisor"].nunique())
+        present_days = float(eligible["Attendance Value"].sum())
 
-    with st.container(border=True):
-        top_filter_col, preset_col, start_col, end_col = st.columns([0.55, 2.25, 1.25, 1.25], gap="small")
+    spd = applications / present_days if applications > 0 and present_days > 0 else 0.0
+    return spd, working_days_capacity, present_days
 
-        with top_filter_col:
-            st.markdown("### 🗓️")
 
-        with preset_col:
-            st.caption("QUICK RANGE")
-            st.radio(
-                "Quick Range",
-                ["This Month", "Today", "This Week", "Last Month", "Custom"],
-                horizontal=True,
-                key="date_preset",
-                on_change=apply_date_preset,
-                label_visibility="collapsed",
-            )
-
-        with start_col:
-            st.caption("START DATE")
-            start_date = st.date_input(
-                "Start Date",
-                key="main_start_date",
-                disabled=st.session_state.date_preset != "Custom",
-                label_visibility="collapsed",
-            )
-
-        with end_col:
-            st.caption("END DATE")
-            end_date = st.date_input(
-                "End Date",
-                key="main_end_date",
-                disabled=st.session_state.date_preset != "Custom",
-                label_visibility="collapsed",
-            )
-
-    # Protect against a reversed user-selected range without altering the source data.
-    if start_date > end_date:
-        st.warning("Start Date is after End Date. Please select a valid date range.")
+with st.spinner("Loading historical + CRM data..."):
+    try:
+        sparta_df, sparta2_df, source_status = load_hybrid_data()
+    except Exception as e:
+        st.error("Failed to load the dashboard data. See logs for details.")
+        logger.exception("Failed to load hybrid dashboard data: %s", e)
         st.stop()
 
-    ag1_filtered = ag1[date_range_mask(ag1["Date_Parsed"], start_date, end_date)].copy()
-    ag2_filtered = ag2[date_range_mask(ag2["Date_Parsed"], start_date, end_date)].copy()
 
-    ag1_filtered["Q_Status"] = ag1_filtered["Quality Status"].apply(map_quality)
-    ag2_filtered["P_Status"] = ag2_filtered["Status"].apply(map_portal)
+@st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
+def build_master_dataframe(app_df: pd.DataFrame, portal_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge application and portal records on Sale Date + Telephone No.
 
-    wc_col = (
-        "Status"
-        if "Status" in ag1_filtered.columns
-        else "Welcome call Status"
-        if "Welcome call Status" in ag1_filtered.columns
-        else None
-    )
-    if wc_col:
-        ag1_filtered["WC_Clean"] = ag1_filtered[wc_col].apply(map_wc)
+    This prevents a later sale using the same phone number from receiving the
+    downstream portal status of an earlier sale.
+    """
+    apps = app_df.copy()
+    portal = portal_df.copy()
 
-    # ------------------------------------------------------------------------
-    # KPI ROW
-    # ------------------------------------------------------------------------
-    total_apps = len(ag1_filtered)
-    total_ag2 = len(ag2_filtered)
-
-    group_1 = [("Total Apps", total_apps, total_apps)]
-    group_2 = [
-        ("Approved", len(ag1_filtered[ag1_filtered["Q_Status"] == "Approved"]), total_apps),
-        ("Rework", len(ag1_filtered[ag1_filtered["Q_Status"] == "Rework"]), total_apps),
-        ("Cancelled", len(ag1_filtered[ag1_filtered["Q_Status"] == "Cancelled"]), total_apps),
-        ("Rejected", len(ag1_filtered[ag1_filtered["Q_Status"] == "Rejected"]), total_apps),
-        ("Others", len(ag1_filtered[ag1_filtered["Q_Status"] == "Others"]), total_apps),
-    ]
-
-    group_3 = []
-    if wc_col:
-        group_3 = [
-            ("WC Done", len(ag1_filtered[ag1_filtered["WC_Clean"] == "Done"]), total_apps),
-            ("WC Pending", len(ag1_filtered[ag1_filtered["WC_Clean"] == "Pending"]), total_apps),
-            ("WC Paperwork", len(ag1_filtered[ag1_filtered["WC_Clean"] == "Paperwork"]), total_apps),
-            ("WC Cancelled", len(ag1_filtered[ag1_filtered["WC_Clean"] == "Cancelled"]), total_apps),
-            ("WC Others", len(ag1_filtered[ag1_filtered["WC_Clean"] == "Others"]), total_apps),
-        ]
-
-    live_total_denominator = total_ag2 if total_ag2 > 0 else total_apps
-    group_4 = [
-        ("Live", len(ag2_filtered[ag2_filtered["P_Status"] == "Live"]), live_total_denominator),
-        ("Committed", len(ag2_filtered[ag2_filtered["P_Status"] == "Committed"]), live_total_denominator),
-        ("Cancelled", len(ag2_filtered[ag2_filtered["P_Status"] == "Cancelled"]), live_total_denominator),
-        ("Others", len(ag2_filtered[ag2_filtered["P_Status"] == "Others"]), live_total_denominator),
-    ]
-
-    render_section("Performance snapshot", "✦", "Your selected date range at a glance")
-
-    b1, b2, b3, b4 = st.columns([1.15, 2.6, 2.6, 2.35], gap="small")
-    with b1:
-        with st.container(border=True):
-            st.markdown("**Overview**")
-            render_kpi(group_1[0][0], group_1[0][1], group_1[0][2])
-    with b2:
-        kpi_panel("Quality audit status", group_2)
-    with b3:
-        kpi_panel("Welcome call status", group_3)
-    with b4:
-        kpi_panel("Live status", group_4)
-
-    # ========================================================================
-    # ACTION CENTRE — CANCELLATION FIRST
-    # ========================================================================
-    quality_cancel_count = len(ag1_filtered[ag1_filtered["Q_Status"] == "Cancelled"])
-    wc_cancel_count = 0
-    if wc_col and "WC_Clean" in ag1_filtered.columns:
-        wc_cancel_count = len(ag1_filtered[ag1_filtered["WC_Clean"] == "Cancelled"])
-    live_cancel_count = len(ag2_filtered[ag2_filtered["P_Status"] == "Cancelled"]) if not ag2_filtered.empty else 0
-    total_cancel_count = quality_cancel_count + wc_cancel_count + live_cancel_count
-
-    st.divider()
-    render_section(
-        "Action centre",
-        "⚡",
-        "Cancellation-focused queues highlighting records that need attention in the selected period",
-    )
-
-    action_items = [
-        ("Quality cancellations", quality_cancel_count, "!", "#FEF2F2", "#B91C1C", "Review cancelled applications and the associated Quality Remarks for recurring loss points."),
-        ("Welcome call cancellations", wc_cancel_count, "☎", "#FFF7ED", "#C2410C", "Review Welcome Call cancellations and remarks to identify avoidable customer drop-offs."),
-        ("Live-stage cancellations", live_cancel_count, "×", "#FEF2F2", "#991B1B", "Review final-stage cancellations, customer feedback and cancellation reasons."),
-    ]
-
-    action_html = []
-    for title, count, icon, bg, fg, copy in action_items:
-        action_html.append(
-            f"""
-            <div class="action-card">
-                <div class="action-top">
-                    <div class="action-icon" style="background:{bg};color:{fg};">{icon}</div>
-                    <div class="action-label">{escape(title)}</div>
-                </div>
-                <div class="action-count">{count:,}</div>
-                <div class="action-copy">{escape(copy)}</div>
-            </div>
-            """
-        )
-    st.html('<div class="action-wrap">' + ''.join(action_html) + '</div>')
-
-    st.caption(f"Total cancellation records across the three tracked stages in this period: {total_cancel_count:,}")
-
-    with st.expander("Open cancellation queues", expanded=False):
-        aq1, aq2, aq3 = st.tabs(["Quality cancellations", "Welcome cancellations", "Live-stage cancellations"])
-
-        with aq1:
-            quality_cancel_df = ag1_filtered[ag1_filtered["Q_Status"] == "Cancelled"].copy()
-            if not quality_cancel_df.empty:
-                quality_cancel_df = add_date_strings(quality_cancel_df, "Standardized_Date", "Sale Date")
-                cols = pick_existing(
-                    quality_cancel_df,
-                    ["Sale Date", "Customer Name", "CLI", "Quality Status", "Quality Remarks"],
-                )
-                st.dataframe(quality_cancel_df[cols], use_container_width=True, hide_index=True, height=260)
-            else:
-                st.success("No Quality Cancellation applications in the selected period.")
-
-        with aq2:
-            if wc_col:
-                wc_cancel_df = ag1_filtered[ag1_filtered["WC_Clean"] == "Cancelled"].copy()
-                if not wc_cancel_df.empty:
-                    wc_cancel_df = add_date_strings(wc_cancel_df, "Standardized_Date", "Sale Date")
-                    cols = pick_existing(
-                        wc_cancel_df,
-                        ["Sale Date", "Customer Name", "CLI", wc_col, "Welcome call Remarks"],
-                    )
-                    st.dataframe(wc_cancel_df[cols], use_container_width=True, hide_index=True, height=260)
-                else:
-                    st.success("No Welcome Call Cancellation applications in the selected period.")
-            else:
-                st.info("Welcome Call status is not available in the current source data.")
-
-        with aq3:
-            live_cancel_df = ag2_filtered[ag2_filtered["P_Status"] == "Cancelled"].copy()
-            if not live_cancel_df.empty:
-                live_cancel_df = add_date_strings(live_cancel_df, "Sale Date", "Sale Date")
-                cols = pick_existing(
-                    live_cancel_df,
-                    [
-                        "Sale Date",
-                        "Customer Name",
-                        "Telephone No.",
-                        "Portal Status",
-                        "Cancellation Reason",
-                        "Comments",
-                        "Voice of Customer",
-                    ],
-                )
-                st.dataframe(live_cancel_df[cols], use_container_width=True, hide_index=True, height=260)
-            else:
-                st.success("No Live-stage Cancellation applications in the selected period.")
-
-    # ========================================================================
-    # PIPELINE SNAPSHOT + PERFORMANCE PULSE
-    # ========================================================================
-    st.divider()
-    funnel_col, pulse_col = st.columns([1.0, 2.0], gap="medium")
-
-    with funnel_col:
-        render_section(
-            "Pipeline snapshot",
-            "◎",
-            "Four true stages. Committed remains alongside Live and is not treated as a fifth stage.",
-        )
-        stages, committed_count = stage_snapshot(ag1_filtered, ag2_filtered, wc_col)
-        total_for_funnel = max(total_apps, 1)
-        funnel_rows = []
-        for name, count, color in stages:
-            width = min(max(pct(count, total_for_funnel), 0), 100)
-            companion = ""
-            if name == "Live":
-                companion = f'<div class="funnel-companion">Committed: {committed_count:,}</div>'
-            funnel_rows.append(
-                f"""
-                <div class="funnel-row">
-                    <div class="funnel-name">
-                        {escape(name)}
-                        {companion}
-                    </div>
-                    <div class="funnel-track">
-                        <div class="funnel-fill" style="width:{width:.1f}%;background:{color};"></div>
-                    </div>
-                    <div class="funnel-value">{count:,} · {width:.1f}%</div>
-                </div>
-                """
-            )
-        st.html(
-            '<div class="funnel-shell">'
-            '<div class="funnel-note">'
-            'Selected-period stage snapshot: Quality = Approved, Welcome = Done, Live = Live. '
-            'Committed is companion information only.'
-            '</div>'
-            + ''.join(funnel_rows)
-            + '</div>'
-        )
-
-    with pulse_col:
-        period_days = (end_date - start_date).days + 1
-        prev_start = start_date - datetime.timedelta(days=period_days)
-        prev_end = start_date - datetime.timedelta(days=1)
-
-        current_summary = {
-            "apps": total_apps,
-            "approval_rate": pct(len(ag1_filtered[ag1_filtered["Q_Status"] == "Approved"]), total_apps),
-            "wc_done_rate": pct(
-                len(ag1_filtered[ag1_filtered["WC_Clean"] == "Done"])
-                if wc_col and "WC_Clean" in ag1_filtered.columns else 0,
-                total_apps,
-            ),
-            "live_rate": pct(
-                len(ag2_filtered[ag2_filtered["P_Status"] == "Live"]),
-                total_ag2 if total_ag2 > 0 else total_apps,
-            ),
-        }
-        previous_summary = summary_for_period(ag1, ag2, prev_start, prev_end, wc_col)
-
-        # Working-day / activity calculations.
-        def portal_is_holiday(dt):
-            wd = dt.weekday()
-            if wd == 6:
-                return True
-            if wd == 5:
-                week_num = (dt.day - 1) // 7 + 1
-                return week_num in [1, 3, 5]
-            return False
-
-        range_dates = [
-            start_date + datetime.timedelta(days=i)
-            for i in range((end_date - start_date).days + 1)
-        ]
-        working_days = [d for d in range_dates if not portal_is_holiday(d)]
-        daily_activity = (
-            ag1_filtered.groupby(ag1_filtered["Date_Parsed"].dt.date).size()
-            if not ag1_filtered.empty
-            else pd.Series(dtype="int64")
-        )
-        active_days = sum(1 for d in working_days if daily_activity.get(d, 0) > 0)
-        zero_sales_days = sum(1 for d in working_days if daily_activity.get(d, 0) == 0)
-        best_day_text = "—"
-        best_day_count = 0
-        if not daily_activity.empty:
-            best_day = daily_activity.idxmax()
-            best_day_count = int(daily_activity.max())
-            best_day_text = pd.Timestamp(best_day).strftime("%d %b")
-        avg_active_day = (total_apps / active_days) if active_days > 0 else 0
-        avg_working_day = (total_apps / len(working_days)) if working_days else 0
-
-        st.html(
-            f"""
-            <div class="pulse-shell">
-                <div class="pulse-head">
-                    <div class="pulse-title">Performance pulse</div>
-                    <div class="pulse-note">
-                        Selected period: {escape(start_date.strftime('%d %b'))} – {escape(end_date.strftime('%d %b %Y'))}
-                    </div>
-                </div>
-                <div class="pulse-subtitle"><span></span>Period momentum</div>
-            </div>
-            """
-        )
-
-        render_comparison_cards(
-            [
-                ("Applications", current_summary["apps"], previous_summary["apps"], False, f"Previous: {previous_summary['apps']:,}"),
-                ("QA approval", current_summary["approval_rate"], previous_summary["approval_rate"], True, f"Previous: {previous_summary['approval_rate']:.1f}%"),
-                ("WC completion", current_summary["wc_done_rate"], previous_summary["wc_done_rate"], True, f"Previous: {previous_summary['wc_done_rate']:.1f}%"),
-                ("Live rate", current_summary["live_rate"], previous_summary["live_rate"], True, f"Previous: {previous_summary['live_rate']:.1f}%"),
-            ]
-        )
-
-        st.html(
-            """
-            <div class="pulse-separator"></div>
-            <div class="pulse-subtitle"><span></span>Activity consistency</div>
-            """
-        )
-
-        activity_cards = [
-            ("Working days", len(working_days), "in selected range"),
-            ("Active days", active_days, f"of {len(working_days)} working days"),
-            ("Avg apps / working day", f"{avg_working_day:.1f}", "applications"),
-            ("Avg apps / active day", f"{avg_active_day:.1f}", "applications"),
-            ("Best sales day", best_day_text, f"{best_day_count:,} applications" if best_day_count else "no activity"),
-        ]
-        activity_html = []
-        for label, value, sub in activity_cards:
-            activity_html.append(
-                f"""
-                <div class="mini-stat">
-                    <div class="mini-stat-label">{escape(str(label))}</div>
-                    <div class="mini-stat-value">{escape(str(value))}</div>
-                    <div class="mini-stat-sub">{escape(str(sub))}</div>
-                </div>
-                """
-            )
-        st.html('<div class="mini-stat-grid">' + ''.join(activity_html) + '</div>')
-
-        if len(working_days) > 0 and zero_sales_days > 0:
-            st.caption(f"{zero_sales_days} working day(s) had no applications in the selected period.")
-
-    # ------------------------------------------------------------------------
-    # INSIGHT FLAGS
-    # ------------------------------------------------------------------------
-    flags_html = ""
-
-    if total_apps > 0:
-        q_appr = len(ag1_filtered[ag1_filtered["Q_Status"] == "Approved"]) / total_apps
-        q_can = len(ag1_filtered[ag1_filtered["Q_Status"] == "Cancelled"]) / total_apps
-        q_rej = len(ag1_filtered[ag1_filtered["Q_Status"] == "Rejected"]) / total_apps
-        q_rew = len(ag1_filtered[ag1_filtered["Q_Status"] == "Rework"]) / total_apps
-
-        if q_appr > 0.60:
-            flags_html += '<div class="insight-card" style="border-color:#10B981"><p class="insight-title">Quality</p><p class="insight-phrase">High Approval Rate</p><p class="insight-comment">Excellent pitch and quality compliance!</p></div>'
-        elif q_appr < 0.60:
-            flags_html += '<div class="insight-card" style="border-color:#EF4444"><p class="insight-title">Quality</p><p class="insight-phrase">Low Approval Rate</p><p class="insight-comment">Review the quality guidelines to increase quality approval!</p></div>'
-
-        if q_can > 0.40:
-            flags_html += '<div class="insight-card" style="border-color:#F59E0B"><p class="insight-title">Quality</p><p class="insight-phrase">High Cancellation</p><p class="insight-comment">High Quality Cancellations, review the quality guidelines!</p></div>'
-        if q_rej > 0.20:
-            flags_html += '<div class="insight-card" style="border-color:#EF4444"><p class="insight-title">Quality</p><p class="insight-phrase">High Rejection</p><p class="insight-comment">High Quality Rejections! Pay attention to quality guidelines!</p></div>'
-        if q_rew > 0.30:
-            flags_html += '<div class="insight-card" style="border-color:#3B82F6"><p class="insight-title">Quality</p><p class="insight-phrase">Frequent Reworks</p><p class="insight-comment">Pay closer attention to quality guidelines, to avoid large number of Quality Reworks.</p></div>'
-
-        if wc_col:
-            wc_done = len(ag1_filtered[ag1_filtered["WC_Clean"] == "Done"]) / total_apps
-            wc_can = len(ag1_filtered[ag1_filtered["WC_Clean"] == "Cancelled"]) / total_apps
-            if wc_done < 0.70:
-                flags_html += '<div class="insight-card" style="border-color:#F59E0B"><p class="insight-title">Welcome Call</p><p class="insight-phrase">Low Completion</p><p class="insight-comment">Address customer requirements closely to increase Welcome call approvals!</p></div>'
-            if wc_can > 0.15:
-                flags_html += '<div class="insight-card" style="border-color:#EF4444"><p class="insight-title">Welcome Call</p><p class="insight-phrase">High WC Cancellation</p><p class="insight-comment">Address customer doubts in the sales call to avoid Welcome call cancellations!</p></div>'
-
-    if total_ag2 > 0:
-        l_live = len(ag2_filtered[ag2_filtered["P_Status"] == "Live"]) / total_ag2
-        l_can = len(ag2_filtered[ag2_filtered["P_Status"] == "Cancelled"]) / total_ag2
-        if l_live > 0.20:
-            flags_html += '<div class="insight-card" style="border-color:#10B981"><p class="insight-title">Live Stage</p><p class="insight-phrase">Strong Conversion</p><p class="insight-comment">Good live rate! Great overall quality of applications!</p></div>'
-        elif l_live < 0.20:
-            flags_html += '<div class="insight-card" style="border-color:#F59E0B"><p class="insight-title">Live Stage</p><p class="insight-phrase">Low Live Rate</p><p class="insight-comment">Identify bottlenecks preventing sales from going live.</p></div>'
-        if l_can > 0.65:
-            flags_html += '<div class="insight-card" style="border-color:#EF4444"><p class="insight-title">Live Stage</p><p class="insight-phrase">High Final Loss</p><p class="insight-comment">Large drops between applications and Committed. Identify bottlenecks!</p></div>'
-
-    if flags_html:
-        st.html('<div style="height:6px"></div>')
-        render_section("Points to look out for", "💡", "Automated indicators based on the same thresholds as the original portal")
-        st.html(f'<div class="insight-wrap">{flags_html}</div>')
-
-    # ------------------------------------------------------------------------
-    # DATA BREAKDOWN
-    # ------------------------------------------------------------------------
-    st.html('<div style="height:6px"></div>')
-    render_section("Data breakdown", "▦", "Daily or monthly view of your application funnel")
-
-    ag1_filtered["Date"] = ag1_filtered["Date_Parsed"].dt.date
-    ag2_filtered["Date"] = ag2_filtered["Date_Parsed"].dt.date
-
-    view_mode = st.radio(
-        "View tables by:",
-        ["Daily", "Monthly"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="breakdown_view_mode",
-    )
-
-    if view_mode == "Daily":
-        ag1_filtered["Period"] = ag1_filtered["Date_Parsed"].dt.date
-        ag2_filtered["Period"] = ag2_filtered["Date_Parsed"].dt.date
-        chart_group_col = "Date"
-    else:
-        ag1_filtered["Period"] = ag1_filtered["Date_Parsed"].dt.strftime("%Y-%m")
-        ag2_filtered["Period"] = ag2_filtered["Date_Parsed"].dt.strftime("%Y-%m")
-        chart_group_col = "Period"
-
-    ca, cb, cc, cd = st.columns(4, gap="small")
-
-    with ca:
-        render_section("Applications", "01")
-        if not ag1_filtered.empty:
-            period_apps = ag1_filtered.groupby("Period").size().to_frame("Total Apps")
-            vmax_apps = max(period_apps.max().max(), 1.1)
-            styled_apps = (
-                period_apps.style
-                .format(lambda x: "-" if x == 0 else x)
-                .background_gradient(cmap="Greens", vmin=1, vmax=vmax_apps)
-                .map(lambda x: "background-color: transparent" if x == 0 else "")
-            )
-            st.dataframe(styled_apps, use_container_width=True, height=370)
-
-    with cb:
-        render_section("Quality audit", "02")
-        if not ag1_filtered.empty:
-            period_qual = ag1_filtered.groupby(["Period", "Q_Status"]).size().unstack(fill_value=0)
-            qual_order = ["Approved", "Rework", "Cancelled", "Rejected", "Others"]
-            period_qual = period_qual.reindex(columns=qual_order, fill_value=0)
-            period_qual = period_qual.loc[:, (period_qual != 0).any(axis=0)]
-            if not period_qual.empty:
-                vmax_qual = max(period_qual.max().max(), 1.1)
-                styled_qual = (
-                    period_qual.style
-                    .format(lambda x: "-" if x == 0 else x)
-                    .background_gradient(cmap="Greens", subset=pd.IndexSlice[:, period_qual.columns.intersection(["Approved"])], vmin=1, vmax=vmax_qual)
-                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_qual.columns.intersection(["Rework"])], vmin=1, vmax=vmax_qual)
-                    .background_gradient(cmap="Reds", subset=pd.IndexSlice[:, period_qual.columns.intersection(["Cancelled", "Rejected"])], vmin=1, vmax=vmax_qual)
-                    .map(lambda x: "background-color: transparent" if x == 0 else "")
-                )
-                st.dataframe(styled_qual, use_container_width=True, height=370)
-
-    with cc:
-        render_section("Welcome call", "03")
-        if wc_col and not ag1_filtered.empty:
-            period_wc = ag1_filtered.groupby(["Period", "WC_Clean"]).size().unstack(fill_value=0)
-            wc_order = ["Done", "Pending", "Paperwork", "Cancelled", "Others"]
-            period_wc = period_wc.reindex(columns=wc_order, fill_value=0)
-            period_wc = period_wc.loc[:, (period_wc != 0).any(axis=0)]
-            if not period_wc.empty:
-                vmax_wc = max(period_wc.max().max(), 1.1)
-                styled_wc = (
-                    period_wc.style
-                    .format(lambda x: "-" if x == 0 else x)
-                    .background_gradient(cmap="Greens", subset=pd.IndexSlice[:, period_wc.columns.intersection(["Done"])], vmin=1, vmax=vmax_wc)
-                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_wc.columns.intersection(["Pending", "Paperwork"])], vmin=1, vmax=vmax_wc)
-                    .background_gradient(cmap="Reds", subset=pd.IndexSlice[:, period_wc.columns.intersection(["Cancelled"])], vmin=1, vmax=vmax_wc)
-                    .map(lambda x: "background-color: transparent" if x == 0 else "")
-                )
-                st.dataframe(styled_wc, use_container_width=True, height=370)
-        else:
-            st.info("No Welcome Call data.")
-
-    with cd:
-        render_section("Live status", "04")
-        if not ag2_filtered.empty:
-            period_port = ag2_filtered.groupby(["Period", "P_Status"]).size().unstack(fill_value=0)
-            port_order = ["Live", "Committed", "Cancelled", "Others"]
-            period_port = period_port.reindex(columns=port_order, fill_value=0)
-            period_port = period_port.loc[:, (period_port != 0).any(axis=0)]
-            if not period_port.empty:
-                vmax_port = max(period_port.max().max(), 1.1)
-                styled_port = (
-                    period_port.style
-                    .format(lambda x: "-" if x == 0 else x)
-                    .background_gradient(cmap="Greens", subset=pd.IndexSlice[:, period_port.columns.intersection(["Live"])], vmin=1, vmax=vmax_port)
-                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_port.columns.intersection(["Committed"])], vmin=1, vmax=vmax_port)
-                    .background_gradient(cmap="Reds", subset=pd.IndexSlice[:, period_port.columns.intersection(["Cancelled"])], vmin=1, vmax=vmax_port)
-                    .map(lambda x: "background-color: transparent" if x == 0 else "")
-                )
-                st.dataframe(styled_port, use_container_width=True, height=370)
-
-    # ------------------------------------------------------------------------
-    # TREND + CALENDAR
-    # ------------------------------------------------------------------------
-    st.html('<div style="height:8px"></div>')
-    col_trend, col_cal = st.columns([3, 2], gap="large")
-
-    with col_trend:
-        render_section("My trend", "↗", "Applications compared with Quality Approved and Live")
-        if not ag1_filtered.empty:
-            d_apps = ag1_filtered.groupby(chart_group_col).size().to_frame("Total Apps")
-            d_appr = (
-                ag1_filtered[ag1_filtered["Q_Status"] == "Approved"]
-                .groupby(chart_group_col)
-                .size()
-                .to_frame("Approved")
-            )
-            d_live = (
-                ag2_filtered[ag2_filtered["P_Status"] == "Live"]
-                .groupby(chart_group_col)
-                .size()
-                .to_frame("Live")
-            )
-
-            i_comb = d_apps.join([d_appr, d_live], how="left").fillna(0).reset_index()
-            i_comb[chart_group_col] = i_comb[chart_group_col].astype(str)
-
-            fig = go.Figure()
-            fig.add_trace(
-                go.Bar(
-                    x=i_comb[chart_group_col],
-                    y=i_comb["Total Apps"],
-                    name="Total Applications",
-                    marker_color="#93C5FD",
-                    marker_line_width=0,
-                )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=i_comb[chart_group_col],
-                    y=i_comb["Approved"],
-                    name="Quality Approved Applications",
-                    mode="lines+markers",
-                    line=dict(color="#10B981", width=3),
-                    marker=dict(size=7),
-                )
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=i_comb[chart_group_col],
-                    y=i_comb["Live"],
-                    name="Live Applications",
-                    mode="lines+markers",
-                    line=dict(color="#F59E0B", width=3),
-                    marker=dict(size=7),
-                )
-            )
-            fig.update_layout(
-                height=365,
-                hovermode="x unified",
-                margin=dict(l=8, r=8, t=22, b=8),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(255,255,255,.72)",
-                font=dict(color="#475569", size=11),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                xaxis=dict(
-                    title="Date" if view_mode == "Daily" else "Month",
-                    showgrid=False,
-                    zeroline=False,
-                    linecolor="#E2E8F0",
+    if "_RecordKey" not in apps.columns:
+        apps["_RecordKey"] = [
+            make_source_record_key(d, p)
+            for d, p in zip(
+                apps.get(
+                    "Sale Date Clean",
+                    pd.Series(index=apps.index, dtype="datetime64[ns]"),
                 ),
-                yaxis=dict(
-                    title="Applications",
-                    gridcolor="#E7EDF5",
-                    zeroline=False,
-                ),
-            )
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-        else:
-            st.info("No application data for the selected date range.")
-
-    with col_cal:
-        render_section("Sales activity heatmap", "▦", "Daily application intensity — darker cells mean more sales")
-
-        def is_holiday(dt):
-            wd = dt.weekday()  # 0=Mon, 6=Sun
-            if wd == 6:
-                return True
-            if wd == 5:
-                week_num = (dt.day - 1) // 7 + 1
-                return week_num in [1, 3, 5]
-            return False
-
-        c_month_col, c_year_col = st.columns(2)
-        with c_month_col:
-            sel_month = st.selectbox(
-                "Month",
-                list(calendar.month_name)[1:],
-                index=start_date.month - 1,
-                key="calendar_month",
-            )
-        with c_year_col:
-            year_options = list(range(max(2025, start_date.year - 2), max(2025, today_date.year) + 1))
-            if start_date.year not in year_options:
-                year_options.append(start_date.year)
-                year_options = sorted(set(year_options))
-            default_year_index = year_options.index(start_date.year) if start_date.year in year_options else len(year_options) - 1
-            sel_year = st.selectbox(
-                "Year",
-                year_options,
-                index=default_year_index,
-                key="calendar_year",
-            )
-
-        m_idx = list(calendar.month_name).index(sel_month)
-        num_days = calendar.monthrange(sel_year, m_idx)[1]
-        dates = [datetime.date(sel_year, m_idx, day) for day in range(1, num_days + 1)]
-
-        daily_sales = ag1.groupby(ag1["Date_Parsed"].dt.date).size()
-        calendar_max = int(daily_sales.max()) if not daily_sales.empty else 0
-        cal_df = pd.DataFrame(
-            {
-                "Date": dates,
-                "Day": [d.day for d in dates],
-                "Weekday": [d.strftime("%a") for d in dates],
-                "WeekNum": [int(d.strftime("%V")) if d.strftime("%V").isdigit() else 0 for d in dates],
-                "Sales": [daily_sales.get(d, 0) for d in dates],
-                "Type": ["Holiday" if is_holiday(d) else "Working" for d in dates],
-            }
-        )
-        cal_df["HoverText"] = cal_df.apply(
-            lambda r: "Holiday" if r["Type"] == "Holiday" else f"{r['Sales']} sale(s)",
-            axis=1,
-        )
-
-        fig_cal = go.Figure()
-        working_days = cal_df[cal_df["Type"] == "Working"]
-        fig_cal.add_trace(
-            go.Heatmap(
-                x=working_days["Weekday"],
-                y=working_days["WeekNum"],
-                z=working_days["Sales"],
-                text=working_days["Day"],
-                customdata=working_days["HoverText"],
-                hovertemplate="%{customdata}<extra></extra>",
-                texttemplate="%{text}",
-                textfont=dict(color="#334155", size=11),
-                zmin=0,
-                zmax=max(calendar_max, 1),
-                colorscale=[[0, "#F8FAFC"], [0.15, "#E6F7EE"], [0.50, "#86EFAC"], [1, "#047857"]],
-                showscale=False,
-                xgap=3,
-                ygap=3,
-            )
-        )
-
-        holidays = cal_df[cal_df["Type"] == "Holiday"]
-        fig_cal.add_trace(
-            go.Scatter(
-                x=holidays["Weekday"],
-                y=holidays["WeekNum"],
-                mode="markers+text",
-                marker=dict(symbol="square", size=35, color="#DDEBFF", line=dict(color="#BFD7F7", width=1)),
-                text=holidays["Day"],
-                customdata=holidays["HoverText"],
-                hovertemplate="%{customdata}<extra></extra>",
-                textfont=dict(color="#64748B", size=11),
-                showlegend=False,
-            )
-        )
-
-        fig_cal.update_layout(
-            height=325,
-            margin=dict(l=0, r=0, t=2, b=4),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(255,255,255,.72)",
-            xaxis=dict(
-                side="top",
-                categoryorder="array",
-                categoryarray=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-                showgrid=False,
-                zeroline=False,
-                fixedrange=True,
-            ),
-            yaxis=dict(
-                autorange="reversed",
-                showgrid=False,
-                zeroline=False,
-                showticklabels=False,
-                fixedrange=True,
-            ),
-        )
-        st.plotly_chart(fig_cal, use_container_width=True, config={"displayModeBar": False})
-        st.caption(
-            f"Showing {calendar.month_name[m_idx]} {sel_year} · peak day: {calendar_max:,} application(s) · "
-            "working day intensity  •  🔵 non-working / holiday"
-        )
-
-    # ------------------------------------------------------------------------
-    # RECENT APPLICATIONS LOG
-    # ------------------------------------------------------------------------
-    st.divider()
-    render_section("Recent applications log", "⌕", "Detailed record-by-record view of your applications and downstream status")
-
-    if not ag1.empty:
-        ag2_clean = ag2.copy()
-        ag2_clean["Telephone No."] = ag2_clean["Telephone No."].astype(str).str.strip()
-        ag2_clean = ag2_clean.rename(columns={"Status": "Portal Status", "Committed Date": "Live Date"})
-
-        # Use the same agreed Sale Date + Phone primary key in the detailed
-        # portal log. This prevents a customer with the same number on a later
-        # sale from receiving the wrong downstream status.
-        ag2_clean = add_record_keys(ag2_clean, "Sale Date", "Telephone No.")
-        ag2_unique = ag2_clean.sort_values("Date_Parsed").drop_duplicates("_RecordKey", keep="last")
-
-        ag1_log_base = ag1.copy()
-        ag1_log_base = add_record_keys(ag1_log_base, "Standardized_Date", "CLI")
-        merged_log = ag1_log_base.merge(
-            ag2_unique[
-                [
-                    "_RecordKey",
+                apps.get(
                     "Telephone No.",
-                    "LetterStatus",
-                    "Provisioning Status",
-                    "Provisioning Remarks",
-                    "CallStatus",
-                    "Comments",
-                    "Voice of Customer",
-                    "Cancellation Reason",
-                    "Portal Status",
-                    "Live Date",
-                ]
-            ],
+                    pd.Series([""] * len(apps), index=apps.index),
+                ),
+            )
+        ]
+
+    if "_RecordKey" not in portal.columns:
+        portal["_RecordKey"] = [
+            make_source_record_key(d, p)
+            for d, p in zip(
+                portal.get(
+                    "Sale Date Clean",
+                    pd.Series(index=portal.index, dtype="datetime64[ns]"),
+                ),
+                portal.get(
+                    "Telephone No.",
+                    pd.Series([""] * len(portal), index=portal.index),
+                ),
+            )
+        ]
+
+    portal_valid = portal[
+        portal["_RecordKey"].fillna("").astype(str).str.strip() != ""
+    ].copy()
+
+    if not portal_valid.empty:
+        portal_valid = (
+            portal_valid.sort_values("Sale Date Clean")
+            .drop_duplicates(subset="_RecordKey", keep="last")
+        )
+
+    if not portal_valid.empty:
+        merged = apps.merge(
+            portal_valid,
             on="_RecordKey",
             how="left",
+            suffixes=("", "_portal"),
         )
+    else:
+        merged = apps.copy()
 
-        merged_log["Sale Date"] = (
-            pd.to_datetime(merged_log["Date_Parsed"], errors="coerce")
-            .dt.strftime("%d-%m-%Y")
-            .fillna("")
-        )
-        merged_log["Live Date"] = (
-            parse_date_series(merged_log["Live Date"])
-            .dt.strftime("%d-%m-%Y")
-            .fillna("")
-        )
+    return merged
 
-        columns_layout = [
-            ("Basic Info.", "S.No."),
-            ("Basic Info.", "Sale Date"),
-            ("Basic Info.", "Customer Name"),
-            ("Quality Audit", "Quality Status"),
-            ("Quality Audit", "Quality Remarks"),
-            ("Welcome Call", "Status"),
-            ("Welcome Call", "Welcome call Remarks"),
-            ("Live Status", "LetterStatus"),
-            ("Provisioning", "Provisioning Status"),
-            ("Provisioning", "Provisioning Remarks"),
-            ("Live Status", "CallStatus"),
-            ("Live Status", "Portal Status"),
-            ("Live Status", "Live Date"),
-            ("Live Status", "Comments"),
-            ("Live Status", "Voice of Customer"),
-            ("Live Status", "Cancellation Reason"),
-        ]
 
-        # Smarter log controls: preserve the original date/month filters while adding
-        # compact status pills and full-record search.
-        log_col1, log_col2, log_col3 = st.columns([2.0, 2.55, 1.0], gap="small")
+master_raw_df = build_master_dataframe(sparta_df, sparta2_df)
 
-        with log_col1:
-            log_filter_type = st.radio(
-                "Log View Filter:",
-                ["All Applications", "By Specific Date Range", "By Specific Month"],
-                horizontal=True,
-                key="log_filter_type",
+with st.spinner("Loading attendance data..."):
+    attendance_df = load_attendance_data()
+
+if not attendance_df.empty:
+    attendance_df, attendance_agent_mapping = attach_attendance_advisors(
+        attendance_df, master_raw_df
+    )
+else:
+    attendance_agent_mapping = {}
+
+def assign_periods(df: pd.DataFrame, date_col: str = "Sale Date Clean", default_period: str = "2026-01"):
+    if date_col in df.columns and not df[date_col].dropna().empty:
+        df["Month_Year"] = df[date_col].dt.strftime("%B %Y")
+        df["Period_Sort"] = df[date_col].dt.to_period("M")
+    else:
+        df["Month_Year"] = "Unknown"
+        df["Period_Sort"] = pd.Period(default_period, freq="M")
+    return df
+
+master_raw_df = assign_periods(master_raw_df)
+sparta2_df = assign_periods(sparta2_df)
+
+source_status_text = (
+    f"Source boundary: Excel / legacy through 17 Sep 2026 · "
+    f"{source_status['legacy_app_rows']:,} application rows | "
+    f"CRM from 18 Sep 2026 · {source_status['crm_app_rows']:,} application rows"
+)
+st.caption(source_status_text)
+
+if attendance_df.empty:
+    st.warning(
+        "Attendance source unavailable. SPD will display '-' until the attendance sheet is available."
+    )
+else:
+    st.caption(
+        f"Attendance source connected · {attendance_df['Name'].nunique():,} people · "
+        f"{attendance_df['Date Clean'].min().strftime('%d %b %Y')} to "
+        f"{attendance_df['Date Clean'].max().strftime('%d %b %Y')}"
+    )
+
+if source_status["crm_error"]:
+    st.warning(
+        "CRM source warning: "
+        + str(source_status["crm_error"])
+        + " Historical Excel / legacy data is still available."
+    )
+
+# ==========================================================
+# FILTERS SECTION
+# ==========================================================
+st.subheader("📅 Filters")
+
+if "Sale Date Clean" in master_raw_df.columns and not master_raw_df["Sale Date Clean"].dropna().empty:
+    available_months = ["All Months"] + list(
+        master_raw_df["Sale Date Clean"].dt.to_period("M").drop_duplicates().sort_values(ascending=False).dt.strftime("%B %Y")
+    )
+else:
+    available_months = ["All Months"]
+
+valid_dates = master_raw_df["Sale Date Clean"].dropna() if "Sale Date Clean" in master_raw_df.columns else pd.Series(dtype="datetime64[ns]")
+min_date = valid_dates.min().date() if not valid_dates.empty else datetime.today().date()
+max_date = valid_dates.max().date() if not valid_dates.empty else datetime.today().date()
+
+filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 1])
+with filter_col1:
+    selected_month = st.selectbox("Select Month", options=available_months, index=0)
+with filter_col2:
+    start_date = st.date_input("Start Date", value=min_date, min_value=min_date, max_value=max_date, format="DD/MM/YYYY")
+with filter_col3:
+    end_date = st.date_input("End Date", value=max_date, min_value=min_date, max_value=max_date, format="DD/MM/YYYY")
+
+st.markdown("##### Tag Visibility Filters")
+tag_col1, tag_col2, tag_col3, tag_col4 = st.columns([1, 1, 1, 1])
+with tag_col1:
+    include_new = st.checkbox("Include 'New' Agents", value=True)
+with tag_col2:
+    include_cs = st.checkbox("Include 'Customer Service' Agents", value=True)
+with tag_col3:
+    include_left = st.checkbox("Include 'Left' Agents", value=False)
+with tag_col4:
+    include_untagged = st.checkbox("Include Untagged Names", value=True)
+
+# ==========================================================
+# Projection weights (editable by user)
+# ==========================================================
+st.markdown("##### Projection weights (editable)")
+proj_col1, proj_col2, proj_col3, proj_col4 = st.columns([1, 1, 1, 2])
+with proj_col1:
+    committed_pct_input = st.number_input("Committed weight %", min_value=0, max_value=100, value=60, step=1, help="Percent of committed expected to convert to Live")
+with proj_col2:
+    welcome_pending_pct_input = st.number_input("Welcome Pending weight %", min_value=0, max_value=100, value=35, step=1, help="Percent of Welcome Pending expected to convert to Live")
+with proj_col3:
+    quality_pending_pct_input = st.number_input("Quality Pending weight %", min_value=0, max_value=100, value=25, step=1, help="Percent of Quality Pending expected to convert to Live")
+with proj_col4:
+    st.markdown(
+        f"""
+        **Applied formula** (per row):  
+        Projected Live = Live + ({committed_pct_input}% × Committed) + ({welcome_pending_pct_input}% × Welcome Pending) + ({quality_pending_pct_input}% × QA Pending)
+        """
+    )
+
+committed_frac = committed_pct_input / 100.0
+welcome_pending_frac = welcome_pending_pct_input / 100.0
+quality_pending_frac = quality_pending_pct_input / 100.0
+
+if start_date > end_date:
+    st.error("Error: Start Date must be earlier than or equal to End Date.")
+    master_df = master_raw_df.copy()
+    filtered_portal_df = sparta2_df.copy()
+else:
+    if "Sale Date Clean" in master_raw_df.columns:
+        date_mask = (master_raw_df["Sale Date Clean"].dt.date >= start_date) & (master_raw_df["Sale Date Clean"].dt.date <= end_date)
+        if selected_month != "All Months":
+            date_mask &= master_raw_df["Month_Year"] == selected_month
+        master_df = master_raw_df[date_mask].copy()
+    else:
+        master_df = master_raw_df.copy()
+
+    if "Sale Date Clean" in sparta2_df.columns:
+        portal_date_mask = (sparta2_df["Sale Date Clean"].dt.date >= start_date) & (sparta2_df["Sale Date Clean"].dt.date <= end_date)
+        if selected_month != "All Months":
+            portal_date_mask &= sparta2_df["Month_Year"] == selected_month
+        filtered_portal_df = sparta2_df[portal_date_mask].copy()
+    else:
+        filtered_portal_df = sparta2_df.copy()
+
+# ==========================================================
+# TOP KPI SECTION
+# ==========================================================
+st.subheader("📌 Key Performance Indicators")
+
+def count_status(df: pd.DataFrame, column: str, target_val: str) -> int:
+    return int((df[column] == target_val).sum()) if column in df.columns else 0
+
+def get_pct(part: int, total: int) -> str:
+    return "0.0%" if total == 0 else f"{(part / total * 100):.1f}%"
+
+total_applications = len(master_df)
+portal_total = len(filtered_portal_df)
+
+q_approved = count_status(master_df, "Quality Status Clean", "Approved")
+q_rework = count_status(master_df, "Quality Status Clean", "Rework")
+q_cancelled = count_status(master_df, "Quality Status Clean", "Cancelled")
+q_pending = count_status(master_df, "Quality Status Clean", "Pending")
+
+wc_done = count_status(master_df, "Welcome Status Clean", "Done")
+wc_cancelled = count_status(master_df, "Welcome Status Clean", "Cancelled")
+wc_pending = count_status(master_df, "Welcome Status Clean", "Pending")
+
+portal_live = count_status(filtered_portal_df, "Portal Status Clean", "Live")
+portal_committed = count_status(filtered_portal_df, "Portal Status Clean", "Committed")
+portal_cancelled = count_status(filtered_portal_df, "Portal Status Clean", "Cancelled")
+
+all_kpis = [
+    ("Applications", total_applications, "100% Base", "#3b82f6", "#eff6ff", "#1d4ed8"),
+    ("Quality Approved", q_approved, f"{get_pct(q_approved, total_applications)} Qualified", "#10b981", "#f0fdf4", "#15803d"),
+    ("Quality Rework", q_rework, f"{get_pct(q_rework, total_applications)} In Rework", "#f59e0b", "#fefce8", "#b45309"),
+    ("Quality Cancelled", q_cancelled, f"{get_pct(q_cancelled, total_applications)} Rejected", "#ef4444", "#fef2f2", "#b91c1c"),
+    ("Quality Pending", q_pending, f"{get_pct(q_pending, total_applications)} Pending", "#f97316", "#fff7ed", "#c2410c"),
+    ("Welcome Done", wc_done, f"{get_pct(wc_done, total_applications)} Completed", "#10b981", "#f0fdf4", "#15803d"),
+    ("Welcome Cancelled", wc_cancelled, f"{get_pct(wc_cancelled, total_applications)} Cancelled", "#ef4444", "#fef2f2", "#b91c1c"),
+    ("Welcome Pending", wc_pending, f"{get_pct(wc_pending, total_applications)} Pending", "#f59e0b", "#fefce8", "#b45309"),
+    ("Live Status: Live", portal_live, f"{get_pct(portal_live, portal_total)} Live/Pend.", "#14b8a6", "#f0fdfa", "#0f766e"),
+    ("Live Status: Comm.", portal_committed, f"{get_pct(portal_committed, portal_total)} Pipeline", "#f59e0b", "#fefce8", "#b45309"),
+    ("Live Status: Canc.", portal_cancelled, f"{get_pct(portal_cancelled, portal_total)} Churned", "#ef4444", "#fef2f2", "#b91c1c"),
+]
+
+visible_kpis = [k for k in all_kpis if k[1] > 0]
+
+if visible_kpis:
+    cols = st.columns(len(visible_kpis))
+    for col, (label, val, delta_sub, border_col, bg_col, delta_col) in zip(cols, visible_kpis):
+        with col:
+            st.markdown(
+                f"""
+                <div style="border:1px solid #e2e8f0;border-top:4px solid {border_col};background-color:{bg_col};border-radius:8px;padding:8px 4px; text-align:center;">
+                    <div style="font-size:0.58rem;font-weight:700;color:#475569;text-transform:uppercase;">{label}</div>
+                    <div style="font-size:1.3rem;font-weight:800;color:#0f172a;margin-top:6px;">{val:,}</div>
+                    <div style="font-size:0.62rem;font-weight:700;color:{delta_col};margin-top:4px;">{delta_sub}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
+else:
+    st.info("No active KPIs for the selected filters.")
 
-        with log_col2:
-            if log_filter_type == "By Specific Date Range":
-                ld_col1, ld_col2 = st.columns(2)
-                with ld_col1:
-                    log_start = st.date_input(
-                        "Log Start Date",
-                        today_date.replace(day=1),
-                        key="log_start_date",
-                    )
-                with ld_col2:
-                    log_end = st.date_input(
-                        "Log End Date",
-                        today_date,
-                        key="log_end_date",
-                    )
-                recent_log = merged_log[
-                    date_range_mask(merged_log["Date_Parsed"], log_start, log_end)
-                ].sort_values(by="Date_Parsed", ascending=False)
-            elif log_filter_type == "By Specific Month":
-                unique_months = sorted(
-                    merged_log["Date_Parsed"].dt.strftime("%Y-%m").dropna().unique(),
-                    reverse=True,
-                )
-                if unique_months:
-                    selected_month = st.selectbox(
-                        "Select Month for Log (YYYY-MM):",
-                        unique_months,
-                        key="log_selected_month",
-                    )
-                    recent_log = merged_log[
-                        merged_log["Date_Parsed"].dt.strftime("%Y-%m") == selected_month
-                    ].sort_values(by="Date_Parsed", ascending=False)
-                else:
-                    recent_log = merged_log[0:0]
+# ==========================================================
+# MONTHLY KPI BREAKDOWN (SELECTABLE YEAR)
+# with per-month + / - expandable daily breakdown
+# ==========================================================
+st.divider()
+st.subheader("📅 Monthly KPI Breakdown")
+
+current_year = datetime.now().year
+years = list(range(2022, current_year + 1))
+selected_year = st.selectbox("Select year for monthly breakdown", options=years, index=len(years) - 1)
+
+# --- Agent dropdown for monthly table (default = All Agents)
+agent_list = []
+if "Advisor" in master_raw_df.columns:
+    agent_list = sorted(master_raw_df["Advisor"].dropna().astype(str).unique(), key=lambda s: s.lower())
+agent_options = ["All Agents"] + agent_list
+selected_agent = st.selectbox("Select Agent (Monthly table)", options=agent_options, index=0)
+
+# Build monthly application and portal frames for the selected year
+monthly_app_df = master_raw_df.dropna(subset=["Period_Sort"]).copy()
+monthly_app_df = monthly_app_df[monthly_app_df["Period_Sort"].dt.year == int(selected_year)]
+
+monthly_portal_df = sparta2_df.dropna(subset=["Period_Sort"]).copy()
+monthly_portal_df = monthly_portal_df[monthly_portal_df["Period_Sort"].dt.year == int(selected_year)]
+
+# If an agent is selected, filter monthly_app_df by Agent and derive portal rows for that agent from master_raw_df (merged)
+if selected_agent != "All Agents":
+    agent_norm = selected_agent.strip().lower()
+
+    if "Advisor" in monthly_app_df.columns:
+        monthly_app_df = monthly_app_df[
+            monthly_app_df["Advisor"].fillna("").astype(str).str.strip().str.lower() == agent_norm
+        ].copy()
+    else:
+        monthly_app_df = monthly_app_df.iloc[0:0].copy()
+
+    portal_from_master = master_raw_df.copy()
+    if "Advisor" in portal_from_master.columns:
+        portal_from_master = portal_from_master[
+            portal_from_master["Advisor"].fillna("").astype(str).str.strip().str.lower() == agent_norm
+        ].copy()
+        portal_from_master = portal_from_master.dropna(subset=["Period_Sort"])
+        portal_from_master = portal_from_master[portal_from_master["Period_Sort"].dt.year == int(selected_year)].copy()
+        monthly_portal_df = portal_from_master
+    else:
+        monthly_portal_df = monthly_portal_df.iloc[0:0].copy()
+
+# Periods represented by either applications or portal data
+all_periods = sorted(
+    list(set(monthly_app_df["Period_Sort"]).union(set(monthly_portal_df["Period_Sort"]))),
+    reverse=True,
+)
+
+if not all_periods:
+    st.info(f"No {selected_year} monthly data available for the KPI summary table.")
+else:
+    def build_kpi_row(display_label, m_app, m_portal, period_key, is_daily=False):
+        """Build one monthly/daily KPI row using the same KPI definitions as the original table."""
+        m_total_apps = len(m_app)
+
+        if is_daily:
+            if "Sale Date Clean" in m_app.columns and not m_app["Sale Date Clean"].dropna().empty:
+                spd_day = m_app["Sale Date Clean"].dropna().iloc[0]
             else:
-                recent_log = merged_log.sort_values(by="Date_Parsed", ascending=False)
+                spd_day = pd.to_datetime(display_label, errors="coerce", dayfirst=True)
 
-        with log_col3:
-            row_limit = st.selectbox(
-                "Show records per page:",
-                [5, 10, 20, 50, 100, "All"],
-                index=2,
-                key="log_row_limit",
+            m_spd, m_working_days, m_present_days = get_daily_spd(
+                attendance_df,
+                spd_day,
+                m_total_apps,
+                selected_agent=selected_agent,
             )
-
-        # Full-record search for the application log.
-        # This must be defined before the filtering logic below.
-        log_search = st.text_input(
-            "Search applications",
-            placeholder="Search customer, phone, quality remark, WC remark, cancellation reason…",
-            key="log_search",
-        )
-
-        # --------------------------------------------------------------------
-        # ADVANCED HIERARCHICAL STATUS FILTERS
-        # --------------------------------------------------------------------
-        # Within one stage, checked statuses are combined with OR.
-        # Across selected stages, filters are combined with AND.
-        # Example: Quality > Approved + Welcome Call > Done returns records
-        # that are both QA Approved AND Welcome Call Done.
-        log_filter_source = merged_log.copy()
-        log_filter_source["Q_Filter_Status"] = log_filter_source.get(
-            "Quality Status", pd.Series("", index=log_filter_source.index)
-        ).apply(map_quality)
-
-        wc_filter_source_col = wc_col if wc_col and wc_col in log_filter_source.columns else (
-            "Status" if "Status" in log_filter_source.columns else None
-        )
-        if wc_filter_source_col:
-            log_filter_source["WC_Filter_Status"] = log_filter_source[wc_filter_source_col].apply(map_wc)
         else:
-            log_filter_source["WC_Filter_Status"] = "Others"
+            try:
+                period_for_spd = pd.Period(str(period_key)[:6], freq="M")
+            except Exception:
+                period_for_spd = None
 
-        log_filter_source["P_Filter_Status"] = log_filter_source.get(
-            "Portal Status", pd.Series("", index=log_filter_source.index)
-        ).apply(map_portal)
-
-        quality_options = ["Approved", "Cancelled", "Rework", "Rejected", "Others"]
-        welcome_options = ["Done", "Follow up", "Pending", "Paperwork", "Cancelled", "Others"]
-        live_options = ["Live", "Committed", "Pending", "Cancelled", "Others"]
-
-        with st.expander("☷  Advanced status filters", expanded=False):
-            st.caption(
-                "Select one or more statuses at each level. Multiple selections within a level are OR; "
-                "selected levels are AND. Leave every box unticked to show all applications."
+            m_spd, m_working_days, m_present_days = get_team_month_spd(
+                attendance_df,
+                period_for_spd,
+                m_total_apps,
+                selected_agent=selected_agent,
             )
 
-            # Reset by rotating the widget-key namespace instead of modifying
-            # instantiated checkbox state. This avoids Streamlit's
-            # `st.session_state.<widget_key>` modification error.
-            if "log_status_filter_version" not in st.session_state:
-                st.session_state.log_status_filter_version = 0
+        m_qa_approved = count_status(m_app, "Quality Status Clean", "Approved")
+        m_qa_rework = count_status(m_app, "Quality Status Clean", "Rework")
+        m_qa_cancelled = count_status(m_app, "Quality Status Clean", "Cancelled")
+        m_qa_pending = count_status(m_app, "Quality Status Clean", "Pending")
 
-            if st.button("Clear status filters", key="clear_log_status_filters"):
-                st.session_state.log_status_filter_version += 1
-                st.rerun()
+        m_wc_done = count_status(m_app, "Welcome Status Clean", "Done")
+        m_wc_cancelled = count_status(m_app, "Welcome Status Clean", "Cancelled")
+        m_wc_pending = count_status(m_app, "Welcome Status Clean", "Pending")
 
-            filter_version = st.session_state.log_status_filter_version
-            filter_header_cols = st.columns(3)
-            selected_quality = []
-            selected_wc = []
-            selected_live = []
+        m_p_live = count_status(m_portal, "Portal Status Clean", "Live")
 
-            with filter_header_cols[0]:
-                st.markdown("**01 · Quality Audit**")
-                for status_name in quality_options:
-                    widget_key = f"log_q_status_v{filter_version}_{status_name.lower().replace(' ', '_')}"
-                    if st.checkbox(status_name, key=widget_key):
-                        selected_quality.append(status_name)
+        # CRM-only committed semantics for the Monthly KPI Breakdown:
+        # use Confirmation Status and ignore blanks. Legacy/Excel rows retain
+        # their original Sparta2 Portal Status semantics.
+        source_series = m_portal.get(
+            "Source",
+            pd.Series(index=m_portal.index, dtype=object),
+        ).fillna("").astype(str).str.strip()
+        legacy_portal = m_portal[source_series != "CRM"].copy()
+        crm_portal = m_portal[source_series == "CRM"].copy()
 
-            with filter_header_cols[1]:
-                st.markdown("**02 · Welcome Call**")
-                for status_name in welcome_options:
-                    widget_key = f"log_wc_status_v{filter_version}_{status_name.lower().replace(' ', '_')}"
-                    if st.checkbox(status_name, key=widget_key):
-                        selected_wc.append(status_name)
+        m_p_committed_legacy = count_status(
+            legacy_portal, "Portal Status Clean", "Committed"
+        )
 
-            with filter_header_cols[2]:
-                st.markdown("**03 · Live Status**")
-                for status_name in live_options:
-                    widget_key = f"log_live_status_v{filter_version}_{status_name.lower().replace(' ', '_')}"
-                    if st.checkbox(status_name, key=widget_key):
-                        selected_live.append(status_name)
-
-        # Start from the date/month filtered log produced above.
-        recent_log = recent_log.sort_values(by="Date_Parsed", ascending=False)
-
-        # Apply the hierarchy to the currently visible rows only.
-        if selected_quality or selected_wc or selected_live:
-            stage_mask = pd.Series(True, index=log_filter_source.index)
-
-            if selected_quality:
-                stage_mask &= log_filter_source["Q_Filter_Status"].isin(selected_quality)
-            if selected_wc:
-                stage_mask &= log_filter_source["WC_Filter_Status"].isin(selected_wc)
-            if selected_live:
-                stage_mask &= log_filter_source["P_Filter_Status"].isin(selected_live)
-
-            recent_log = recent_log.loc[stage_mask.loc[recent_log.index]]
-
-        if log_search.strip():
-            searchable_cols = pick_existing(
-                recent_log,
-                [
-                    "Customer Name", "CLI", "Quality Status", "Quality Remarks",
-                    "Status", "Welcome call Remarks", "LetterStatus",
-                    "Provisioning Status", "Provisioning Remarks", "CallStatus",
-                    "Portal Status", "Comments", "Voice of Customer", "Cancellation Reason",
-                ],
+        crm_confirmation_norm = pd.Series(index=crm_portal.index, dtype="string")
+        if "Confirmation Status" in crm_portal.columns:
+            crm_confirmation = (
+                crm_portal["Confirmation Status"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
             )
-            if searchable_cols:
-                search_blob = recent_log[searchable_cols].fillna("").astype(str).agg(" | ".join, axis=1)
-                recent_log = recent_log[
-                    search_blob.str.contains(
-                        log_search.strip(), case=False, regex=False, na=False
-                    )
+            crm_confirmation_norm = (
+                crm_confirmation.str.lower()
+                .str.replace(r"\s+", " ", regex=True)
+                .str.strip()
+            )
+            m_p_committed_crm = int(
+                crm_confirmation_norm.isin({
+                    "confirmation approved",
+                    "confirmation followup",
+                    "confirmation follow-up",
+                    "confirmation pending",
+                }).sum()
+            )
+            m_p_committed_cancelled = int(
+                (crm_confirmation_norm == "to be cancelled").sum()
+            )
+        else:
+            m_p_committed_crm = 0
+            m_p_committed_cancelled = 0
+
+        m_p_committed = m_p_committed_legacy + m_p_committed_crm
+        # Existing Live Cancelled remains based on the dashboard portal taxonomy.
+        m_p_cancelled = count_status(m_portal, "Portal Status Clean", "Cancelled")
+
+        qa_approved_raw = format_raw_breakdown(m_app, "Quality Status", "Quality Status Clean", "Approved")
+        qa_rework_raw = format_raw_breakdown(m_app, "Quality Status", "Quality Status Clean", "Rework")
+        qa_cancelled_raw = format_raw_breakdown(m_app, "Quality Status", "Quality Status Clean", "Cancelled")
+        qa_pending_raw = format_raw_breakdown(m_app, "Quality Status", "Quality Status Clean", "Pending")
+
+        welcome_done_raw = format_raw_breakdown(m_app, "Welcome Status", "Welcome Status Clean", "Done")
+        welcome_cancelled_raw = format_raw_breakdown(m_app, "Welcome Status", "Welcome Status Clean", "Cancelled")
+        welcome_pending_raw = format_raw_breakdown(m_app, "Welcome Status", "Welcome Status Clean", "Pending")
+
+        legacy_committed_raw = format_raw_breakdown(
+            legacy_portal, "Portal Status", "Portal Status Clean", "Committed"
+        )
+        crm_committed_raw = ""
+        crm_committed_cancelled_raw = ""
+
+        if "Confirmation Status" in crm_portal.columns:
+            crm_conf_display = (
+                crm_portal["Confirmation Status"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+            )
+            committed_mask = crm_confirmation_norm.isin({
+                "confirmation approved",
+                "confirmation followup",
+                "confirmation follow-up",
+                "confirmation pending",
+            })
+            committed_counts = crm_conf_display[committed_mask].value_counts()
+            if not committed_counts.empty:
+                lines = [f"{raw}: {count}" for raw, count in committed_counts.items()]
+                crm_committed_raw = (
+                    "CRM Confirmation Status Breakdown\n"
+                    + "\n".join(lines)
+                    + f"\nTotal: {int(committed_counts.sum())}"
+                )
+
+            cancelled_counts = crm_conf_display[
+                crm_confirmation_norm == "to be cancelled"
+            ].value_counts()
+            if not cancelled_counts.empty:
+                lines = [f"{raw}: {count}" for raw, count in cancelled_counts.items()]
+                crm_committed_cancelled_raw = (
+                    "CRM Confirmation Status Breakdown\n"
+                    + "\n".join(lines)
+                    + f"\nTotal: {int(cancelled_counts.sum())}"
+                )
+
+        raw_parts = [x for x in [legacy_committed_raw, crm_committed_raw] if x]
+        committed_raw = "\n\n".join(raw_parts)
+
+        live_raw = format_raw_breakdown(m_portal, "Portal Status", "Portal Status Clean", "Live")
+        live_cancelled_raw = format_raw_breakdown(m_portal, "Portal Status", "Portal Status Clean", "Cancelled")
+
+        m_projected = (
+            m_p_live
+            + (m_p_committed * committed_frac)
+            + (m_wc_pending * welcome_pending_frac)
+            + (m_qa_pending * quality_pending_frac)
+        )
+
+        projected_tooltip = (
+            f"Formula: Live + ({committed_pct_input}% × Committed) + "
+            f"({welcome_pending_pct_input}% × Welcome Pending) + ({quality_pending_pct_input}% × QA Pending)\n"
+            f"Components:\nLive: {m_p_live}\nCommitted: {m_p_committed}\n"
+            f"Welcome Pending: {m_wc_pending}\nQA Pending: {m_qa_pending}\n"
+            f"Projected (rounded): {int(round(m_projected))}"
+        )
+
+        return {
+            "MONTH": display_label,
+            "PERIOD_KEY": period_key,
+            "APPLICATIONS": m_total_apps,
+            "WORKING DAYS": m_working_days,
+            "PRESENT DAYS": m_present_days,
+            "SPD": m_spd,
+            "_SPD_DENOMINATOR": m_present_days,
+            "QA APPROVED": m_qa_approved,
+            "QA APPROVED RAW": qa_approved_raw,
+            "QA Pass Rate % Val": (m_qa_approved / m_total_apps * 100) if m_total_apps > 0 else 0.0,
+            "QA REWORK": m_qa_rework,
+            "QA REWORK RAW": qa_rework_raw,
+            "QA CANCELLED": m_qa_cancelled,
+            "QA CANCELLED RAW": qa_cancelled_raw,
+            "QA PENDING": m_qa_pending,
+            "QA PENDING RAW": qa_pending_raw,
+            "WELCOME DONE": m_wc_done,
+            "WELCOME DONE RAW": welcome_done_raw,
+            "Welcome Done % Val": (m_wc_done / m_total_apps * 100) if m_total_apps > 0 else 0.0,
+            "WELCOME CANCELLED": m_wc_cancelled,
+            "WELCOME CANCELLED RAW": welcome_cancelled_raw,
+            "WELCOME PENDING": m_wc_pending,
+            "WELCOME PENDING RAW": welcome_pending_raw,
+            "COMMITTED REM.": m_p_committed,
+            "COMMITTED RAW": committed_raw,
+            "COMMITTED CANCELLED": m_p_committed_cancelled,
+            "COMMITTED CANCELLED RAW": crm_committed_cancelled_raw,
+            "LIVE": m_p_live,
+            "LIVE RAW": live_raw,
+            "Live Conversion % Val": (m_p_live / m_total_apps * 100) if m_total_apps > 0 else 0.0,
+            "LIVE CANCELLED": m_p_cancelled,
+            "LIVE CANCELLED RAW": live_cancelled_raw,
+            "PROJECTED LIVE": int(round(m_projected)),
+            "PROJECTED LIVE RAW": projected_tooltip,
+            "Projected Live % Val": (m_projected / m_total_apps * 100) if m_total_apps > 0 else 0.0,
+        }
+
+    # ----------------------------------------------------------
+    # Build monthly rows AND daily rows for every calendar day.
+    # Daily rows are stored separately and rendered hidden by default.
+    # ----------------------------------------------------------
+    monthly_rows = []
+    daily_rows_by_period = {}
+
+    for period in all_periods:
+        month_start = period.to_timestamp()
+        next_month = (period + 1).to_timestamp()
+        month_app = monthly_app_df[monthly_app_df["Period_Sort"] == period].copy()
+        month_portal = monthly_portal_df[monthly_portal_df["Period_Sort"] == period].copy()
+
+        period_key = int(period.year) * 100 + int(period.month)
+        monthly_rows.append(
+            build_kpi_row(
+                period.strftime("%B %Y"),
+                month_app,
+                month_portal,
+                period_key,
+            )
+        )
+
+        # Use the actual sale date as the day key. Include every calendar day in the month,
+        # including zero-activity days, so the expanded month always shows a complete calendar.
+        day_rows = []
+        day = month_start
+        while day < next_month:
+            day_end = day + pd.Timedelta(days=1)
+            day_app = month_app[
+                (month_app["Sale Date Clean"] >= day) &
+                (month_app["Sale Date Clean"] < day_end)
+            ].copy() if "Sale Date Clean" in month_app.columns else month_app.iloc[0:0].copy()
+
+            day_portal = month_portal[
+                (month_portal["Sale Date Clean"] >= day) &
+                (month_portal["Sale Date Clean"] < day_end)
+            ].copy() if "Sale Date Clean" in month_portal.columns else month_portal.iloc[0:0].copy()
+
+            day_key = int(day.strftime("%Y%m%d"))
+            day_rows.append(
+                build_kpi_row(
+                    day.strftime("%d %b %Y"),
+                    day_app,
+                    day_portal,
+                    day_key,
+                    is_daily=True,
+                )
+            )
+            day += pd.Timedelta(days=1)
+
+        daily_rows_by_period[period_key] = day_rows
+
+    monthly_summary_df = pd.DataFrame(monthly_rows)
+
+    # ----------------------------------------------------------
+    # Totals row — kept exactly on the monthly view and always
+    # rendered at the bottom.
+    # ----------------------------------------------------------
+    if not monthly_summary_df.empty:
+        tot_apps = monthly_summary_df["APPLICATIONS"].sum()
+        totals_row = {
+            "MONTH": "Total",
+            "PERIOD_KEY": 999999,
+            "APPLICATIONS": tot_apps,
+            "WORKING DAYS": monthly_summary_df["WORKING DAYS"].sum(),
+            "PRESENT DAYS": monthly_summary_df["PRESENT DAYS"].sum(),
+            "SPD": (
+                tot_apps / monthly_summary_df["PRESENT DAYS"].sum()
+                if monthly_summary_df["PRESENT DAYS"].sum() > 0
+                else 0.0
+            ),
+            "_SPD_DENOMINATOR": monthly_summary_df["PRESENT DAYS"].sum(),
+            "QA APPROVED": monthly_summary_df["QA APPROVED"].sum(),
+            "QA APPROVED RAW": format_raw_breakdown(monthly_app_df, "Quality Status", "Quality Status Clean", "Approved"),
+            "QA Pass Rate % Val": (monthly_summary_df["QA APPROVED"].sum() / tot_apps * 100) if tot_apps > 0 else 0.0,
+            "QA REWORK": monthly_summary_df["QA REWORK"].sum(),
+            "QA REWORK RAW": format_raw_breakdown(monthly_app_df, "Quality Status", "Quality Status Clean", "Rework"),
+            "QA CANCELLED": monthly_summary_df["QA CANCELLED"].sum(),
+            "QA CANCELLED RAW": format_raw_breakdown(monthly_app_df, "Quality Status", "Quality Status Clean", "Cancelled"),
+            "QA PENDING": monthly_summary_df["QA PENDING"].sum(),
+            "QA PENDING RAW": format_raw_breakdown(monthly_app_df, "Quality Status", "Quality Status Clean", "Pending"),
+            "WELCOME DONE": monthly_summary_df["WELCOME DONE"].sum(),
+            "WELCOME DONE RAW": format_raw_breakdown(monthly_app_df, "Welcome Status", "Welcome Status Clean", "Done"),
+            "Welcome Done % Val": (monthly_summary_df["WELCOME DONE"].sum() / tot_apps * 100) if tot_apps > 0 else 0.0,
+            "WELCOME CANCELLED": monthly_summary_df["WELCOME CANCELLED"].sum(),
+            "WELCOME CANCELLED RAW": format_raw_breakdown(monthly_app_df, "Welcome Status", "Welcome Status Clean", "Cancelled"),
+            "WELCOME PENDING": monthly_summary_df["WELCOME PENDING"].sum(),
+            "WELCOME PENDING RAW": format_raw_breakdown(monthly_app_df, "Welcome Status", "Welcome Status Clean", "Pending"),
+            "COMMITTED REM.": monthly_summary_df["COMMITTED REM."].sum(),
+            "COMMITTED RAW": "Aggregate committed breakdown shown in the monthly rows",
+            "COMMITTED CANCELLED": monthly_summary_df["COMMITTED CANCELLED"].sum(),
+            "COMMITTED CANCELLED RAW": "CRM Confirmation Status = To Be Cancelled",
+            "LIVE": monthly_summary_df["LIVE"].sum(),
+            "LIVE RAW": format_raw_breakdown(monthly_portal_df, "Portal Status", "Portal Status Clean", "Live"),
+            "Live Conversion % Val": (monthly_summary_df["LIVE"].sum() / tot_apps * 100) if tot_apps > 0 else 0.0,
+            "LIVE CANCELLED": monthly_summary_df["LIVE CANCELLED"].sum(),
+            "LIVE CANCELLED RAW": format_raw_breakdown(monthly_portal_df, "Portal Status", "Portal Status Clean", "Cancelled"),
+            "PROJECTED LIVE": int(round(
+                monthly_summary_df["LIVE"].sum()
+                + monthly_summary_df["COMMITTED REM."].sum() * committed_frac
+                + monthly_summary_df["WELCOME PENDING"].sum() * welcome_pending_frac
+                + monthly_summary_df["QA PENDING"].sum() * quality_pending_frac
+            )),
+            "PROJECTED LIVE RAW": (
+                f"Aggregate projection using weights: {committed_pct_input}% committed, "
+                f"{welcome_pending_pct_input}% welcome pending, {quality_pending_pct_input}% quality pending"
+            ),
+            "Projected Live % Val": ((
+                monthly_summary_df["LIVE"].sum()
+                + monthly_summary_df["COMMITTED REM."].sum() * committed_frac
+                + monthly_summary_df["WELCOME PENDING"].sum() * welcome_pending_frac
+                + monthly_summary_df["QA PENDING"].sum() * quality_pending_frac
+            ) / tot_apps * 100) if tot_apps > 0 else 0.0,
+        }
+        monthly_summary_df = pd.concat(
+            [monthly_summary_df, pd.DataFrame([totals_row])],
+            ignore_index=True,
+        )
+
+    def render_pill(val_float: float, thresholds: List[float], good_bg: str = "#d1fae5"):
+        val_str = f"{val_float:.1f}%"
+        high, med = thresholds
+        if val_float >= high:
+            bg, color, border = "#d1fae5", "#047857", "#a7f3d0"
+        elif val_float >= med:
+            bg, color, border = "#fef3c7", "#b45309", "#fde68a"
+        else:
+            bg, color, border = "#ffe4e6", "#be123c", "#fecdd3"
+        return (
+            f'<span data-sort="{val_float:.6f}" style="background-color: {bg}; '
+            f'color: {color}; border: 1px solid {border}; border-radius: 8px; '
+            f'padding: 2px 8px; font-weight:700;">{val_str}</span>'
+        )
+
+    display_columns = [
+        "MONTH", "APPLICATIONS", "WORKING DAYS", "PRESENT DAYS", "SPD", "QA APPROVED", "QA Pass Rate %",
+        "QA REWORK", "QA CANCELLED", "QA PENDING", "WELCOME DONE",
+        "Welcome Done %", "WELCOME CANCELLED", "WELCOME PENDING",
+        "COMMITTED REM.", "COMMITTED CANCELLED", "LIVE", "Live Conversion %", "PROJECTED LIVE", "Projected Live %", "LIVE CANCELLED",
+    ]
+
+    m_header_styles = {
+        "MONTH": "background-color: #f1f5f9; color: #334155;",
+        "APPLICATIONS": "background-color: #eff6ff; color: #1e40af;",
+        "WORKING DAYS": "background-color: #f8fafc; color: #475569;",
+        "PRESENT DAYS": "background-color: #f0fdfa; color: #0f766e;",
+        "SPD": "background-color: #e0f2fe; color: #0369a1;",
+        "QA APPROVED": "background-color: #f0fdf4; color: #15803d;",
+        "QA Pass Rate %": "background-color: #f0fdf4; color: #15803d;",
+        "QA REWORK": "background-color: #fefce8; color: #a16207;",
+        "QA CANCELLED": "background-color: #fef2f2; color: #b91c1c;",
+        "QA PENDING": "background-color: #fff7ed; color: #c2410c;",
+        "WELCOME DONE": "background-color: #f0fdf4; color: #15803d;",
+        "Welcome Done %": "background-color: #f0fdf4; color: #15803d;",
+        "WELCOME CANCELLED": "background-color: #fef2f2; color: #b91c1c;",
+        "WELCOME PENDING": "background-color: #fefce8; color: #a16207;",
+        "COMMITTED REM.": "background-color: #fff7ed; color: #c2410c;",
+        "COMMITTED CANCELLED": "background-color: #fef2f2; color: #b91c1c;",
+        "LIVE": "background-color: #f0fdfa; color: #0f766e;",
+        "Live Conversion %": "background-color: #f0fdfa; color: #0f766e;",
+        "PROJECTED LIVE": "background-color: #eef2ff; color: #3730a3;",
+        "Projected Live %": "background-color: #eef2ff; color: #3730a3;",
+        "LIVE CANCELLED": "background-color: #fef2f2; color: #b91c1c;",
+    }
+
+    monthly_tooltip_map = {
+        "QA APPROVED": "QA APPROVED RAW",
+        "QA REWORK": "QA REWORK RAW",
+        "QA CANCELLED": "QA CANCELLED RAW",
+        "QA PENDING": "QA PENDING RAW",
+        "WELCOME DONE": "WELCOME DONE RAW",
+        "WELCOME CANCELLED": "WELCOME CANCELLED RAW",
+        "WELCOME PENDING": "WELCOME PENDING RAW",
+        "COMMITTED REM.": "COMMITTED RAW",
+        "COMMITTED CANCELLED": "COMMITTED CANCELLED RAW",
+        "LIVE": "LIVE RAW",
+        "LIVE CANCELLED": "LIVE CANCELLED RAW",
+        "PROJECTED LIVE": "PROJECTED LIVE RAW",
+    }
+
+    # ----------------------------------------------------------
+    # HTML table renderer helpers
+    # ----------------------------------------------------------
+    def render_monthly_data_cell(row, col_name, daily=False):
+        """Render one data cell. Kept consistent with the original table."""
+        if col_name == "MONTH":
+            period_key = int(row.get("PERIOD_KEY", 0)) if pd.notna(row.get("PERIOD_KEY", None)) else 0
+            cell_text = escape(str(row["MONTH"]))
+            return f'<td data-sort="{period_key}">{cell_text}</td>'
+
+        if col_name in {"WORKING DAYS", "PRESENT DAYS"}:
+            val = float(row.get(col_name, 0.0) or 0.0)
+            formatted = "-" if val <= 0 else (f"{val:.1f}" if abs(val - round(val)) > 1e-9 else f"{int(round(val)):,}")
+            return f'<td data-sort="{val:.6f}">{formatted}</td>'
+
+        if col_name == "SPD":
+            val = float(row.get("SPD", 0.0) or 0.0)
+            formatted = "-" if val <= 0 else f"{val:.2f}"
+            return f'<td data-sort="{val:.6f}">{formatted}</td>'
+
+        if col_name == "QA Pass Rate %":
+            val = float(row["QA Pass Rate % Val"])
+            return f'<td data-sort="{val:.6f}">{render_pill(val, thresholds=[75.0, 51.0])}</td>'
+
+        if col_name == "Welcome Done %":
+            val = float(row["Welcome Done % Val"])
+            return f'<td data-sort="{val:.6f}">{render_pill(val, thresholds=[61.0, 51.0])}</td>'
+
+        if col_name == "Live Conversion %":
+            val = float(row["Live Conversion % Val"])
+            return f'<td data-sort="{val:.6f}">{render_pill(val, thresholds=[41.0, 21.0])}</td>'
+
+        if col_name == "PROJECTED LIVE":
+            val = int(row.get("PROJECTED LIVE", 0))
+            raw_text = row.get("PROJECTED LIVE RAW", "")
+            if raw_text and val != 0:
+                tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                return f'<td data-sort="{val}" title="{tooltip_html}" style="cursor:help;">{val:,}</td>'
+            return f'<td data-sort="{val}">{val:,}</td>'
+
+        if col_name == "Projected Live %":
+            val = float(row.get("Projected Live % Val", 0.0))
+            raw_text = row.get("PROJECTED LIVE RAW", "")
+            pill_html = render_pill(val, thresholds=[41.0, 21.0])
+            if raw_text and val != 0:
+                tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                return f'<td data-sort="{val:.6f}" title="{tooltip_html}" style="cursor:help;">{pill_html}</td>'
+            return f'<td data-sort="{val:.6f}">{pill_html}</td>'
+
+        val = row.get(col_name, 0)
+        raw_column = monthly_tooltip_map.get(col_name)
+        raw_text = row.get(raw_column, "") if raw_column else ""
+
+        if isinstance(val, (int, np.integer)):
+            formatted_val = "-" if int(val) == 0 else f"{int(val):,}"
+            if raw_text and int(val) != 0:
+                tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                return f'<td data-sort="{int(val)}" title="{tooltip_html}" style="cursor:help;">{formatted_val}</td>'
+            return f'<td data-sort="{int(val)}">{formatted_val}</td>'
+
+        formatted_val = "-" if (val == 0 or pd.isna(val)) else escape(str(val))
+        if isinstance(val, float):
+            if raw_text and val != 0:
+                tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                return f'<td data-sort="{val}" title="{tooltip_html}" style="cursor:help;">{formatted_val}</td>'
+            return f'<td data-sort="{val}">{formatted_val}</td>'
+
+        if raw_text and str(val) not in ("0", "-", ""):
+            tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+            return f'<td data-sort="{escape(str(val))}" title="{tooltip_html}" style="cursor:help;">{formatted_val}</td>'
+        return f'<td data-sort="{escape(str(val))}">{formatted_val}</td>'
+
+    # ----------------------------------------------------------
+    # Build table HTML.
+    # A month is a sortable group containing its monthly row + its
+    # hidden daily rows. Clicking + toggles only that group.
+    # ----------------------------------------------------------
+    monthly_table_id = "monthly-kpi-table"
+    table_height = min(700, max(200, 95 + (len(monthly_summary_df) * 45)))
+
+    m_html = f"""
+    <style>
+        .monthly-kpi-table-container {{
+            width: 100%;
+            overflow-x: auto;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+            margin-bottom: 20px;
+            max-height: {table_height}px;
+        }}
+        .monthly-kpi-inner {{
+            max-height: {table_height}px;
+            overflow: auto;
+        }}
+        .monthly-kpi-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-size: 0.88rem;
+            background-color: #ffffff;
+        }}
+        .monthly-kpi-table th {{
+            padding: 12px 14px;
+            font-weight: 800;
+            font-size: 0.78rem;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            text-align: center;
+            border-bottom: 2px solid #e2e8f0;
+            border-right: 1px solid #f1f5f9;
+            position: sticky;
+            top: 0;
+            z-index: 5;
+            background: #ffffff;
+            cursor: pointer;
+        }}
+        .monthly-kpi-table th.expand-head {{
+            width: 48px;
+            min-width: 48px;
+            max-width: 48px;
+            cursor: default;
+            padding: 10px 6px;
+        }}
+        .monthly-kpi-table th:first-of-type + th {{
+            text-align: left;
+        }}
+        .monthly-kpi-table td {{
+            padding: 10px 14px;
+            text-align: center;
+            border-bottom: 1px solid #f1f5f9;
+            border-right: 1px solid #f8fafc;
+            color: #1e293b;
+        }}
+        .monthly-kpi-table td.month-label {{
+            text-align: left;
+            font-weight: 700;
+            color: #0f172a;
+            white-space: nowrap;
+        }}
+        .monthly-kpi-table tr.month-row {{
+            background-color: #ffffff;
+        }}
+        .monthly-kpi-table tr.month-row:hover {{
+            background-color: #f8fafc;
+        }}
+        .monthly-kpi-table tr.daily-row {{
+            background-color: #f8fafc;
+            display: none;
+        }}
+        .monthly-kpi-table tr.daily-row td {{
+            padding-top: 8px;
+            padding-bottom: 8px;
+            font-size: 0.84rem;
+        }}
+        .monthly-kpi-table tr.daily-row td.month-label {{
+            padding-left: 42px;
+            font-weight: 600;
+            color: #475569;
+        }}
+        .monthly-kpi-table tr.daily-row.shown {{
+            display: table-row;
+        }}
+        .expand-button {{
+            width: 26px;
+            height: 26px;
+            border: 1px solid #cbd5e1;
+            background: #ffffff;
+            color: #334155;
+            border-radius: 6px;
+            font-size: 16px;
+            line-height: 22px;
+            font-weight: 700;
+            cursor: pointer;
+            padding: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }}
+        .expand-button:hover {{
+            background: #f1f5f9;
+            border-color: #94a3b8;
+        }}
+        .daily-indent {{
+            display: inline-block;
+            width: 7px;
+            border-left: 2px solid #cbd5e1;
+            height: 14px;
+            margin-right: 8px;
+            vertical-align: -2px;
+        }}
+        .monthly-kpi-table tr.totals-row {{
+            font-weight: 800;
+            background-color: #f8fafc;
+            border-top: 2px solid #cbd5e1;
+        }}
+        .monthly-kpi-table tr.totals-row td {{
+            position: sticky;
+            bottom: 0;
+            background-color: #f8fafc;
+            z-index: 4;
+        }}
+    </style>
+    <div class="monthly-kpi-table-container">
+      <div class="monthly-kpi-inner">
+        <table id="{monthly_table_id}" class="monthly-kpi-table">
+            <thead>
+                <tr>
+                    <th class="expand-head"></th>
+    """
+
+    for col_name in display_columns:
+        th_style = m_header_styles.get(col_name, "background-color: #f8fafc; color: #475569;")
+        m_html += f'<th style="{th_style}">{col_name}</th>'
+    m_html += "</tr></thead><tbody>"
+
+    for _, row in monthly_summary_df.iterrows():
+        is_total = str(row.get("MONTH", "")).strip().lower() == "total"
+        if is_total:
+            m_html += '<tr class="totals-row">'
+            m_html += '<td class="expand-cell"></td>'
+            for col_name in display_columns:
+                m_html += render_monthly_data_cell(row, col_name)
+            m_html += "</tr>"
+            continue
+
+        period_key = int(row.get("PERIOD_KEY", 0))
+        group_id = f"month-{period_key}"
+        m_html += f'<tr class="month-row" data-group="{group_id}" data-month-sort="{period_key}">'
+        m_html += (
+            f'<td class="expand-cell">'
+            f'<button type="button" class="expand-button" aria-expanded="false" '
+            f'onclick="toggleMonth(\'{group_id}\', this)" title="Expand daily breakdown">+</button>'
+            f'</td>'
+        )
+
+        for col_name in display_columns:
+            cell_html = render_monthly_data_cell(row, col_name)
+            if col_name == "MONTH":
+                cell_html = cell_html.replace('<td ', '<td class="month-label" ', 1)
+            m_html += cell_html
+        m_html += "</tr>"
+
+        # Daily rows are rendered immediately after their month row and are hidden by default.
+        for daily_row in daily_rows_by_period.get(period_key, []):
+            m_html += f'<tr class="daily-row" data-parent="{group_id}">'
+            m_html += '<td class="expand-cell"></td>'
+            for col_name in display_columns:
+                cell_html = render_monthly_data_cell(daily_row, col_name, daily=True)
+                if col_name == "MONTH":
+                    # Visual indentation for daily rows.
+                    label = escape(str(daily_row["MONTH"]))
+                    cell_html = f'<td class="month-label"><span class="daily-indent"></span>{label}</td>'
+                m_html += cell_html
+            m_html += "</tr>"
+
+    m_html += "</tbody></table></div></div>"
+
+    # ----------------------------------------------------------
+    # JS: per-month expansion + sortable month groups.
+    # Sorting affects the monthly rows while keeping each month's
+    # daily rows attached to that month. Totals remain at the bottom.
+    # ----------------------------------------------------------
+    m_html += f"""
+    <script>
+    (function() {{
+        const table = document.getElementById("{monthly_table_id}");
+        if (!table) return;
+        const tbody = table.tBodies[0];
+
+        window.toggleMonth = function(groupId, button) {{
+            const rows = Array.from(tbody.querySelectorAll('tr.daily-row[data-parent="' + groupId + '"]'));
+            const isExpanded = button.getAttribute('aria-expanded') === 'true';
+            const willExpand = !isExpanded;
+
+            rows.forEach(row => {{
+                row.classList.toggle('shown', willExpand);
+            }});
+
+            button.setAttribute('aria-expanded', willExpand ? 'true' : 'false');
+            button.textContent = willExpand ? '−' : '+';
+            button.title = willExpand ? 'Collapse daily breakdown' : 'Expand daily breakdown';
+        }};
+
+        function sortValue(cell) {{
+            if (!cell) return '';
+            return cell.getAttribute('data-sort') || cell.innerText || '';
+        }}
+
+        function compareValues(aVal, bVal, order) {{
+            const aNum = parseFloat(aVal.toString().replace(/,/g, ''));
+            const bNum = parseFloat(bVal.toString().replace(/,/g, ''));
+            if (!isNaN(aNum) && !isNaN(bNum)) {{
+                return order === 'asc' ? aNum - bNum : bNum - aNum;
+            }}
+            return order === 'asc'
+                ? aVal.toString().localeCompare(bVal.toString())
+                : bVal.toString().localeCompare(aVal.toString());
+        }}
+
+        const headers = table.querySelectorAll('thead th');
+        headers.forEach((th, headerIndex) => {{
+            // First column is the expand/collapse control and is not sortable.
+            if (headerIndex === 0) return;
+
+            th.addEventListener('click', () => {{
+                const current = th.getAttribute('data-order') || 'desc';
+                const newOrder = current === 'asc' ? 'desc' : 'asc';
+                headers.forEach(h => h.removeAttribute('data-order'));
+                th.setAttribute('data-order', newOrder);
+
+                const monthRows = Array.from(tbody.querySelectorAll('tr.month-row'));
+                const totals = tbody.querySelector('tr.totals-row');
+
+                monthRows.sort((a, b) => {{
+                    // headerIndex is offset by one because of the expand column.
+                    const aCell = a.children[headerIndex];
+                    const bCell = b.children[headerIndex];
+                    return compareValues(sortValue(aCell), sortValue(bCell), newOrder);
+                }});
+
+                monthRows.forEach(monthRow => {{
+                    tbody.appendChild(monthRow);
+                    const groupId = monthRow.getAttribute('data-group');
+                    const children = Array.from(tbody.querySelectorAll('tr.daily-row[data-parent="' + groupId + '"]'));
+                    children.forEach(child => tbody.appendChild(child));
+                }});
+
+                if (totals) tbody.appendChild(totals);
+            }});
+        }});
+    }})();
+    </script>
+    """
+
+    components.html(m_html, height=table_height, scrolling=False)
+
+# ==========================================================
+# PERFORMANCE TABLE SELECTOR
+# Only one performance table is displayed at a time.
+# ==========================================================
+st.divider()
+st.subheader("📊 Performance Breakdown")
+
+performance_table_options = [
+    "👥 Sales Executive Performance Breakdown",
+    "🧪 Quality Officer Performance",
+    "📞 Welcome Caller Performance",
+]
+selected_performance_table = st.radio(
+    "Select performance table",
+    options=performance_table_options,
+    index=0,
+    horizontal=True,
+)
+
+# ==========================================================
+# ADVISOR PERFORMANCE MATRIX (with per-advisor tooltips, totals row, sticky header & sorting)
+# Add PROJECTED LIVE and Projected Live % to advisor summary
+# ==========================================================
+if selected_performance_table == "👥 Sales Executive Performance Breakdown":
+    st.divider()
+    st.subheader("👥 Sales Executive Performance Breakdown")
+
+if selected_performance_table == "👥 Sales Executive Performance Breakdown" and "Advisor" in master_df.columns and not master_df.empty:
+    advisor_summary = (
+        master_df.groupby("Advisor", dropna=False)
+            .agg(
+                Applications=("Advisor", "count"),
+                QA_Approved=("Quality Status Clean", lambda x: (x == "Approved").sum()),
+                QA_Rework=("Quality Status Clean", lambda x: (x == "Rework").sum()),
+                QA_Cancelled=("Quality Status Clean", lambda x: (x == "Cancelled").sum()),
+                QA_Pending=("Quality Status Clean", lambda x: (x == "Pending").sum()),
+                Welcome_Done=("Welcome Status Clean", lambda x: (x == "Done").sum()),
+                Welcome_Cancelled=("Welcome Status Clean", lambda x: (x == "Cancelled").sum()),
+                Welcome_Pending=("Welcome Status Clean", lambda x: (x == "Pending").sum()),
+                Committed=("Portal Status Clean", lambda x: (x == "Committed").sum()),
+                Live=("Portal Status Clean", lambda x: (x == "Live").sum()),
+                Live_Cancelled=("Portal Status Clean", lambda x: (x == "Cancelled").sum()),
+            )
+            .reset_index()
+    )
+
+    def filter_tagged_rows(row):
+        name = (str(row["Advisor"]) or "").strip().lower()
+        is_new = name in NEW_ADVISORS_SET
+        is_cs = name in CS_ADVISORS_SET
+        is_left = name in LEFT_ADVISORS_SET
+        is_tagged = is_new or is_cs or is_left
+        if is_new and not include_new:
+            return False
+        if is_cs and not include_cs:
+            return False
+        if is_left and not include_left:
+            return False
+        if not is_tagged and not include_untagged:
+            return False
+        return True
+
+    advisor_summary = advisor_summary[advisor_summary.apply(filter_tagged_rows, axis=1)].copy()
+
+    if advisor_summary.empty:
+        st.info("No sales records match the selected tag filters.")
+    else:
+        if not attendance_df.empty:
+            perf_att = attendance_df[
+                (attendance_df["Date Clean"].dt.date >= start_date)
+                & (attendance_df["Date Clean"].dt.date <= end_date)
+            ].copy()
+
+            if selected_month != "All Months":
+                perf_att = perf_att[
+                    perf_att["Date Clean"].dt.strftime("%B %Y") == selected_month
                 ]
 
-        # Always sort after applying the filters so the newest matching records remain first.
-        recent_log = recent_log.sort_values(by="Date_Parsed", ascending=False)
+            mapped_att = perf_att[
+                perf_att["Dashboard Advisor"].fillna("").astype(str).str.strip() != ""
+            ].copy()
 
-        filter_summary = []
-        if selected_quality:
-            filter_summary.append("QA: " + ", ".join(selected_quality))
-        if selected_wc:
-            filter_summary.append("WC: " + ", ".join(selected_wc))
-        if selected_live:
-            filter_summary.append("Live: " + ", ".join(selected_live))
-        if log_search.strip():
-            filter_summary.append(f'Search: "{log_search.strip()}"')
-        if filter_summary:
-            st.caption(" • ".join(filter_summary) + f"  ·  {len(recent_log):,} matching record(s)")
-
-        # Export the currently filtered application log without changing the table behaviour.
-        export_valid_layout = [item for item in columns_layout if item[1] in recent_log.columns]
-        export_cols = [item[1] for item in export_valid_layout]
-        export_df = recent_log[export_cols].copy() if export_cols else recent_log.copy()
-        export_csv = export_df.to_csv(index=False).encode("utf-8-sig")
-        excel_buffer = BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            export_df.to_excel(writer, index=False, sheet_name="Applications")
-        excel_buffer.seek(0)
-
-        export_col1, export_col2 = st.columns([1, 1])
-        with export_col1:
-            st.download_button(
-                "↓ CSV",
-                data=export_csv,
-                file_name=f"{agent}_applications.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key="export_log_csv",
-            )
-        with export_col2:
-            st.download_button(
-                "↓ Excel",
-                data=excel_buffer.getvalue(),
-                file_name=f"{agent}_applications.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key="export_log_excel",
+            working_days_count = int(mapped_att["Date Clean"].dt.normalize().nunique()) if not mapped_att.empty else 0
+            present_days_by_agent = (
+                mapped_att.groupby("Dashboard Advisor")["Attendance Value"].sum()
+                if not mapped_att.empty else pd.Series(dtype=float)
             )
 
-        recent_log["S.No."] = range(1, len(recent_log) + 1)
-
-        valid_layout = [item for item in columns_layout if item[1] in recent_log.columns]
-        display_df = recent_log[[item[1] for item in valid_layout]].copy()
-        display_df.columns = pd.MultiIndex.from_tuples(valid_layout)
-
-        # Reset pagination when the visible dataset changes in size.
-        if row_limit != "All":
-            limit = int(row_limit)
-            total_records = len(display_df)
-            total_pages = max(1, math.ceil(total_records / limit))
-            if st.session_state.current_page > total_pages:
-                st.session_state.current_page = 1
-            start_idx = (st.session_state.current_page - 1) * limit
-            end_idx = min(start_idx + limit, total_records)
-            display_df_page = display_df.iloc[start_idx:end_idx]
+            advisor_summary["WORKING DAYS"] = float(working_days_count)
+            advisor_summary["PRESENT DAYS"] = (
+                advisor_summary["Advisor"]
+                .map(present_days_by_agent)
+                .fillna(0.0)
+            )
         else:
-            total_records = len(display_df)
-            total_pages = 1
-            start_idx = 0
-            end_idx = total_records
-            display_df_page = display_df
+            advisor_summary["WORKING DAYS"] = 0.0
+            advisor_summary["PRESENT DAYS"] = 0.0
 
-        # Display cleanup: show a dash instead of missing/None-like values.
-        # This is intentionally applied only to the visible table, so source
-        # data and calculations remain unchanged.
-        display_df_page = display_df_page.copy()
-        for _col in display_df_page.columns:
-            display_df_page[_col] = display_df_page[_col].apply(
-                lambda _value: "-"
-                if pd.isna(_value)
-                or str(_value).strip().lower() in {"none", "nan", "nat", "null", ""}
-                else _value
-            )
-
-        # Row/cell styling — CRM-aware status colouring.
-        # Each status cell and its directly related remarks/detail cell share
-        # the same colour. Other unrelated cells remain neutral.
-        def style_log_row(row):
-            styles = [""] * len(row)
-
-            def get_val(col_name):
-                for col in row.index:
-                    if isinstance(col, tuple) and len(col) > 1 and col[1] == col_name:
-                        return str(row[col]).strip().lower()
-                return ""
-
-            DARK_GREEN = "#065F46"
-            DARK_AMBER = "#92400E"
-            DARK_RED = "#991B1B"
-            DARK_BLUE = "#1D4ED8"
-
-            BG_GREEN = "rgba(16, 185, 129, 0.16)"
-            BG_AMBER = "rgba(245, 158, 11, 0.18)"
-            BG_RED = "rgba(239, 68, 68, 0.16)"
-            BG_BLUE = "rgba(59, 130, 246, 0.10)"
-
-            def status_style(value, kind):
-                """Return one precise cell style for a CRM/legacy status value."""
-                v = re.sub(r"\s+", " ", str(value or "").strip().lower())
-                if not v:
-                    return ""
-
-                # ----------------------------- QUALITY ----------------------
-                if kind == "quality":
-                    # Explicit CRM / legacy values requested:
-                    # In-bound cancel, Quality Cancel and SOP are red.
-                    if any(x in v for x in [
-                        "in-bound cancel", "inbound cancel", "quality cancel",
-                        "sop", "rejected", "reject", "cancelled", "canceled",
-                    ]):
-                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
-                    if any(x in v for x in ["approved", "approve", "pass", "qa approved", "satisfied"]):
-                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
-                    if any(x in v for x in ["rework", "re-work", "followup", "follow up", "pending"]):
-                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
-
-                # ----------------------------- WELCOME ----------------------
-                if kind == "welcome":
-                    # Exact/common CRM values: Done = green, Cancel = red.
-                    if any(x in v for x in [
-                        "welcome approved", "welcome: approved", "approved", "welcome done",
-                        "done", "completed", "complete", "pass", "satisfied",
-                    ]):
-                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
-                    if any(x in v for x in [
-                        "welcome followup", "welcome follow-up", "followup", "follow up",
-                        "pending", "ringing", "chasing", "paperwork", "other work",
-                    ]):
-                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
-                    if any(x in v for x in [
-                        "welcome rejected", "rejected", "reject", "cancelled", "canceled",
-                        "cancel",
-                    ]):
-                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
-
-                # --------------------------- CONFIRMATION -------------------
-                if kind == "confirmation":
-                    if any(x in v for x in [
-                        "confirmation approved", "approved", "confirmed", "satisfied",
-                    ]):
-                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
-                    if any(x in v for x in [
-                        "confirmation followup", "confirmation follow-up", "followup", "follow up",
-                        "pending", "ringing", "chasing",
-                    ]):
-                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
-                    if any(x in v for x in [
-                        "confirmation rejected", "rejected", "reject", "cancelled", "canceled",
-                        "to be cancelled", "to be canceled",
-                    ]):
-                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
-
-                # -------------------------- PROVISIONING --------------------
-                if kind == "provisioning":
-                    # Explicit CRM values requested: Connectivity: Committed
-                    # and Connectivity: Order Cancelled.
-                    if "connectivity: order cancelled" in v or "connectivity: order canceled" in v:
-                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
-                    if "connectivity: committed" in v:
-                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
-                    if any(x in v for x in [
-                        "provisioned", "provisioning complete", "order completed", "completed",
-                        "processed", "confirmed", "connected", "live",
-                    ]):
-                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
-                    if any(x in v for x in [
-                        "pending", "followup", "follow-up", "delay", "delayed", "in progress",
-                        "other work", "potential opportunity", "committed",
-                    ]):
-                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
-                    if any(x in v for x in [
-                        "order cancelled", "order canceled", "cancelled", "canceled", "rejected", "reject",
-                    ]):
-                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
-
-                # ------------------------------ LETTER ----------------------
-                if kind == "letter":
-                    if any(x in v for x in ["letter sent", "mail sent", "dispatched", "dispatch approved", "sent"]):
-                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
-                    if any(x in v for x in ["pending", "followup", "follow-up", "re-sent", "resend"]):
-                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
-                    if any(x in v for x in ["cancelled", "canceled", "rejected", "reject"]):
-                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
-
-                # ------------------------------ LIVE ------------------------
-                if kind == "portal":
-                    # Missed / Delayed are operational attention statuses.
-                    if any(x in v for x in ["missed", "delayed", "delay"]):
-                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
-                    if "live" in v:
-                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
-                    if any(x in v for x in ["committed", "pending", "followup", "follow-up"]):
-                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
-                    if any(x in v for x in ["rejected", "reject", "cancelled", "canceled", "to be cancelled"]):
-                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
-
-                return ""
-
-            q_style = status_style(get_val("Quality Status"), "quality")
-            wc_style = status_style(get_val("Status"), "welcome")
-            letter_style = status_style(get_val("LetterStatus"), "letter")
-            prov_style = status_style(get_val("Provisioning Status"), "provisioning")
-            call_style = status_style(get_val("CallStatus"), "confirmation")
-            portal_style = status_style(get_val("Portal Status"), "portal")
-
-            for i, col_tuple in enumerate(row.index):
-                col = col_tuple[1] if isinstance(col_tuple, tuple) and len(col_tuple) > 1 else str(col_tuple)
-                current_style = ""
-
-                # Status + its directly related detail/remarks cell use the
-                # same colour, so the row's status context is immediately clear.
-                # The status cell remains the primary source of the colour.
-                style_by_col = {
-                    "Quality Status": q_style,
-                    "Quality Remarks": q_style,
-                    "Status": wc_style,
-                    "Welcome call Remarks": wc_style,
-                    "LetterStatus": letter_style,
-                    "Provisioning Status": prov_style,
-                    "Provisioning Remarks": prov_style,
-                    "CallStatus": call_style,
-                    "Comments": call_style,
-                    "Portal Status": portal_style,
-                }
-                current_style = style_by_col.get(col, "")
-
-                # Keep the established separators/layout accents.
-                if col == "S.No.":
-                    current_style += "border-left:3px solid #2563EB;"
-                if col in [
-                    "Customer Name",
-                    "Quality Remarks",
-                    "Welcome call Remarks",
-                    "Provisioning Remarks",
-                    "Cancellation Reason",
-                ]:
-                    current_style += "border-right:3px solid #E2E8F0;"
-
-                styles[i] = current_style
-
-            return styles
-
-        styled_log = display_df_page.style.apply(style_log_row, axis=1)
-        st.dataframe(
-            styled_log,
-            use_container_width=True,
-            hide_index=True,
-            height=545,
+        advisor_summary["SPD"] = np.where(
+            advisor_summary["PRESENT DAYS"] > 0,
+            advisor_summary["Applications"] / advisor_summary["PRESENT DAYS"],
+            0.0,
         )
 
-        # Pagination controls
-        if row_limit != "All" and total_pages > 1:
-            st.write("")
-            pag_col1, pag_col2, pag_col3 = st.columns([1.5, 1.0, 1.5])
-            with pag_col1:
-                st.html(
-                    f'<div style="color:#64748B;font-size:.72rem;padding-top:9px;">Showing <b>{start_idx + 1}</b>–<b>{end_idx}</b> of <b>{total_records}</b> entries</div>'
-                )
-            with pag_col2:
-                st.html(
-                    f'<div style="color:#64748B;font-size:.72rem;text-align:center;padding-top:9px;">Page <b>{st.session_state.current_page}</b> of <b>{total_pages}</b></div>'
-                )
-            with pag_col3:
-                p1, p2 = st.columns(2)
-                with p1:
-                    if st.button(
-                        "← Prev",
-                        disabled=(st.session_state.current_page == 1),
-                        use_container_width=True,
-                        key="prev_pg_action",
-                    ):
-                        st.session_state.current_page -= 1
-                        st.rerun()
-                with p2:
-                    if st.button(
-                        "Next →",
-                        disabled=(st.session_state.current_page == total_pages),
-                        use_container_width=True,
-                        key="next_pg_action",
-                    ):
-                        st.session_state.current_page += 1
-                        st.rerun()
-    else:
-        st.info("No applications are available for this agent.")
+        advisor_summary["QA Pass Rate % Val"] = ((advisor_summary["QA_Approved"] / advisor_summary["Applications"].replace(0, np.nan)) * 100).fillna(0.0)
+        advisor_summary["Welcome Done % Val"] = ((advisor_summary["Welcome_Done"] / advisor_summary["Applications"].replace(0, np.nan)) * 100).fillna(0.0)
+        advisor_summary["Live Conversion % Val"] = ((advisor_summary["Live"] / advisor_summary["Applications"].replace(0, np.nan)) * 100).fillna(0.0)
 
-    # ------------------------------------------------------------------------
-    # PERFORMANCE TIPS — ORIGINAL CONTENT RETAINED
-    # ------------------------------------------------------------------------
-    st.divider()
-    render_section("Disposition & data quality guidance", "!", "Reference guidance for accurate call outcomes")
-    st.html(
+        advisor_summary["PROJECTED LIVE"] = (
+            advisor_summary["Live"]
+            + advisor_summary["Committed"] * committed_frac
+            + advisor_summary["Welcome_Pending"] * welcome_pending_frac
+            + advisor_summary["QA_Pending"] * quality_pending_frac
+        ).round().astype(int)
+
+        advisor_summary["Projected Live % Val"] = (
+            (advisor_summary["PROJECTED LIVE"] / advisor_summary["Applications"].replace(0, np.nan)) * 100
+        ).fillna(0.0)
+
+        # 4. Rename columns to match display standards
+        advisor_summary = advisor_summary.rename(columns={
+            "Advisor": "SALES EXECUTIVE",
+            "Applications": "APPLICATIONS",
+            "QA_Approved": "QA APPROVED",
+            "QA_Rework": "QA REWORK",
+            "QA_Cancelled": "QA CANCELLED",
+            "QA_Pending": "QA PENDING",
+            "Welcome_Done": "WELCOME DONE",
+            "Welcome_Cancelled": "WELCOME CANCELLED",
+            "Welcome_Pending": "WELCOME PENDING",
+            "Committed": "COMMITTED REM.",
+            "Live": "LIVE",
+            "Live_Cancelled": "LIVE CANCELLED",
+        })
+
+        advisor_summary["SALES EXECUTIVE"] = advisor_summary["SALES EXECUTIVE"].replace("", "Unassigned").fillna("Unassigned")
+        advisor_summary = advisor_summary.sort_values(by="APPLICATIONS", ascending=False)
+
+        # Build per-advisor raw breakdown tooltips once (use master_df as source)
+        advisor_tooltip_mapping = {
+            "QA APPROVED": ("Quality Status", "Quality Status Clean", "Approved"),
+            "QA REWORK": ("Quality Status", "Quality Status Clean", "Rework"),
+            "QA CANCELLED": ("Quality Status", "Quality Status Clean", "Cancelled"),
+            "QA PENDING": ("Quality Status", "Quality Status Clean", "Pending"),
+            "WELCOME DONE": ("Welcome Status", "Welcome Status Clean", "Done"),
+            "WELCOME CANCELLED": ("Welcome Status", "Welcome Status Clean", "Cancelled"),
+            "WELCOME PENDING": ("Welcome Status", "Welcome Status Clean", "Pending"),
+            "COMMITTED REM.": ("Portal Status", "Portal Status Clean", "Committed"),
+            "LIVE": ("Portal Status", "Portal Status Clean", "Live"),
+            "LIVE CANCELLED": ("Portal Status", "Portal Status Clean", "Cancelled"),
+        }
+
+        raw_tooltips = {}
+        # Pre-normalize advisor column in master_df for matching
+        master_df["_advisor_norm"] = master_df["Advisor"].fillna("").astype(str).str.strip().str.lower()
+        for _, r in advisor_summary.iterrows():
+            adv_display = str(r["SALES EXECUTIVE"])
+            adv_norm = adv_display.strip().lower()
+            subset = master_df[master_df["_advisor_norm"] == adv_norm]
+            adv_tooltips = {}
+            for k, (raw_col, clean_col, target_val) in advisor_tooltip_mapping.items():
+                adv_tooltips[k] = format_raw_breakdown(subset, raw_col, clean_col, target_val)
+            # Add projection tooltip for this advisor
+            adv_proj_tooltip = (
+                f"Formula: Live + ({committed_pct_input}% × Committed) + "
+                f"({welcome_pending_pct_input}% × Welcome Pending) + ({quality_pending_pct_input}% × QA Pending)\n"
+                f"Components:\nLive: {int(r.get('LIVE',0))}\nCommitted: {int(r.get('COMMITTED REM.',0))}\n"
+                f"Welcome Pending: {int(r.get('WELCOME PENDING',0))}\nQA Pending: {int(r.get('QA PENDING',0))}\n"
+                f"Projected (rounded): {int(r.get('PROJECTED LIVE',0))}"
+            )
+            adv_tooltips["PROJECTED LIVE"] = adv_proj_tooltip
+            raw_tooltips[adv_display] = adv_tooltips
+        # drop the helper column
+        master_df.drop(columns=["_advisor_norm"], inplace=True, errors=True)
+
+        numeric_cols = {
+            "APPLICATIONS", "WORKING DAYS", "PRESENT DAYS", "SPD", "QA APPROVED", "QA REWORK", "QA CANCELLED", "QA PENDING",
+            "WELCOME DONE", "WELCOME CANCELLED", "WELCOME PENDING", "COMMITTED REM.", "LIVE", "LIVE CANCELLED", "PROJECTED LIVE"
+        }
+
+        base_col_order = [
+            "SALES EXECUTIVE", "APPLICATIONS", "WORKING DAYS", "PRESENT DAYS", "SPD", "QA APPROVED", "QA Pass Rate %",
+            "QA REWORK", "QA CANCELLED", "QA PENDING", "WELCOME DONE", "Welcome Done %",
+            "WELCOME CANCELLED", "WELCOME PENDING", "COMMITTED REM.",
+            "LIVE", "Live Conversion %", "PROJECTED LIVE", "Projected Live %", "LIVE CANCELLED"
+        ]
+
+        visible_cols = ["SALES EXECUTIVE"]
+        for col in base_col_order[1:]:
+            if col in numeric_cols:
+                if (advisor_summary.get(col, pd.Series(dtype=int)) > 0).any():
+                    visible_cols.append(col)
+            elif col == "QA Pass Rate %":
+                if "QA APPROVED" in visible_cols:
+                    visible_cols.append(col)
+            elif col == "Welcome Done %":
+                if "WELCOME DONE" in visible_cols:
+                    visible_cols.append(col)
+            elif col == "Live Conversion %":
+                if "LIVE" in visible_cols:
+                    visible_cols.append(col)
+            elif col == "Projected Live %":
+                if "PROJECTED LIVE" in visible_cols:
+                    visible_cols.append(col)
+
+        def render_qa_pill(v):
+            if v >= 75.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#d1fae5; color:#047857; border:1px solid #a7f3d0; border-radius:8px; padding:3px 12px; font-weight:700;">{v:.1f}%</span>'
+            if v >= 51.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#fef3c7;color:#b45309;border:1px solid #fde68a;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            return f'<span data-sort="{v:.6f}" style="background-color:#ffe4e6;color:#be123c;border:1px solid #fecdd3;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+
+        def render_welcome_pill(v):
+            if v >= 61.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#d1fae5;color:#047857;border:1px solid #a7f3d0;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            if v >= 51.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#fef3c7;color:#b45309;border:1px solid #fde68a;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            return f'<span data-sort="{v:.6f}" style="background-color:#ffe4e6;color:#be123c;border:1px solid #fecdd3;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+
+        def render_live_pill(v):
+            if v >= 41.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#d1fae5;color:#047857;border:1px solid #a7f3d0;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            if v >= 21.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#fef3c7;color:#b45309;border:1px solid #fde68a;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            return f'<span data-sort="{v:.6f}" style="background-color:#ffe4e6;color:#be123c;border:1px solid #fecdd3;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+
+        header_styles = {
+            "SALES EXECUTIVE": "background-color:#f1f5f9;color:#334155;",
+            "APPLICATIONS": "background-color:#eff6ff;color:#1e40af;",
+            "WORKING DAYS": "background-color:#f8fafc;color:#475569;",
+            "PRESENT DAYS": "background-color:#f0fdfa;color:#0f766e;",
+            "SPD": "background-color:#e0f2fe;color:#0369a1;",
+            "QA APPROVED": "background-color:#f0fdf4;color:#15803d;",
+            "QA Pass Rate %": "background-color:#f0fdf4;color:#15803d;",
+            "QA REWORK": "background-color:#fefce8;color:#a16207;",
+            "QA CANCELLED": "background-color:#fef2f2;color:#b91c1c;",
+            "QA PENDING": "background-color:#fff7ed;color:#c2410c;",
+            "WELCOME DONE": "background-color:#f0fdf4;color:#15803d;",
+            "Welcome Done %": "background-color:#f0fdf4;color:#15803d;",
+            "WELCOME CANCELLED": "background-color:#fef2f2;color:#b91c1c;",
+            "WELCOME PENDING": "background-color:#fefce8;color:#a16207;",
+            "COMMITTED REM.": "background-color:#fff7ed;color:#c2410c;",
+            "LIVE": "background-color:#f0fdfa;color:#0f766e;",
+            "LIVE CANCELLED": "background-color:#fef2f2;color:#b91c1c;",
+            "PROJECTED LIVE": "background-color:#eef2ff;color:#3730a3;",
+            "Projected Live %": "background-color:#eef2ff;color:#3730a3;",
+            "Live Conversion %": "background-color:#f0fdfa;color:#0f766e;",
+        }
+
+        # Compute totals across visible advisors for numeric columns
+        totals_series = advisor_summary[[c for c in advisor_summary.columns if c in numeric_cols]].sum(numeric_only=True)
+        total_apps = int(totals_series.get("APPLICATIONS", 0))
+        total_working_days = float(
+            advisor_summary["WORKING DAYS"].sum()
+            if "WORKING DAYS" in advisor_summary.columns
+            else 0.0
+        )
+        total_present_days = float(
+            advisor_summary["PRESENT DAYS"].sum()
+            if "PRESENT DAYS" in advisor_summary.columns
+            else 0.0
+        )
+        total_spd = (
+            total_apps / total_present_days
+            if total_present_days > 0
+            else 0.0
+        )
+        total_qa_approved = int(totals_series.get("QA APPROVED", 0))
+        total_welcome_done = int(totals_series.get("WELCOME DONE", 0))
+        total_live = int(totals_series.get("LIVE", 0))
+
+        # totals percentages (overall)
+        total_qa_pass_pct = (total_qa_approved / total_apps * 100) if total_apps > 0 else 0.0
+        total_welcome_pct = (total_welcome_done / total_apps * 100) if total_apps > 0 else 0.0
+        total_live_pct = (total_live / total_apps * 100) if total_apps > 0 else 0.0
+
+        # totals tooltips using filtered master_df
+        totals_tooltips = {}
+        for k, (raw_col, clean_col, target_val) in advisor_tooltip_mapping.items():
+            totals_tooltips[k] = format_raw_breakdown(master_df, raw_col, clean_col, target_val)
+        # totals projection tooltip
+        totals_tooltips["PROJECTED LIVE"] = (
+            f"Aggregate projection using weights: {committed_pct_input}% committed, "
+            f"{welcome_pending_pct_input}% welcome pending, {quality_pending_pct_input}% quality pending"
+        )
+
+        # Build advisor HTML table (use components.html to allow JS)
+        advisor_table_id = "advisor-perf-table"
+        advisor_table_height = min(900, max(240, 90 + len(advisor_summary) * 45))
+        adv_html = f'''
+        <style>
+          .perf-table-container {{
+            width:100%;
+            border:1px solid #e2e8f0;
+            border-radius:8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+            margin-bottom:16px;
+            max-height:{advisor_table_height}px;
+            overflow:auto;
+          }}
+          table.perf-table {{
+            width:100%;
+            border-collapse:collapse;
+            font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;
+            font-size:0.88rem;
+            background:#fff;
+          }}
+          table.perf-table th {{
+            padding:10px 12px;
+            font-weight:800;
+            font-size:0.78rem;
+            text-transform:uppercase;
+            border-bottom:2px solid #e2e8f0;
+            position:sticky;
+            top:0;
+            z-index:5;
+            background:#fff;
+            cursor:pointer;
+          }}
+          table.perf-table td {{
+            padding:8px 12px;
+            border-bottom:1px solid #f1f5f9;
+          }}
+          table.perf-table td:first-child {{
+            text-align:left;
+            font-weight:700;
+            color:#0f172a;
+          }}
+          .tag{{padding:2px 6px;border-radius:6px;font-weight:700;margin-left:6px;font-size:0.68rem;display:inline-block;vertical-align:middle;}}
+          .new{{background:#ede9fe;color:#6d28d9;}} .cs{{background:#e0f2fe;color:#0369a1;}} .left{{background:#fee2e2;color:#991b1b;}}
+          .totals-row{{font-weight:800;background-color:#f8fafc;}}
+        </style>
+        <div class="perf-table-container">
+          <table id="{advisor_table_id}" class="perf-table">
+            <thead><tr>
+        '''
+        for c in visible_cols:
+            style = header_styles.get(c, "background-color:#f8fafc;color:#475569;")
+            adv_html += f'<th style="{style}">{c}</th>'
+        adv_html += '</tr></thead><tbody>'
+
+        for _, r in advisor_summary.iterrows():
+            adv_display = str(r["SALES EXECUTIVE"])
+            adv_tooltips_local = raw_tooltips.get(adv_display, {})
+            adv_html += "<tr>"
+            for c in visible_cols:
+                if c == "SALES EXECUTIVE":
+                    name = escape(str(r[c]))
+                    lname = name.strip().lower()
+                    tags_html = ""
+                    if lname in NEW_ADVISORS_SET:
+                        tags_html += '<span class="tag new">New</span>'
+                    if lname in CS_ADVISORS_SET:
+                        tags_html += '<span class="tag cs">Customer Service</span>'
+                    if lname in LEFT_ADVISORS_SET:
+                        tags_html += '<span class="tag left">Left</span>'
+                    adv_html += f"<td data-sort=\"{escape(name)}\">{name}{tags_html}</td>"
+                elif c in {"WORKING DAYS", "PRESENT DAYS"}:
+                    val = float(r.get(c, 0.0) or 0.0)
+                    formatted = "-" if val <= 0 else (f"{val:.1f}" if abs(val - round(val)) > 1e-9 else f"{int(round(val)):,}")
+                    adv_html += f'<td data-sort="{val:.6f}">{formatted}</td>'
+                elif c == "SPD":
+                    val = float(r.get("SPD", 0.0) or 0.0)
+                    formatted = "-" if val <= 0 else f"{val:.2f}"
+                    adv_html += f'<td data-sort="{val:.6f}">{formatted}</td>'
+                elif c == "QA Pass Rate %":
+                    val = float(r["QA Pass Rate % Val"])
+                    raw_text = adv_tooltips_local.get("QA APPROVED", "")
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val:.6f}" title="{tooltip_html}" style="cursor:help;">{render_qa_pill(val)}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val:.6f}">{render_qa_pill(val)}</td>'
+                elif c == "Welcome Done %":
+                    val = float(r["Welcome Done % Val"])
+                    raw_text = adv_tooltips_local.get("WELCOME DONE", "")
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val:.6f}" title="{tooltip_html}" style="cursor:help;">{render_welcome_pill(val)}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val:.6f}">{render_welcome_pill(val)}</td>'
+                elif c == "Live Conversion %":
+                    val = float(r["Live Conversion % Val"])
+                    raw_text = adv_tooltips_local.get("LIVE", "")
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val:.6f}" title="{tooltip_html}" style="cursor:help;">{render_live_pill(val)}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val:.6f}">{render_live_pill(val)}</td>'
+                elif c == "PROJECTED LIVE":
+                    val = int(r.get("PROJECTED LIVE", 0))
+                    raw_text = adv_tooltips_local.get("PROJECTED LIVE", "")
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val}" title="{tooltip_html}" style="cursor:help;">{val:,}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val}">{val:,}</td>'
+                elif c == "Projected Live %":
+                    val = float(r.get("Projected Live % Val", 0.0))
+                    raw_text = adv_tooltips_local.get("PROJECTED LIVE", "")
+                    pill_html = render_live_pill(val)
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val:.6f}" title="{tooltip_html}" style="cursor:help;">{pill_html}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val:.6f}">{pill_html}</td>'
+                else:
+                    val = r.get(c)
+                    raw_text = adv_tooltips_local.get(c, "")
+                    if isinstance(val, (int, np.integer)):
+                        formatted_val = "-" if int(val) == 0 else f"{int(val):,}"
+                        if raw_text and int(val) != 0:
+                            tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                            adv_html += f'<td data-sort="{int(val)}" title="{tooltip_html}" style="cursor:help;">{formatted_val}</td>'
+                        else:
+                            adv_html += f'<td data-sort="{int(val)}">{formatted_val}</td>'
+                    else:
+                        formatted_val = "-" if (val == 0 or pd.isna(val)) else escape(str(val))
+                        if raw_text and str(val) not in ("0", "-", ""):
+                            tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                            adv_html += f'<td data-sort="{escape(str(val))}" title="{tooltip_html}" style="cursor:help;">{formatted_val}</td>'
+                        else:
+                            adv_html += f'<td data-sort="{escape(str(val))}">{formatted_val}</td>'
+            adv_html += "</tr>"
+
+        # totals row
+        adv_html += '<tr class="totals-row">'
+        for c in visible_cols:
+            if c == "SALES EXECUTIVE":
+                adv_html += "<td data-sort='Total'>Total</td>"
+            elif c == "WORKING DAYS":
+                formatted = "-" if total_working_days <= 0 else (f"{total_working_days:.1f}" if abs(total_working_days - round(total_working_days)) > 1e-9 else f"{int(round(total_working_days)):,}")
+                adv_html += f'<td data-sort="{total_working_days:.6f}">{formatted}</td>'
+            elif c == "PRESENT DAYS":
+                formatted = "-" if total_present_days <= 0 else (f"{total_present_days:.1f}" if abs(total_present_days - round(total_present_days)) > 1e-9 else f"{int(round(total_present_days)):,}")
+                adv_html += f'<td data-sort="{total_present_days:.6f}">{formatted}</td>'
+            elif c == "SPD":
+                formatted = "-" if total_spd <= 0 else f"{total_spd:.2f}"
+                adv_html += f'<td data-sort="{total_spd:.6f}">{formatted}</td>'
+            elif c == "QA Pass Rate %":
+                adv_html += f'<td data-sort="{total_qa_pass_pct:.6f}">' + f'{render_qa_pill(total_qa_pass_pct)}</td>'
+            elif c == "Welcome Done %":
+                adv_html += f'<td data-sort="{total_welcome_pct:.6f}">' + f'{render_welcome_pill(total_welcome_pct)}</td>'
+            elif c == "Live Conversion %":
+                adv_html += f'<td data-sort="{total_live_pct:.6f}">' + f'{render_live_pill(total_live_pct)}</td>'
+            elif c == "PROJECTED LIVE":
+                tot_proj = int(round(
+                    advisor_summary["PROJECTED LIVE"].sum()
+                ))
+                tooltip_text = totals_tooltips.get("PROJECTED LIVE", "")
+                if tooltip_text and tot_proj != 0:
+                    tooltip_html = escape(str(tooltip_text)).replace("\n", "&#10;")
+                    adv_html += f'<td data-sort="{tot_proj}" title="{tooltip_html}" style="cursor:help;">{tot_proj:,}</td>'
+                else:
+                    adv_html += f'<td data-sort="{tot_proj}">{tot_proj:,}</td>'
+            elif c == "Projected Live %":
+                tot_proj_pct = ( (advisor_summary["PROJECTED LIVE"].sum() / totals_series.get("APPLICATIONS", 1)) * 100 ) if totals_series.get("APPLICATIONS",0) > 0 else 0.0
+                adv_html += f'<td data-sort="{tot_proj_pct:.6f}">'+f'{render_live_pill(tot_proj_pct)}</td>'
+            else:
+                if c in numeric_cols:
+                    tot_val = int(totals_series.get(c, 0))
+                    formatted = "-" if tot_val == 0 else f"{tot_val:,}"
+                    tooltip_text = totals_tooltips.get(c, "")
+                    if tooltip_text and tot_val != 0:
+                        tooltip_html = escape(str(tooltip_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{tot_val}" title="{tooltip_html}" style="cursor:help;">{formatted}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{tot_val}">{formatted}</td>'
+                else:
+                    adv_html += "<td data-sort='-'>-</td>"
+        adv_html += "</tr>"
+
+        adv_html += "</tbody></table></div>"
+
+        # Sorting JS for advisor table; keeps totals-row at bottom
+        adv_html += f"""
+        <script>
+        (function() {{
+          function makeSortable(tableId) {{
+            const table = document.getElementById(tableId);
+            if(!table) return;
+            const tbody = table.tBodies[0];
+            const headers = table.querySelectorAll('th');
+            headers.forEach((th, index) => {{
+              th.addEventListener('click', () => {{
+                const current = th.getAttribute('data-order') || 'desc';
+                const newOrder = current === 'asc' ? 'desc' : 'asc';
+                headers.forEach(h => h.removeAttribute('data-order'));
+                th.setAttribute('data-order', newOrder);
+                const rows = Array.from(tbody.querySelectorAll('tr')).filter(r => !r.classList.contains('totals-row'));
+                rows.sort((a,b) => {{
+                  const aCell = a.children[index];
+                  const bCell = b.children[index];
+                  const aVal = aCell ? (aCell.getAttribute('data-sort') || aCell.innerText) : '';
+                  const bVal = bCell ? (bCell.getAttribute('data-sort') || bCell.innerText) : '';
+                  const aNum = parseFloat(aVal.toString().replace(/,/g,'')); 
+                  const bNum = parseFloat(bVal.toString().replace(/,/g,''));
+                  if(!isNaN(aNum) && !isNaN(bNum)) {{
+                    return newOrder === 'asc' ? aNum - bNum : bNum - aNum;
+                  }}
+                  return newOrder === 'asc' ? aVal.toString().localeCompare(bVal.toString()) : bVal.toString().localeCompare(aVal.toString());
+                }});
+                rows.forEach(r => tbody.appendChild(r));
+                const totals = tbody.querySelector('tr.totals-row');
+                if(totals) tbody.appendChild(totals);
+              }});
+            }});
+          }}
+          makeSortable("{advisor_table_id}");
+        }})();
+        </script>
         """
-        <div class="tips-box">
-            <div class="tips-title">💡 Performance Tips: Correct Call Dispositions and Data Quality</div>
-            <ul class="tips-list">
-                <li><b>Answering Machines:</b> Do not dispose active customer connections as an "Answering Machine" especially if the Customer Talk Time/connectivity exceeds 30 seconds. Use it primarily when you hear a pre-recorded Answering Machine/Voicemail message.</li>
-                <li><b>Customer Hangup:</b> This disposition should be used when the customer abruptly hangsup. Should be used for active/connected customers.</li>
-                <li><b>No Answer:</b> Dispose as "No Answer" only if the customer does not pick up the call.</li>
-                <li><b>Sky TV packages/Virgin:</b> Any call which indicates an error on the Talk-Talk portal, should be disposed as "Sky TV packages" or "Virgin". They must not be disposed as Answering Machines, Customer Hangup, No Answer, Not Interested etc. These dispositions would reappear in the dialler, and would dilute the quality of the data severely as the probability of the application of these customers is pretty low.</li>
-                <li><b>Wrong Number:</b> Dispose them as "Wrong Number" if there is a mismatch in the data on the dialler and the data provided by the customer.</li>
-                <li><b>Family Interference/POA:</b> Dispose as Family Interference/POA, if a family member or a 3rd person takes care of the customer's finances or other decisions.</li>
-                <li><b>Dementia:</b> Dispose as Dementia, if the customer seems to have Dementia (seems forgetful of basic details), or seems Vulnerable.</li>
-                <li><b>Over Age:</b> Dispose as Over Age if the customer is over 85 years old, or was born before 1940.</li>
-                <li><b>Mobile Number:</b> Any number beginning with "7" should be disposed as a Mobile Number.</li>
-                <li><b>Social Alarm VOIP:</b> If a customer has a Social Alarm/Medical Alarm/Careline/Lifeline etc, then use the disposition "Social Alarm VOIP".</li>
-                <li><b>Hang up on bank details:</b> Use this disposition if the customer disconnects when hearing of or attempting any financial details.</li>
-                <li><b>Busy:</b> If the customer is busy.</li>
-                <br>
-                <li><b>🚫 Dispositions that WILL NOT reappear in the dialler (if processed correctly):</b>
-                    <ul>
-                        <li>Dementia</li>
-                        <li>Family Interference / POA</li>
-                        <li>Sky TV Packages / Virgin</li>
-                        <li>Over Age</li>
-                    </ul>
-                </li>
-                <br>
-                <li><b>🔄 Dispositions that WILL reappear frequently on the dialler:</b>
-                    <ul>
-                        <li>Answering Machine</li>
-                        <li>Customer Hangup</li>
-                        <li>Interested</li>
-                        <li>Callback</li>
-                    </ul>
-                </li>
-                <br>
-                <li><u><b>Data Accuracy and Quality: The more accurate the disposition you enter, the better quality of the data would appear on the dialler for the entire team.</b></u></li>
-            </ul>
-        </div>
-        """,
+        components.html(adv_html, height=advisor_table_height, scrolling=False)
+elif selected_performance_table == "👥 Sales Executive Performance Breakdown":
+    st.info("No sales records available for the selected date or month filter.")
+
+
+# ==========================================================
+# 🧪 QUALITY OFFICER PERFORMANCE (same performance layout and KPI calculations)
+# Add PROJECTED LIVE and Projected Live % to performance summary
+# ==========================================================
+if selected_performance_table == "🧪 Quality Officer Performance":
+    st.divider()
+    st.subheader("🧪 Quality Officer Performance")
+
+if selected_performance_table == "🧪 Quality Officer Performance" and "Quality Officer" in master_df.columns and not master_df.empty:
+    advisor_summary = (
+        master_df.groupby("Quality Officer", dropna=False)
+            .agg(
+                Applications=("Quality Officer", "count"),
+                QA_Approved=("Quality Status Clean", lambda x: (x == "Approved").sum()),
+                QA_Rework=("Quality Status Clean", lambda x: (x == "Rework").sum()),
+                QA_Cancelled=("Quality Status Clean", lambda x: (x == "Cancelled").sum()),
+                QA_Pending=("Quality Status Clean", lambda x: (x == "Pending").sum()),
+                Welcome_Done=("Welcome Status Clean", lambda x: (x == "Done").sum()),
+                Welcome_Cancelled=("Welcome Status Clean", lambda x: (x == "Cancelled").sum()),
+                Welcome_Pending=("Welcome Status Clean", lambda x: (x == "Pending").sum()),
+                Committed=("Portal Status Clean", lambda x: (x == "Committed").sum()),
+                Live=("Portal Status Clean", lambda x: (x == "Live").sum()),
+                Live_Cancelled=("Portal Status Clean", lambda x: (x == "Cancelled").sum()),
+            )
+            .reset_index()
     )
 
-    st.html(
-        '<div class="footer-note">Sparta Agent Portal • Legacy records through 17-Sep-2026 remain sourced from Sparta/Sparta2; records from 18-Sep-2026 onward are sourced from the CRM mirror.</div>',
+    if advisor_summary.empty:
+        st.info("No sales records match the selected tag filters.")
+    else:
+        advisor_summary["QA Pass Rate % Val"] = ((advisor_summary["QA_Approved"] / advisor_summary["Applications"].replace(0, np.nan)) * 100).fillna(0.0)
+        advisor_summary["Welcome Done % Val"] = ((advisor_summary["Welcome_Done"] / advisor_summary["Applications"].replace(0, np.nan)) * 100).fillna(0.0)
+        advisor_summary["Live Conversion % Val"] = ((advisor_summary["Live"] / advisor_summary["Applications"].replace(0, np.nan)) * 100).fillna(0.0)
+
+        advisor_summary["PROJECTED LIVE"] = (
+            advisor_summary["Live"]
+            + advisor_summary["Committed"] * committed_frac
+            + advisor_summary["Welcome_Pending"] * welcome_pending_frac
+            + advisor_summary["QA_Pending"] * quality_pending_frac
+        ).round().astype(int)
+
+        advisor_summary["Projected Live % Val"] = (
+            (advisor_summary["PROJECTED LIVE"] / advisor_summary["Applications"].replace(0, np.nan)) * 100
+        ).fillna(0.0)
+
+        # 4. Rename columns to match display standards
+        advisor_summary = advisor_summary.rename(columns={
+            "Quality Officer": "Quality Officer",
+            "Applications": "APPLICATIONS",
+            "QA_Approved": "QA APPROVED",
+            "QA_Rework": "QA REWORK",
+            "QA_Cancelled": "QA CANCELLED",
+            "QA_Pending": "QA PENDING",
+            "Welcome_Done": "WELCOME DONE",
+            "Welcome_Cancelled": "WELCOME CANCELLED",
+            "Welcome_Pending": "WELCOME PENDING",
+            "Committed": "COMMITTED REM.",
+            "Live": "LIVE",
+            "Live_Cancelled": "LIVE CANCELLED",
+        })
+
+        advisor_summary["Quality Officer"] = advisor_summary["Quality Officer"].replace("", "Unassigned").fillna("Unassigned")
+        advisor_summary = advisor_summary.sort_values(by="APPLICATIONS", ascending=False)
+
+        # Build per-advisor raw breakdown tooltips once (use master_df as source)
+        advisor_tooltip_mapping = {
+            "QA APPROVED": ("Quality Status", "Quality Status Clean", "Approved"),
+            "QA REWORK": ("Quality Status", "Quality Status Clean", "Rework"),
+            "QA CANCELLED": ("Quality Status", "Quality Status Clean", "Cancelled"),
+            "QA PENDING": ("Quality Status", "Quality Status Clean", "Pending"),
+            "WELCOME DONE": ("Welcome Status", "Welcome Status Clean", "Done"),
+            "WELCOME CANCELLED": ("Welcome Status", "Welcome Status Clean", "Cancelled"),
+            "WELCOME PENDING": ("Welcome Status", "Welcome Status Clean", "Pending"),
+            "COMMITTED REM.": ("Portal Status", "Portal Status Clean", "Committed"),
+            "LIVE": ("Portal Status", "Portal Status Clean", "Live"),
+            "LIVE CANCELLED": ("Portal Status", "Portal Status Clean", "Cancelled"),
+        }
+
+        raw_tooltips = {}
+        # Pre-normalize advisor column in master_df for matching
+        master_df["_advisor_norm"] = master_df["Quality Officer"].fillna("").astype(str).str.strip().str.lower()
+        for _, r in advisor_summary.iterrows():
+            adv_display = str(r["Quality Officer"])
+            adv_norm = adv_display.strip().lower()
+            subset = master_df[master_df["_advisor_norm"] == adv_norm]
+            adv_tooltips = {}
+            for k, (raw_col, clean_col, target_val) in advisor_tooltip_mapping.items():
+                adv_tooltips[k] = format_raw_breakdown(subset, raw_col, clean_col, target_val)
+            # Add projection tooltip for this advisor
+            adv_proj_tooltip = (
+                f"Formula: Live + ({committed_pct_input}% × Committed) + "
+                f"({welcome_pending_pct_input}% × Welcome Pending) + ({quality_pending_pct_input}% × QA Pending)\n"
+                f"Components:\nLive: {int(r.get('LIVE',0))}\nCommitted: {int(r.get('COMMITTED REM.',0))}\n"
+                f"Welcome Pending: {int(r.get('WELCOME PENDING',0))}\nQA Pending: {int(r.get('QA PENDING',0))}\n"
+                f"Projected (rounded): {int(r.get('PROJECTED LIVE',0))}"
+            )
+            adv_tooltips["PROJECTED LIVE"] = adv_proj_tooltip
+            raw_tooltips[adv_display] = adv_tooltips
+        # drop the helper column
+        master_df.drop(columns=["_advisor_norm"], inplace=True, errors=True)
+
+        numeric_cols = {
+            "APPLICATIONS", "QA APPROVED", "QA REWORK", "QA CANCELLED", "QA PENDING",
+            "WELCOME DONE", "WELCOME CANCELLED", "WELCOME PENDING", "COMMITTED REM.", "LIVE", "LIVE CANCELLED", "PROJECTED LIVE"
+        }
+
+        base_col_order = [
+            "Quality Officer", "APPLICATIONS", "QA APPROVED", "QA Pass Rate %",
+            "QA REWORK", "QA CANCELLED", "QA PENDING", "WELCOME DONE", "Welcome Done %",
+            "WELCOME CANCELLED", "WELCOME PENDING", "COMMITTED REM.",
+            "LIVE", "Live Conversion %", "PROJECTED LIVE", "Projected Live %", "LIVE CANCELLED"
+        ]
+
+        visible_cols = ["Quality Officer"]
+        for col in base_col_order[1:]:
+            if col in numeric_cols:
+                if (advisor_summary.get(col, pd.Series(dtype=int)) > 0).any():
+                    visible_cols.append(col)
+            elif col == "QA Pass Rate %":
+                if "QA APPROVED" in visible_cols:
+                    visible_cols.append(col)
+            elif col == "Welcome Done %":
+                if "WELCOME DONE" in visible_cols:
+                    visible_cols.append(col)
+            elif col == "Live Conversion %":
+                if "LIVE" in visible_cols:
+                    visible_cols.append(col)
+            elif col == "Projected Live %":
+                if "PROJECTED LIVE" in visible_cols:
+                    visible_cols.append(col)
+
+        def render_qa_pill(v):
+            if v >= 75.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#d1fae5; color:#047857; border:1px solid #a7f3d0; border-radius:8px; padding:3px 12px; font-weight:700;">{v:.1f}%</span>'
+            if v >= 51.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#fef3c7;color:#b45309;border:1px solid #fde68a;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            return f'<span data-sort="{v:.6f}" style="background-color:#ffe4e6;color:#be123c;border:1px solid #fecdd3;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+
+        def render_welcome_pill(v):
+            if v >= 61.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#d1fae5;color:#047857;border:1px solid #a7f3d0;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            if v >= 51.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#fef3c7;color:#b45309;border:1px solid #fde68a;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            return f'<span data-sort="{v:.6f}" style="background-color:#ffe4e6;color:#be123c;border:1px solid #fecdd3;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+
+        def render_live_pill(v):
+            if v >= 41.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#d1fae5;color:#047857;border:1px solid #a7f3d0;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            if v >= 21.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#fef3c7;color:#b45309;border:1px solid #fde68a;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            return f'<span data-sort="{v:.6f}" style="background-color:#ffe4e6;color:#be123c;border:1px solid #fecdd3;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+
+        header_styles = {
+            "Quality Officer": "background-color:#f1f5f9;color:#334155;",
+            "APPLICATIONS": "background-color:#eff6ff;color:#1e40af;",
+            "QA APPROVED": "background-color:#f0fdf4;color:#15803d;",
+            "QA Pass Rate %": "background-color:#f0fdf4;color:#15803d;",
+            "QA REWORK": "background-color:#fefce8;color:#a16207;",
+            "QA CANCELLED": "background-color:#fef2f2;color:#b91c1c;",
+            "QA PENDING": "background-color:#fff7ed;color:#c2410c;",
+            "WELCOME DONE": "background-color:#f0fdf4;color:#15803d;",
+            "Welcome Done %": "background-color:#f0fdf4;color:#15803d;",
+            "WELCOME CANCELLED": "background-color:#fef2f2;color:#b91c1c;",
+            "WELCOME PENDING": "background-color:#fefce8;color:#a16207;",
+            "COMMITTED REM.": "background-color:#fff7ed;color:#c2410c;",
+            "LIVE": "background-color:#f0fdfa;color:#0f766e;",
+            "LIVE CANCELLED": "background-color:#fef2f2;color:#b91c1c;",
+            "PROJECTED LIVE": "background-color:#eef2ff;color:#3730a3;",
+            "Projected Live %": "background-color:#eef2ff;color:#3730a3;",
+            "Live Conversion %": "background-color:#f0fdfa;color:#0f766e;",
+        }
+
+        # Compute totals across visible advisors for numeric columns
+        totals_series = advisor_summary[[c for c in advisor_summary.columns if c in numeric_cols]].sum(numeric_only=True)
+        total_apps = int(totals_series.get("APPLICATIONS", 0))
+        total_qa_approved = int(totals_series.get("QA APPROVED", 0))
+        total_welcome_done = int(totals_series.get("WELCOME DONE", 0))
+        total_live = int(totals_series.get("LIVE", 0))
+
+        # totals percentages (overall)
+        total_qa_pass_pct = (total_qa_approved / total_apps * 100) if total_apps > 0 else 0.0
+        total_welcome_pct = (total_welcome_done / total_apps * 100) if total_apps > 0 else 0.0
+        total_live_pct = (total_live / total_apps * 100) if total_apps > 0 else 0.0
+
+        # totals tooltips using filtered master_df
+        totals_tooltips = {}
+        for k, (raw_col, clean_col, target_val) in advisor_tooltip_mapping.items():
+            totals_tooltips[k] = format_raw_breakdown(master_df, raw_col, clean_col, target_val)
+        # totals projection tooltip
+        totals_tooltips["PROJECTED LIVE"] = (
+            f"Aggregate projection using weights: {committed_pct_input}% committed, "
+            f"{welcome_pending_pct_input}% welcome pending, {quality_pending_pct_input}% quality pending"
+        )
+
+        # Build advisor HTML table (use components.html to allow JS)
+        advisor_table_id = "quality-officer-perf-table"
+        advisor_table_height = min(900, max(240, 90 + len(advisor_summary) * 45))
+        adv_html = f'''
+        <style>
+          .perf-table-container {{
+            width:100%;
+            border:1px solid #e2e8f0;
+            border-radius:8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+            margin-bottom:16px;
+            max-height:{advisor_table_height}px;
+            overflow:auto;
+          }}
+          table.perf-table {{
+            width:100%;
+            border-collapse:collapse;
+            font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;
+            font-size:0.88rem;
+            background:#fff;
+          }}
+          table.perf-table th {{
+            padding:10px 12px;
+            font-weight:800;
+            font-size:0.78rem;
+            text-transform:uppercase;
+            border-bottom:2px solid #e2e8f0;
+            position:sticky;
+            top:0;
+            z-index:5;
+            background:#fff;
+            cursor:pointer;
+          }}
+          table.perf-table td {{
+            padding:8px 12px;
+            border-bottom:1px solid #f1f5f9;
+          }}
+          table.perf-table td:first-child {{
+            text-align:left;
+            font-weight:700;
+            color:#0f172a;
+          }}
+          .tag{{padding:2px 6px;border-radius:6px;font-weight:700;margin-left:6px;font-size:0.68rem;display:inline-block;vertical-align:middle;}}
+          .new{{background:#ede9fe;color:#6d28d9;}} .cs{{background:#e0f2fe;color:#0369a1;}} .left{{background:#fee2e2;color:#991b1b;}}
+          .totals-row{{font-weight:800;background-color:#f8fafc;}}
+        </style>
+        <div class="perf-table-container">
+          <table id="{advisor_table_id}" class="perf-table">
+            <thead><tr>
+        '''
+        for c in visible_cols:
+            style = header_styles.get(c, "background-color:#f8fafc;color:#475569;")
+            adv_html += f'<th style="{style}">{c}</th>'
+        adv_html += '</tr></thead><tbody>'
+
+        for _, r in advisor_summary.iterrows():
+            adv_display = str(r["Quality Officer"])
+            adv_tooltips_local = raw_tooltips.get(adv_display, {})
+            adv_html += "<tr>"
+            for c in visible_cols:
+                if c == "Quality Officer":
+                    name = escape(str(r[c]))
+                    lname = name.strip().lower()
+                    tags_html = ""
+                    adv_html += f"<td data-sort=\"{escape(name)}\">{name}{tags_html}</td>"
+                elif c == "QA Pass Rate %":
+                    val = float(r["QA Pass Rate % Val"])
+                    raw_text = adv_tooltips_local.get("QA APPROVED", "")
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val:.6f}" title="{tooltip_html}" style="cursor:help;">{render_qa_pill(val)}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val:.6f}">{render_qa_pill(val)}</td>'
+                elif c == "Welcome Done %":
+                    val = float(r["Welcome Done % Val"])
+                    raw_text = adv_tooltips_local.get("WELCOME DONE", "")
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val:.6f}" title="{tooltip_html}" style="cursor:help;">{render_welcome_pill(val)}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val:.6f}">{render_welcome_pill(val)}</td>'
+                elif c == "Live Conversion %":
+                    val = float(r["Live Conversion % Val"])
+                    raw_text = adv_tooltips_local.get("LIVE", "")
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val:.6f}" title="{tooltip_html}" style="cursor:help;">{render_live_pill(val)}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val:.6f}">{render_live_pill(val)}</td>'
+                elif c == "PROJECTED LIVE":
+                    val = int(r.get("PROJECTED LIVE", 0))
+                    raw_text = adv_tooltips_local.get("PROJECTED LIVE", "")
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val}" title="{tooltip_html}" style="cursor:help;">{val:,}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val}">{val:,}</td>'
+                elif c == "Projected Live %":
+                    val = float(r.get("Projected Live % Val", 0.0))
+                    raw_text = adv_tooltips_local.get("PROJECTED LIVE", "")
+                    pill_html = render_live_pill(val)
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val:.6f}" title="{tooltip_html}" style="cursor:help;">{pill_html}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val:.6f}">{pill_html}</td>'
+                else:
+                    val = r.get(c)
+                    raw_text = adv_tooltips_local.get(c, "")
+                    if isinstance(val, (int, np.integer)):
+                        formatted_val = "-" if int(val) == 0 else f"{int(val):,}"
+                        if raw_text and int(val) != 0:
+                            tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                            adv_html += f'<td data-sort="{int(val)}" title="{tooltip_html}" style="cursor:help;">{formatted_val}</td>'
+                        else:
+                            adv_html += f'<td data-sort="{int(val)}">{formatted_val}</td>'
+                    else:
+                        formatted_val = "-" if (val == 0 or pd.isna(val)) else escape(str(val))
+                        if raw_text and str(val) not in ("0", "-", ""):
+                            tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                            adv_html += f'<td data-sort="{escape(str(val))}" title="{tooltip_html}" style="cursor:help;">{formatted_val}</td>'
+                        else:
+                            adv_html += f'<td data-sort="{escape(str(val))}">{formatted_val}</td>'
+            adv_html += "</tr>"
+
+        # totals row
+        adv_html += '<tr class="totals-row">'
+        for c in visible_cols:
+            if c == "Quality Officer":
+                adv_html += "<td data-sort='Total'>Total</td>"
+            elif c == "QA Pass Rate %":
+                adv_html += f'<td data-sort="{total_qa_pass_pct:.6f}">' + f'{render_qa_pill(total_qa_pass_pct)}</td>'
+            elif c == "Welcome Done %":
+                adv_html += f'<td data-sort="{total_welcome_pct:.6f}">' + f'{render_welcome_pill(total_welcome_pct)}</td>'
+            elif c == "Live Conversion %":
+                adv_html += f'<td data-sort="{total_live_pct:.6f}">' + f'{render_live_pill(total_live_pct)}</td>'
+            elif c == "PROJECTED LIVE":
+                tot_proj = int(round(
+                    advisor_summary["PROJECTED LIVE"].sum()
+                ))
+                tooltip_text = totals_tooltips.get("PROJECTED LIVE", "")
+                if tooltip_text and tot_proj != 0:
+                    tooltip_html = escape(str(tooltip_text)).replace("\n", "&#10;")
+                    adv_html += f'<td data-sort="{tot_proj}" title="{tooltip_html}" style="cursor:help;">{tot_proj:,}</td>'
+                else:
+                    adv_html += f'<td data-sort="{tot_proj}">{tot_proj:,}</td>'
+            elif c == "Projected Live %":
+                tot_proj_pct = ( (advisor_summary["PROJECTED LIVE"].sum() / totals_series.get("APPLICATIONS", 1)) * 100 ) if totals_series.get("APPLICATIONS",0) > 0 else 0.0
+                adv_html += f'<td data-sort="{tot_proj_pct:.6f}">'+f'{render_live_pill(tot_proj_pct)}</td>'
+            else:
+                if c in numeric_cols:
+                    tot_val = int(totals_series.get(c, 0))
+                    formatted = "-" if tot_val == 0 else f"{tot_val:,}"
+                    tooltip_text = totals_tooltips.get(c, "")
+                    if tooltip_text and tot_val != 0:
+                        tooltip_html = escape(str(tooltip_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{tot_val}" title="{tooltip_html}" style="cursor:help;">{formatted}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{tot_val}">{formatted}</td>'
+                else:
+                    adv_html += "<td data-sort='-'>-</td>"
+        adv_html += "</tr>"
+
+        adv_html += "</tbody></table></div>"
+
+        # Sorting JS for advisor table; keeps totals-row at bottom
+        adv_html += f"""
+        <script>
+        (function() {{
+          function makeSortable(tableId) {{
+            const table = document.getElementById(tableId);
+            if(!table) return;
+            const tbody = table.tBodies[0];
+            const headers = table.querySelectorAll('th');
+            headers.forEach((th, index) => {{
+              th.addEventListener('click', () => {{
+                const current = th.getAttribute('data-order') || 'desc';
+                const newOrder = current === 'asc' ? 'desc' : 'asc';
+                headers.forEach(h => h.removeAttribute('data-order'));
+                th.setAttribute('data-order', newOrder);
+                const rows = Array.from(tbody.querySelectorAll('tr')).filter(r => !r.classList.contains('totals-row'));
+                rows.sort((a,b) => {{
+                  const aCell = a.children[index];
+                  const bCell = b.children[index];
+                  const aVal = aCell ? (aCell.getAttribute('data-sort') || aCell.innerText) : '';
+                  const bVal = bCell ? (bCell.getAttribute('data-sort') || bCell.innerText) : '';
+                  const aNum = parseFloat(aVal.toString().replace(/,/g,'')); 
+                  const bNum = parseFloat(bVal.toString().replace(/,/g,''));
+                  if(!isNaN(aNum) && !isNaN(bNum)) {{
+                    return newOrder === 'asc' ? aNum - bNum : bNum - aNum;
+                  }}
+                  return newOrder === 'asc' ? aVal.toString().localeCompare(bVal.toString()) : bVal.toString().localeCompare(aVal.toString());
+                }});
+                rows.forEach(r => tbody.appendChild(r));
+                const totals = tbody.querySelector('tr.totals-row');
+                if(totals) tbody.appendChild(totals);
+              }});
+            }});
+          }}
+          makeSortable("{advisor_table_id}");
+        }})();
+        </script>
+        """
+        components.html(adv_html, height=advisor_table_height, scrolling=False)
+elif selected_performance_table == "🧪 Quality Officer Performance":
+    st.info("No sales records available for the selected date or month filter.")
+
+
+# ==========================================================
+# 📞 WELCOME CALLER PERFORMANCE (same performance layout and KPI calculations)
+# Add PROJECTED LIVE and Projected Live % to performance summary
+# ==========================================================
+if selected_performance_table == "📞 Welcome Caller Performance":
+    st.divider()
+    st.subheader("📞 Welcome Caller Performance")
+
+if selected_performance_table == "📞 Welcome Caller Performance" and "Welcome Call By" in master_df.columns and not master_df.empty:
+    advisor_summary = (
+        master_df.groupby("Welcome Call By", dropna=False)
+            .agg(
+                Applications=("Welcome Call By", "count"),
+                QA_Approved=("Quality Status Clean", lambda x: (x == "Approved").sum()),
+                QA_Rework=("Quality Status Clean", lambda x: (x == "Rework").sum()),
+                QA_Cancelled=("Quality Status Clean", lambda x: (x == "Cancelled").sum()),
+                QA_Pending=("Quality Status Clean", lambda x: (x == "Pending").sum()),
+                Welcome_Done=("Welcome Status Clean", lambda x: (x == "Done").sum()),
+                Welcome_Cancelled=("Welcome Status Clean", lambda x: (x == "Cancelled").sum()),
+                Welcome_Pending=("Welcome Status Clean", lambda x: (x == "Pending").sum()),
+                Committed=("Portal Status Clean", lambda x: (x == "Committed").sum()),
+                Live=("Portal Status Clean", lambda x: (x == "Live").sum()),
+                Live_Cancelled=("Portal Status Clean", lambda x: (x == "Cancelled").sum()),
+            )
+            .reset_index()
     )
 
-except Exception as e:
-    st.error(f"Error: {e}")
+    if advisor_summary.empty:
+        st.info("No sales records match the selected tag filters.")
+    else:
+        advisor_summary["QA Pass Rate % Val"] = ((advisor_summary["QA_Approved"] / advisor_summary["Applications"].replace(0, np.nan)) * 100).fillna(0.0)
+        advisor_summary["Welcome Done % Val"] = ((advisor_summary["Welcome_Done"] / advisor_summary["Applications"].replace(0, np.nan)) * 100).fillna(0.0)
+        advisor_summary["Live Conversion % Val"] = ((advisor_summary["Live"] / advisor_summary["Applications"].replace(0, np.nan)) * 100).fillna(0.0)
+
+        advisor_summary["PROJECTED LIVE"] = (
+            advisor_summary["Live"]
+            + advisor_summary["Committed"] * committed_frac
+            + advisor_summary["Welcome_Pending"] * welcome_pending_frac
+            + advisor_summary["QA_Pending"] * quality_pending_frac
+        ).round().astype(int)
+
+        advisor_summary["Projected Live % Val"] = (
+            (advisor_summary["PROJECTED LIVE"] / advisor_summary["Applications"].replace(0, np.nan)) * 100
+        ).fillna(0.0)
+
+        # 4. Rename columns to match display standards
+        advisor_summary = advisor_summary.rename(columns={
+            "Welcome Call By": "Welcome Call By",
+            "Applications": "APPLICATIONS",
+            "QA_Approved": "QA APPROVED",
+            "QA_Rework": "QA REWORK",
+            "QA_Cancelled": "QA CANCELLED",
+            "QA_Pending": "QA PENDING",
+            "Welcome_Done": "WELCOME DONE",
+            "Welcome_Cancelled": "WELCOME CANCELLED",
+            "Welcome_Pending": "WELCOME PENDING",
+            "Committed": "COMMITTED REM.",
+            "Live": "LIVE",
+            "Live_Cancelled": "LIVE CANCELLED",
+        })
+
+        advisor_summary["Welcome Call By"] = advisor_summary["Welcome Call By"].replace("", "Unassigned").fillna("Unassigned")
+        advisor_summary = advisor_summary.sort_values(by="APPLICATIONS", ascending=False)
+
+        # Build per-advisor raw breakdown tooltips once (use master_df as source)
+        advisor_tooltip_mapping = {
+            "QA APPROVED": ("Quality Status", "Quality Status Clean", "Approved"),
+            "QA REWORK": ("Quality Status", "Quality Status Clean", "Rework"),
+            "QA CANCELLED": ("Quality Status", "Quality Status Clean", "Cancelled"),
+            "QA PENDING": ("Quality Status", "Quality Status Clean", "Pending"),
+            "WELCOME DONE": ("Welcome Status", "Welcome Status Clean", "Done"),
+            "WELCOME CANCELLED": ("Welcome Status", "Welcome Status Clean", "Cancelled"),
+            "WELCOME PENDING": ("Welcome Status", "Welcome Status Clean", "Pending"),
+            "COMMITTED REM.": ("Portal Status", "Portal Status Clean", "Committed"),
+            "LIVE": ("Portal Status", "Portal Status Clean", "Live"),
+            "LIVE CANCELLED": ("Portal Status", "Portal Status Clean", "Cancelled"),
+        }
+
+        raw_tooltips = {}
+        # Pre-normalize advisor column in master_df for matching
+        master_df["_advisor_norm"] = master_df["Welcome Call By"].fillna("").astype(str).str.strip().str.lower()
+        for _, r in advisor_summary.iterrows():
+            adv_display = str(r["Welcome Call By"])
+            adv_norm = adv_display.strip().lower()
+            subset = master_df[master_df["_advisor_norm"] == adv_norm]
+            adv_tooltips = {}
+            for k, (raw_col, clean_col, target_val) in advisor_tooltip_mapping.items():
+                adv_tooltips[k] = format_raw_breakdown(subset, raw_col, clean_col, target_val)
+            # Add projection tooltip for this advisor
+            adv_proj_tooltip = (
+                f"Formula: Live + ({committed_pct_input}% × Committed) + "
+                f"({welcome_pending_pct_input}% × Welcome Pending) + ({quality_pending_pct_input}% × QA Pending)\n"
+                f"Components:\nLive: {int(r.get('LIVE',0))}\nCommitted: {int(r.get('COMMITTED REM.',0))}\n"
+                f"Welcome Pending: {int(r.get('WELCOME PENDING',0))}\nQA Pending: {int(r.get('QA PENDING',0))}\n"
+                f"Projected (rounded): {int(r.get('PROJECTED LIVE',0))}"
+            )
+            adv_tooltips["PROJECTED LIVE"] = adv_proj_tooltip
+            raw_tooltips[adv_display] = adv_tooltips
+        # drop the helper column
+        master_df.drop(columns=["_advisor_norm"], inplace=True, errors=True)
+
+        numeric_cols = {
+            "APPLICATIONS", "QA APPROVED", "QA REWORK", "QA CANCELLED", "QA PENDING",
+            "WELCOME DONE", "WELCOME CANCELLED", "WELCOME PENDING", "COMMITTED REM.", "LIVE", "LIVE CANCELLED", "PROJECTED LIVE"
+        }
+
+        base_col_order = [
+            "Welcome Call By", "APPLICATIONS", "QA APPROVED", "QA Pass Rate %",
+            "QA REWORK", "QA CANCELLED", "QA PENDING", "WELCOME DONE", "Welcome Done %",
+            "WELCOME CANCELLED", "WELCOME PENDING", "COMMITTED REM.",
+            "LIVE", "Live Conversion %", "PROJECTED LIVE", "Projected Live %", "LIVE CANCELLED"
+        ]
+
+        visible_cols = ["Welcome Call By"]
+        for col in base_col_order[1:]:
+            if col in numeric_cols:
+                if (advisor_summary.get(col, pd.Series(dtype=int)) > 0).any():
+                    visible_cols.append(col)
+            elif col == "QA Pass Rate %":
+                if "QA APPROVED" in visible_cols:
+                    visible_cols.append(col)
+            elif col == "Welcome Done %":
+                if "WELCOME DONE" in visible_cols:
+                    visible_cols.append(col)
+            elif col == "Live Conversion %":
+                if "LIVE" in visible_cols:
+                    visible_cols.append(col)
+            elif col == "Projected Live %":
+                if "PROJECTED LIVE" in visible_cols:
+                    visible_cols.append(col)
+
+        def render_qa_pill(v):
+            if v >= 75.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#d1fae5; color:#047857; border:1px solid #a7f3d0; border-radius:8px; padding:3px 12px; font-weight:700;">{v:.1f}%</span>'
+            if v >= 51.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#fef3c7;color:#b45309;border:1px solid #fde68a;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            return f'<span data-sort="{v:.6f}" style="background-color:#ffe4e6;color:#be123c;border:1px solid #fecdd3;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+
+        def render_welcome_pill(v):
+            if v >= 61.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#d1fae5;color:#047857;border:1px solid #a7f3d0;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            if v >= 51.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#fef3c7;color:#b45309;border:1px solid #fde68a;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            return f'<span data-sort="{v:.6f}" style="background-color:#ffe4e6;color:#be123c;border:1px solid #fecdd3;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+
+        def render_live_pill(v):
+            if v >= 41.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#d1fae5;color:#047857;border:1px solid #a7f3d0;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            if v >= 21.0:
+                return f'<span data-sort="{v:.6f}" style="background-color:#fef3c7;color:#b45309;border:1px solid #fde68a;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+            return f'<span data-sort="{v:.6f}" style="background-color:#ffe4e6;color:#be123c;border:1px solid #fecdd3;border-radius:8px;padding:3px 12px;font-weight:700;">{v:.1f}%</span>'
+
+        header_styles = {
+            "Welcome Call By": "background-color:#f1f5f9;color:#334155;",
+            "APPLICATIONS": "background-color:#eff6ff;color:#1e40af;",
+            "QA APPROVED": "background-color:#f0fdf4;color:#15803d;",
+            "QA Pass Rate %": "background-color:#f0fdf4;color:#15803d;",
+            "QA REWORK": "background-color:#fefce8;color:#a16207;",
+            "QA CANCELLED": "background-color:#fef2f2;color:#b91c1c;",
+            "QA PENDING": "background-color:#fff7ed;color:#c2410c;",
+            "WELCOME DONE": "background-color:#f0fdf4;color:#15803d;",
+            "Welcome Done %": "background-color:#f0fdf4;color:#15803d;",
+            "WELCOME CANCELLED": "background-color:#fef2f2;color:#b91c1c;",
+            "WELCOME PENDING": "background-color:#fefce8;color:#a16207;",
+            "COMMITTED REM.": "background-color:#fff7ed;color:#c2410c;",
+            "LIVE": "background-color:#f0fdfa;color:#0f766e;",
+            "LIVE CANCELLED": "background-color:#fef2f2;color:#b91c1c;",
+            "PROJECTED LIVE": "background-color:#eef2ff;color:#3730a3;",
+            "Projected Live %": "background-color:#eef2ff;color:#3730a3;",
+            "Live Conversion %": "background-color:#f0fdfa;color:#0f766e;",
+        }
+
+        # Compute totals across visible advisors for numeric columns
+        totals_series = advisor_summary[[c for c in advisor_summary.columns if c in numeric_cols]].sum(numeric_only=True)
+        total_apps = int(totals_series.get("APPLICATIONS", 0))
+        total_qa_approved = int(totals_series.get("QA APPROVED", 0))
+        total_welcome_done = int(totals_series.get("WELCOME DONE", 0))
+        total_live = int(totals_series.get("LIVE", 0))
+
+        # totals percentages (overall)
+        total_qa_pass_pct = (total_qa_approved / total_apps * 100) if total_apps > 0 else 0.0
+        total_welcome_pct = (total_welcome_done / total_apps * 100) if total_apps > 0 else 0.0
+        total_live_pct = (total_live / total_apps * 100) if total_apps > 0 else 0.0
+
+        # totals tooltips using filtered master_df
+        totals_tooltips = {}
+        for k, (raw_col, clean_col, target_val) in advisor_tooltip_mapping.items():
+            totals_tooltips[k] = format_raw_breakdown(master_df, raw_col, clean_col, target_val)
+        # totals projection tooltip
+        totals_tooltips["PROJECTED LIVE"] = (
+            f"Aggregate projection using weights: {committed_pct_input}% committed, "
+            f"{welcome_pending_pct_input}% welcome pending, {quality_pending_pct_input}% quality pending"
+        )
+
+        # Build advisor HTML table (use components.html to allow JS)
+        advisor_table_id = "welcome-caller-perf-table"
+        advisor_table_height = min(900, max(240, 90 + len(advisor_summary) * 45))
+        adv_html = f'''
+        <style>
+          .perf-table-container {{
+            width:100%;
+            border:1px solid #e2e8f0;
+            border-radius:8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+            margin-bottom:16px;
+            max-height:{advisor_table_height}px;
+            overflow:auto;
+          }}
+          table.perf-table {{
+            width:100%;
+            border-collapse:collapse;
+            font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;
+            font-size:0.88rem;
+            background:#fff;
+          }}
+          table.perf-table th {{
+            padding:10px 12px;
+            font-weight:800;
+            font-size:0.78rem;
+            text-transform:uppercase;
+            border-bottom:2px solid #e2e8f0;
+            position:sticky;
+            top:0;
+            z-index:5;
+            background:#fff;
+            cursor:pointer;
+          }}
+          table.perf-table td {{
+            padding:8px 12px;
+            border-bottom:1px solid #f1f5f9;
+          }}
+          table.perf-table td:first-child {{
+            text-align:left;
+            font-weight:700;
+            color:#0f172a;
+          }}
+          .tag{{padding:2px 6px;border-radius:6px;font-weight:700;margin-left:6px;font-size:0.68rem;display:inline-block;vertical-align:middle;}}
+          .new{{background:#ede9fe;color:#6d28d9;}} .cs{{background:#e0f2fe;color:#0369a1;}} .left{{background:#fee2e2;color:#991b1b;}}
+          .totals-row{{font-weight:800;background-color:#f8fafc;}}
+        </style>
+        <div class="perf-table-container">
+          <table id="{advisor_table_id}" class="perf-table">
+            <thead><tr>
+        '''
+        for c in visible_cols:
+            style = header_styles.get(c, "background-color:#f8fafc;color:#475569;")
+            adv_html += f'<th style="{style}">{c}</th>'
+        adv_html += '</tr></thead><tbody>'
+
+        for _, r in advisor_summary.iterrows():
+            adv_display = str(r["Welcome Call By"])
+            adv_tooltips_local = raw_tooltips.get(adv_display, {})
+            adv_html += "<tr>"
+            for c in visible_cols:
+                if c == "Welcome Call By":
+                    name = escape(str(r[c]))
+                    lname = name.strip().lower()
+                    tags_html = ""
+                    adv_html += f"<td data-sort=\"{escape(name)}\">{name}{tags_html}</td>"
+                elif c == "QA Pass Rate %":
+                    val = float(r["QA Pass Rate % Val"])
+                    raw_text = adv_tooltips_local.get("QA APPROVED", "")
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val:.6f}" title="{tooltip_html}" style="cursor:help;">{render_qa_pill(val)}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val:.6f}">{render_qa_pill(val)}</td>'
+                elif c == "Welcome Done %":
+                    val = float(r["Welcome Done % Val"])
+                    raw_text = adv_tooltips_local.get("WELCOME DONE", "")
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val:.6f}" title="{tooltip_html}" style="cursor:help;">{render_welcome_pill(val)}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val:.6f}">{render_welcome_pill(val)}</td>'
+                elif c == "Live Conversion %":
+                    val = float(r["Live Conversion % Val"])
+                    raw_text = adv_tooltips_local.get("LIVE", "")
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val:.6f}" title="{tooltip_html}" style="cursor:help;">{render_live_pill(val)}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val:.6f}">{render_live_pill(val)}</td>'
+                elif c == "PROJECTED LIVE":
+                    val = int(r.get("PROJECTED LIVE", 0))
+                    raw_text = adv_tooltips_local.get("PROJECTED LIVE", "")
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val}" title="{tooltip_html}" style="cursor:help;">{val:,}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val}">{val:,}</td>'
+                elif c == "Projected Live %":
+                    val = float(r.get("Projected Live % Val", 0.0))
+                    raw_text = adv_tooltips_local.get("PROJECTED LIVE", "")
+                    pill_html = render_live_pill(val)
+                    if raw_text and val != 0:
+                        tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{val:.6f}" title="{tooltip_html}" style="cursor:help;">{pill_html}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{val:.6f}">{pill_html}</td>'
+                else:
+                    val = r.get(c)
+                    raw_text = adv_tooltips_local.get(c, "")
+                    if isinstance(val, (int, np.integer)):
+                        formatted_val = "-" if int(val) == 0 else f"{int(val):,}"
+                        if raw_text and int(val) != 0:
+                            tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                            adv_html += f'<td data-sort="{int(val)}" title="{tooltip_html}" style="cursor:help;">{formatted_val}</td>'
+                        else:
+                            adv_html += f'<td data-sort="{int(val)}">{formatted_val}</td>'
+                    else:
+                        formatted_val = "-" if (val == 0 or pd.isna(val)) else escape(str(val))
+                        if raw_text and str(val) not in ("0", "-", ""):
+                            tooltip_html = escape(str(raw_text)).replace("\n", "&#10;")
+                            adv_html += f'<td data-sort="{escape(str(val))}" title="{tooltip_html}" style="cursor:help;">{formatted_val}</td>'
+                        else:
+                            adv_html += f'<td data-sort="{escape(str(val))}">{formatted_val}</td>'
+            adv_html += "</tr>"
+
+        # totals row
+        adv_html += '<tr class="totals-row">'
+        for c in visible_cols:
+            if c == "Welcome Call By":
+                adv_html += "<td data-sort='Total'>Total</td>"
+            elif c == "QA Pass Rate %":
+                adv_html += f'<td data-sort="{total_qa_pass_pct:.6f}">' + f'{render_qa_pill(total_qa_pass_pct)}</td>'
+            elif c == "Welcome Done %":
+                adv_html += f'<td data-sort="{total_welcome_pct:.6f}">' + f'{render_welcome_pill(total_welcome_pct)}</td>'
+            elif c == "Live Conversion %":
+                adv_html += f'<td data-sort="{total_live_pct:.6f}">' + f'{render_live_pill(total_live_pct)}</td>'
+            elif c == "PROJECTED LIVE":
+                tot_proj = int(round(
+                    advisor_summary["PROJECTED LIVE"].sum()
+                ))
+                tooltip_text = totals_tooltips.get("PROJECTED LIVE", "")
+                if tooltip_text and tot_proj != 0:
+                    tooltip_html = escape(str(tooltip_text)).replace("\n", "&#10;")
+                    adv_html += f'<td data-sort="{tot_proj}" title="{tooltip_html}" style="cursor:help;">{tot_proj:,}</td>'
+                else:
+                    adv_html += f'<td data-sort="{tot_proj}">{tot_proj:,}</td>'
+            elif c == "Projected Live %":
+                tot_proj_pct = ( (advisor_summary["PROJECTED LIVE"].sum() / totals_series.get("APPLICATIONS", 1)) * 100 ) if totals_series.get("APPLICATIONS",0) > 0 else 0.0
+                adv_html += f'<td data-sort="{tot_proj_pct:.6f}">'+f'{render_live_pill(tot_proj_pct)}</td>'
+            else:
+                if c in numeric_cols:
+                    tot_val = int(totals_series.get(c, 0))
+                    formatted = "-" if tot_val == 0 else f"{tot_val:,}"
+                    tooltip_text = totals_tooltips.get(c, "")
+                    if tooltip_text and tot_val != 0:
+                        tooltip_html = escape(str(tooltip_text)).replace("\n", "&#10;")
+                        adv_html += f'<td data-sort="{tot_val}" title="{tooltip_html}" style="cursor:help;">{formatted}</td>'
+                    else:
+                        adv_html += f'<td data-sort="{tot_val}">{formatted}</td>'
+                else:
+                    adv_html += "<td data-sort='-'>-</td>"
+        adv_html += "</tr>"
+
+        adv_html += "</tbody></table></div>"
+
+        # Sorting JS for advisor table; keeps totals-row at bottom
+        adv_html += f"""
+        <script>
+        (function() {{
+          function makeSortable(tableId) {{
+            const table = document.getElementById(tableId);
+            if(!table) return;
+            const tbody = table.tBodies[0];
+            const headers = table.querySelectorAll('th');
+            headers.forEach((th, index) => {{
+              th.addEventListener('click', () => {{
+                const current = th.getAttribute('data-order') || 'desc';
+                const newOrder = current === 'asc' ? 'desc' : 'asc';
+                headers.forEach(h => h.removeAttribute('data-order'));
+                th.setAttribute('data-order', newOrder);
+                const rows = Array.from(tbody.querySelectorAll('tr')).filter(r => !r.classList.contains('totals-row'));
+                rows.sort((a,b) => {{
+                  const aCell = a.children[index];
+                  const bCell = b.children[index];
+                  const aVal = aCell ? (aCell.getAttribute('data-sort') || aCell.innerText) : '';
+                  const bVal = bCell ? (bCell.getAttribute('data-sort') || bCell.innerText) : '';
+                  const aNum = parseFloat(aVal.toString().replace(/,/g,'')); 
+                  const bNum = parseFloat(bVal.toString().replace(/,/g,''));
+                  if(!isNaN(aNum) && !isNaN(bNum)) {{
+                    return newOrder === 'asc' ? aNum - bNum : bNum - aNum;
+                  }}
+                  return newOrder === 'asc' ? aVal.toString().localeCompare(bVal.toString()) : bVal.toString().localeCompare(aVal.toString());
+                }});
+                rows.forEach(r => tbody.appendChild(r));
+                const totals = tbody.querySelector('tr.totals-row');
+                if(totals) tbody.appendChild(totals);
+              }});
+            }});
+          }}
+          makeSortable("{advisor_table_id}");
+        }})();
+        </script>
+        """
+        components.html(adv_html, height=advisor_table_height, scrolling=False)
+elif selected_performance_table == "📞 Welcome Caller Performance":
+    st.info("No sales records available for the selected date or month filter.")
+
+
+# ==========================================================
+# FOOTER
+# ==========================================================
+st.divider()
+st.success("✅ Data loaded successfully")
+st.caption(f"Dashboard refreshed at {datetime.now().strftime('%d %b %Y %H:%M:%S')}")
