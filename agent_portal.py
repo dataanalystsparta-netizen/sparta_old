@@ -1665,18 +1665,131 @@ def map_portal(val):
 
 
 def map_wc(val):
-    s = str(val).lower().strip()
-    if any(x in s for x in ["done", "pass", "comp", "approved"]):
-        return "Done"
-    if any(x in s for x in ["follow", "f/u", "f u"]):
-        return "Follow up"
-    if any(x in s for x in ["pend", "pnd", "other work", "delay"]):
-        return "Pending"
-    if any(x in s for x in ["paper", "ppw"]):
-        return "Paperwork"
-    if any(x in s for x in ["can", "rej"]):
+    """Normalize Welcome Call outcomes; rejection belongs in WC Cancelled."""
+    s = str(val).strip().lower()
+    if not s or s in {"none", "nan", "nat", "null", "-"}:
+        return "Others"
+
+    # Rejection/cancellation takes precedence. In particular, Welcome Rejected
+    # is a Welcome Call cancellation outcome, not WC Others.
+    if any(token in s for token in ("cancel", "reject", "rejected", "rej")):
         return "Cancelled"
+    if any(token in s for token in ("done", "pass", "comp", "approved", "approve")):
+        return "Done"
+    if any(token in s for token in ("follow", "f/u", "f u")):
+        return "Follow up"
+    if any(token in s for token in ("pend", "pnd", "other work", "delay")):
+        return "Pending"
+    if any(token in s for token in ("paper", "ppw")):
+        return "Paperwork"
     return "Others"
+
+
+LIVE_KPI_STATUS_ORDER = [
+    "Live",
+    "Committed",
+    "Cancelled",
+    "Onboarding Pending",
+    "Confirmation Approved",
+    "Confirmation Followup",
+    "Confirmation Pending",
+    "Others",
+]
+
+
+def _is_blank_status(value):
+    if pd.isna(value):
+        return True
+    return str(value).strip().lower() in {"", "none", "nan", "nat", "null", "-"}
+
+
+def map_live_kpi_status(primary_status, call_status=""):
+    """Use onboarding Status first; fall back to CallStatus only when blank.
+
+    To Be Cancelled and rejection variants roll into Cancelled. Confirmation
+    Approved/Followup/Pending remain visible as separate categories when they
+    are the fallback status, instead of being incorrectly counted as Others.
+    """
+    if not _is_blank_status(primary_status):
+        return map_portal(primary_status)
+
+    fallback = "" if _is_blank_status(call_status) else str(call_status).strip()
+    normalized = re.sub(r"\s+", " ", fallback).strip().lower()
+    if not normalized:
+        return "Others"
+
+    if any(token in normalized for token in ("cancel", "reject", "rejected", "rej")):
+        return "Cancelled"
+
+    if "confirmation" in normalized:
+        if "pend" in normalized or "pnd" in normalized:
+            return "Confirmation Pending"
+        if "follow" in normalized or "f/u" in normalized:
+            return "Confirmation Followup"
+        if "approv" in normalized or "approve" in normalized:
+            return "Confirmation Approved"
+
+    # If CallStatus itself carries a standard onboarding status, preserve the
+    # portal's existing normalization for Live / Committed / Pending values.
+    mapped = map_portal(fallback)
+    if mapped != "Others":
+        return mapped
+    return "Others"
+
+
+def build_wc_done_live_kpi_rows(apps_frame, portal_frame, welcome_status_col):
+    """Return only downstream rows whose matching application is WC Done/Approved.
+
+    Uses the same Sale Date + phone record key already used by the Recent
+    Applications Log. The source dataframes are copied, so the detailed log and
+    daily/monthly breakdown remain unchanged by this KPI-only eligibility rule.
+    """
+    if (
+        apps_frame is None or portal_frame is None
+        or apps_frame.empty or portal_frame.empty
+        or not welcome_status_col or welcome_status_col not in apps_frame.columns
+    ):
+        empty = portal_frame.iloc[0:0].copy() if portal_frame is not None else pd.DataFrame()
+        empty["Live_KPI_Status"] = pd.Series(dtype="object")
+        return empty
+
+    apps_done = apps_frame[apps_frame[welcome_status_col].apply(map_wc) == "Done"].copy()
+    if apps_done.empty:
+        empty = portal_frame.iloc[0:0].copy()
+        empty["Live_KPI_Status"] = pd.Series(dtype="object")
+        return empty
+
+    if "Standardized_Date" not in apps_done.columns:
+        apps_done["Standardized_Date"] = apps_done.get("Date_Parsed", pd.NaT)
+    if "CLI" not in apps_done.columns:
+        apps_done["CLI"] = ""
+    apps_done = add_record_keys(apps_done, "Standardized_Date", "CLI")
+    wc_done_keys = {
+        str(key) for key in apps_done["_RecordKey"].tolist()
+        if key and str(key).strip()
+    }
+    if not wc_done_keys:
+        empty = portal_frame.iloc[0:0].copy()
+        empty["Live_KPI_Status"] = pd.Series(dtype="object")
+        return empty
+
+    portal = portal_frame.copy()
+    if "Sale Date" not in portal.columns:
+        portal["Sale Date"] = portal.get("Date_Parsed", pd.NaT)
+    if "Telephone No." not in portal.columns:
+        portal["Telephone No."] = ""
+    if "Status" not in portal.columns:
+        portal["Status"] = ""
+    if "CallStatus" not in portal.columns:
+        portal["CallStatus"] = ""
+
+    portal = add_record_keys(portal, "Sale Date", "Telephone No.")
+    portal = portal[portal["_RecordKey"].astype(str).isin(wc_done_keys)].copy()
+    portal["Live_KPI_Status"] = portal.apply(
+        lambda row: map_live_kpi_status(row.get("Status", ""), row.get("CallStatus", "")),
+        axis=1,
+    )
+    return portal
 
 
 def date_range_mask(series, start_date, end_date):
@@ -2136,6 +2249,14 @@ try:
     if wc_col:
         ag1_filtered["WC_Clean"] = ag1_filtered[wc_col].apply(map_wc)
 
+    # The Live Status KPI counts only downstream records whose corresponding
+    # application is Welcome Done/Approved. It falls back to CallStatus when
+    # the primary onboarding Status is blank. The broader ag2_filtered frame
+    # remains untouched for the Recent Applications Log and breakdown tables.
+    live_kpi_filtered = build_wc_done_live_kpi_rows(
+        ag1_filtered, ag2_filtered, wc_col
+    )
+
     # The trend shown on each main KPI card compares the selected date range
     # with the immediately preceding period of the same number of days.
     period_days = (end_date - start_date).days + 1
@@ -2155,6 +2276,10 @@ try:
     if wc_col and wc_col in previous_ag1.columns:
         previous_ag1["WC_Clean"] = previous_ag1[wc_col].apply(map_wc)
 
+    previous_live_kpi = build_wc_done_live_kpi_rows(
+        previous_ag1, previous_ag2, wc_col
+    )
+
     trend_previous_counts = {"Total Apps": len(previous_ag1)}
     for label, status in [
         ("Approved", "Approved"), ("Rework", "Rework"),
@@ -2171,17 +2296,13 @@ try:
         ]:
             trend_previous_counts[label] = int((previous_ag1["WC_Clean"] == status).sum())
 
-    for label, status in [
-        ("Live", "Live"),
-        ("Committed", "Committed"),
-        ("Cancelled", "Cancelled"),
-        ("Onboarding Pending", "Onboarding Pending"),
-        ("Others", "Others"),
-    ]:
-        # Quality/Welcome and Portal status groups reuse some labels. Keep the
-        # portal trend keys separate so they cannot overwrite other groups.
+    for label in LIVE_KPI_STATUS_ORDER:
+        # These comparison counts use the same WC Done/Approved eligibility
+        # and CallStatus fallback as the current Live Status KPI cards.
         key = f"Portal {label}"
-        trend_previous_counts[key] = int((previous_ag2["P_Status"] == status).sum())
+        trend_previous_counts[key] = int(
+            (previous_live_kpi["Live_KPI_Status"] == label).sum()
+        )
 
     # ------------------------------------------------------------------------
     # KPI ROW
@@ -2208,13 +2329,16 @@ try:
             ("WC Others", len(ag1_filtered[ag1_filtered["WC_Clean"] == "Others"]), total_apps),
         ]
 
-    live_total_denominator = total_ag2 if total_ag2 > 0 else total_apps
+    # Live KPI denominator is the subset with a matching Welcome Done/Approved
+    # application row, not every downstream record in the selected period.
+    live_total_denominator = len(live_kpi_filtered)
     group_4 = [
-        ("Live", len(ag2_filtered[ag2_filtered["P_Status"] == "Live"]), live_total_denominator),
-        ("Committed", len(ag2_filtered[ag2_filtered["P_Status"] == "Committed"]), live_total_denominator),
-        ("Cancelled", len(ag2_filtered[ag2_filtered["P_Status"] == "Cancelled"]), live_total_denominator),
-        ("Onboarding Pending", len(ag2_filtered[ag2_filtered["P_Status"] == "Onboarding Pending"]), live_total_denominator),
-        ("Others", len(ag2_filtered[ag2_filtered["P_Status"] == "Others"]), live_total_denominator),
+        (
+            status_label,
+            int((live_kpi_filtered["Live_KPI_Status"] == status_label).sum()),
+            live_total_denominator,
+        )
+        for status_label in LIVE_KPI_STATUS_ORDER
     ]
 
     # ------------------------------------------------------------------------
@@ -2246,11 +2370,8 @@ try:
                 "Live status",
                 group_4,
                 {
-                    "Live": trend_previous_counts.get("Portal Live", 0),
-                    "Committed": trend_previous_counts.get("Portal Committed", 0),
-                    "Cancelled": trend_previous_counts.get("Portal Cancelled", 0),
-                    "Onboarding Pending": trend_previous_counts.get("Portal Onboarding Pending", 0),
-                    "Others": trend_previous_counts.get("Portal Others", 0),
+                    status_label: trend_previous_counts.get(f"Portal {status_label}", 0)
+                    for status_label in LIVE_KPI_STATUS_ORDER
                 },
             )
 
