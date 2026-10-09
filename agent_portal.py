@@ -1342,6 +1342,12 @@ def normalize_api_records(api_df):
         if col not in api.columns:
             api[col] = ""
 
+    # Optional CRM fields displayed in Recent Applications Log. Keep them
+    # optional so older CRM mirror exports without these columns still load.
+    for col in ("Verifier Name", "Agent Remarks"):
+        if col not in api.columns:
+            api[col] = ""
+
     api["Date_Parsed"] = parse_api_date_series(api["Sale Date"])
     api["Advisor"] = api["Advisor (Created Username)"].apply(canonicalize_advisor)
     api["Customer Name"] = api["Customer Name"].fillna("").astype(str).str.strip()
@@ -1371,6 +1377,8 @@ def normalize_api_records(api_df):
     app["Sale Date"] = api["Sale Date"]
     app["Advisor"] = api["Advisor"]
     app["Customer Name"] = api["Customer Name"]
+    app["Verifier Name"] = api["Verifier Name"].apply(clean_reason_text)
+    app["Agent Remarks"] = api["Agent Remarks"].apply(clean_reason_text)
     app["CLI"] = api["Phone Number"]
     app["Quality Status"] = quality
     app["Quality Remarks"] = quality_remarks
@@ -2384,7 +2392,7 @@ try:
                 return True
             if wd == 5:
                 week_num = (dt.day - 1) // 7 + 1
-                return week_num in [1, 3]
+                return week_num in [1, 3, 5]
             return False
 
         range_dates = [
@@ -2915,6 +2923,8 @@ try:
             ("Basic Info.", "S.No."),
             ("Basic Info.", "Sale Date"),
             ("Basic Info.", "Customer Name"),
+            ("Basic Info.", "Verifier Name"),
+            ("Basic Info.", "Agent Remarks"),
             ("Quality Audit", "Quality Status"),
             ("Quality Audit", "Quality Remarks"),
             ("Welcome Call", "Status"),
@@ -3086,8 +3096,9 @@ try:
             searchable_cols = pick_existing(
                 recent_log,
                 [
-                    "Customer Name", "CLI", "Quality Status", "Quality Remarks",
-                    "Status", "Welcome call Remarks", "LetterStatus",
+                    "Customer Name", "Verifier Name", "Agent Remarks", "CLI",
+                    "Quality Status", "Quality Remarks", "Status",
+                    "Welcome call Remarks", "LetterStatus",
                     "Provisioning Status", "Provisioning Remarks", "CallStatus",
                     "Portal Status", "Comments", "Voice of Customer", "Cancellation Reason",
                 ],
