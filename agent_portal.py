@@ -25,6 +25,7 @@ import os
 # - Start/end date filtering
 # - Quality / Welcome Call / Live KPIs
 # - Insight flags
+# - Main KPI cards include change versus the immediately preceding equal-length period
 # - Daily / Monthly breakdowns
 # - Sales activity calendar
 # - Recent applications log with hierarchical filters + pagination
@@ -422,6 +423,22 @@ st.html(
         padding: 3px 7px;
         border-radius: 99px;
     }
+
+    .kpi-trend {
+        display: inline-block;
+        margin-top: 5px;
+        padding: 2px 6px;
+        border-radius: 999px;
+        font-size: .52rem;
+        line-height: 1.25;
+        font-weight: 850;
+        white-space: nowrap;
+        max-width: 100%;
+    }
+    .kpi-trend-good { background: #ECFDF5; color: #047857; }
+    .kpi-trend-bad { background: #FEF2F2; color: #B91C1C; }
+    .kpi-trend-neutral { background: #EFF6FF; color: #1D4ED8; }
+    .kpi-trend-flat { background: #F1F5F9; color: #64748B; }
 
     /* ------------------------------ INSIGHTS ----------------------------- */
     .insight-wrap {
@@ -1682,7 +1699,48 @@ def render_section(title, icon="◆", subtitle=None):
     )
 
 
-def render_kpi(label, value, total):
+def trend_badge_html(label, current, previous):
+    """Compact count trend versus the immediately preceding equal-length period."""
+    if previous is None:
+        return ""
+
+    try:
+        current = int(current)
+        previous = int(previous)
+    except (TypeError, ValueError):
+        return ""
+
+    delta = current - previous
+    if delta == 0:
+        text_value = "→ unchanged"
+        css_class = "flat"
+    else:
+        arrow = "↑" if delta > 0 else "↓"
+        if previous == 0:
+            text_value = f"{arrow} {abs(delta):,} vs 0"
+        else:
+            pct_change = abs(delta) / abs(previous) * 100
+            text_value = f"{arrow} {abs(delta):,} ({pct_change:.0f}%)"
+
+        label_lower = str(label).strip().lower()
+        unfavourable_when_up = any(token in label_lower for token in (
+            "rework", "cancel", "reject", "pending", "paperwork"
+        ))
+        favourable_when_up = any(token in label_lower for token in (
+            "total apps", "approved", "done", "live", "committed"
+        ))
+
+        if unfavourable_when_up:
+            css_class = "bad" if delta > 0 else "good"
+        elif favourable_when_up:
+            css_class = "good" if delta > 0 else "bad"
+        else:
+            css_class = "neutral"
+
+    return f'<div><span class="kpi-trend kpi-trend-{css_class}" title="Change versus immediately preceding period">{escape(text_value)}</span></div>'
+
+
+def render_kpi(label, value, total, previous_count=None):
     lbl = str(label).lower()
     accent = "#94A3B8"
 
@@ -1701,6 +1759,7 @@ def render_kpi(label, value, total):
         if "total apps" not in lbl
         else ""
     )
+    trend_html = trend_badge_html(label, value, previous_count)
 
     st.html(
         f"""
@@ -1708,13 +1767,18 @@ def render_kpi(label, value, total):
             <p class="kpi-label">{escape(str(label))}</p>
             <p class="kpi-value">{value:,}</p>
             {pc_html}
+            {trend_html}
         </div>
         """
     )
 
 
-def kpi_panel(title, kpis):
-    active = [x for x in kpis if x[1] > 0]
+def kpi_panel(title, kpis, previous_counts=None):
+    previous_counts = previous_counts or {}
+    active = [
+        x for x in kpis
+        if x[1] > 0 or previous_counts.get(x[0], 0) > 0
+    ]
     if not active:
         return
 
@@ -1723,7 +1787,10 @@ def kpi_panel(title, kpis):
         cols = st.columns(len(active))
         for i, kpi in enumerate(active):
             with cols[i]:
-                render_kpi(kpi[0], kpi[1], kpi[2])
+                render_kpi(
+                    kpi[0], kpi[1], kpi[2],
+                    previous_count=previous_counts.get(kpi[0]),
+                )
 
 
 def pct(value, total):
@@ -2059,6 +2126,50 @@ try:
     if wc_col:
         ag1_filtered["WC_Clean"] = ag1_filtered[wc_col].apply(map_wc)
 
+    # The trend shown on each main KPI card compares the selected date range
+    # with the immediately preceding period of the same number of days.
+    period_days = (end_date - start_date).days + 1
+    prev_start = start_date - datetime.timedelta(days=period_days)
+    prev_end = start_date - datetime.timedelta(days=1)
+    previous_ag1 = ag1[date_range_mask(ag1["Date_Parsed"], prev_start, prev_end)].copy()
+    previous_ag2 = ag2[date_range_mask(ag2["Date_Parsed"], prev_start, prev_end)].copy()
+
+    if "Quality Status" in previous_ag1.columns:
+        previous_ag1["Q_Status"] = previous_ag1["Quality Status"].apply(map_quality)
+    else:
+        previous_ag1["Q_Status"] = "Others"
+    if "Status" in previous_ag2.columns:
+        previous_ag2["P_Status"] = previous_ag2["Status"].apply(map_portal)
+    else:
+        previous_ag2["P_Status"] = "Others"
+    if wc_col and wc_col in previous_ag1.columns:
+        previous_ag1["WC_Clean"] = previous_ag1[wc_col].apply(map_wc)
+
+    trend_previous_counts = {"Total Apps": len(previous_ag1)}
+    for label, status in [
+        ("Approved", "Approved"), ("Rework", "Rework"),
+        ("Cancelled", "Cancelled"), ("Rejected", "Rejected"),
+        ("Others", "Others"),
+    ]:
+        trend_previous_counts[label] = int((previous_ag1["Q_Status"] == status).sum())
+
+    if wc_col and "WC_Clean" in previous_ag1.columns:
+        for label, status in [
+            ("WC Done", "Done"), ("WC Pending", "Pending"),
+            ("WC Paperwork", "Paperwork"), ("WC Cancelled", "Cancelled"),
+            ("WC Others", "Others"),
+        ]:
+            trend_previous_counts[label] = int((previous_ag1["WC_Clean"] == status).sum())
+
+    for label, status in [
+        ("Live", "Live"), ("Committed", "Committed"),
+        ("Cancelled", "Cancelled"), ("Others", "Others"),
+    ]:
+        # Quality/Welcome and Portal status groups reuse some labels. Keep the
+        # portal trend keys separate so they cannot overwrite other groups.
+        key = f"Portal {label}"
+        trend_previous_counts[key] = int((previous_ag2["P_Status"] == status).sum())
+
     # ------------------------------------------------------------------------
     # KPI ROW
     # ------------------------------------------------------------------------
@@ -2104,36 +2215,17 @@ try:
         with b1:
             with st.container(border=True):
                 st.markdown("**Overview**")
-                render_kpi(group_1[0][0], group_1[0][1], group_1[0][2])
+                render_kpi(group_1[0][0], group_1[0][1], group_1[0][2], previous_count=trend_previous_counts.get("Total Apps"))
         with b2:
-            kpi_panel("Quality audit status", group_2)
+            kpi_panel("Quality audit status", group_2, trend_previous_counts)
         with b3:
-            kpi_panel("Welcome call status", group_3)
+            kpi_panel("Welcome call status", group_3, trend_previous_counts)
         with b4:
-            kpi_panel("Live status", group_4)
+            kpi_panel("Live status", group_4, {"Live": trend_previous_counts.get("Portal Live", 0), "Committed": trend_previous_counts.get("Portal Committed", 0), "Cancelled": trend_previous_counts.get("Portal Cancelled", 0), "Others": trend_previous_counts.get("Portal Others", 0)})
 
-        # Compact performance pulse / activity consistency sits directly under
-        # the KPI cards so the top dashboard reads as one cohesive block.
-        period_days = (end_date - start_date).days + 1
-        prev_start = start_date - datetime.timedelta(days=period_days)
-        prev_end = start_date - datetime.timedelta(days=1)
-
-        current_summary = {
-            "apps": total_apps,
-            "approval_rate": pct(len(ag1_filtered[ag1_filtered["Q_Status"] == "Approved"]), total_apps),
-            "wc_done_rate": pct(
-                len(ag1_filtered[ag1_filtered["WC_Clean"] == "Done"])
-                if wc_col and "WC_Clean" in ag1_filtered.columns else 0,
-                total_apps,
-            ),
-            "live_rate": pct(
-                len(ag2_filtered[ag2_filtered["P_Status"] == "Live"]),
-                total_ag2 if total_ag2 > 0 else total_apps,
-            ),
-        }
-        previous_summary = summary_for_period(ag1, ag2, prev_start, prev_end, wc_col)
-
-        # Working-day / activity calculations.
+        # Compact activity consistency. Period-to-period trends now live on
+        # the main KPI cards, so repeated Performance Pulse comparison cards
+        # are intentionally omitted.
         def portal_is_holiday(dt):
             wd = dt.weekday()
             if wd == 6:
@@ -2165,33 +2257,11 @@ try:
         avg_working_day = (total_apps / len(working_days)) if working_days else 0
 
         st.html(
-            f"""
-            <div class="pulse-shell">
-                <div class="pulse-head">
-                    <div class="pulse-title">Performance pulse</div>
-                    <div class="pulse-note">
-                        Selected period: {escape(start_date.strftime('%d %b'))} – {escape(end_date.strftime('%d %b %Y'))}
-                    </div>
-                </div>
-                <div class="pulse-subtitle"><span></span>Period momentum</div>
-            </div>
-            """
-        )
-
-        render_comparison_cards(
-            [
-                ("Applications", current_summary["apps"], previous_summary["apps"], False, f"Previous: {previous_summary['apps']:,}"),
-                ("QA approval", current_summary["approval_rate"], previous_summary["approval_rate"], True, f"Previous: {previous_summary['approval_rate']:.1f}%"),
-                ("WC completion", current_summary["wc_done_rate"], previous_summary["wc_done_rate"], True, f"Previous: {previous_summary['wc_done_rate']:.1f}%"),
-                ("Live rate", current_summary["live_rate"], previous_summary["live_rate"], True, f"Previous: {previous_summary['live_rate']:.1f}%"),
-            ]
-        )
-
-        st.html(
-            """
-            <div class="pulse-separator"></div>
-            <div class="pulse-subtitle"><span></span>Activity consistency</div>
-            """
+            '<div style="display:flex;align-items:center;gap:7px;margin:7px 0 5px;'
+            'font-size:.68rem;font-weight:900;letter-spacing:.65px;color:#475569;'
+            'text-transform:uppercase;"><span style="width:4px;height:13px;border-radius:4px;'
+            'background:linear-gradient(180deg,#2563EB,#06B6D4);display:inline-block;"></span>'
+            'Activity consistency</div>'
         )
 
         activity_cards = [
@@ -2213,9 +2283,6 @@ try:
                 """
             )
         st.html('<div class="mini-stat-grid">' + ''.join(activity_html) + '</div>')
-
-        if len(working_days) > 0 and zero_sales_days > 0:
-            st.caption(f"{zero_sales_days} working day(s) had no applications in the selected period.")
 
     with top_right:
             render_section("Sales activity heatmap", "▦", "Attendance + daily sales intensity — working-day cells show attendance and sales")
@@ -2495,141 +2562,6 @@ try:
                 "format: date + attendance/sales · Sundays + 1st/3rd/5th Saturdays are holidays"
             )
 
-
-    # ========================================================================
-    # ACTION CENTRE — CANCELLATION FIRST
-    # ========================================================================
-    quality_cancel_count = len(ag1_filtered[ag1_filtered["Q_Status"] == "Cancelled"])
-    wc_cancel_count = 0
-    if wc_col and "WC_Clean" in ag1_filtered.columns:
-        wc_cancel_count = len(ag1_filtered[ag1_filtered["WC_Clean"] == "Cancelled"])
-    live_cancel_count = len(ag2_filtered[ag2_filtered["P_Status"] == "Cancelled"]) if not ag2_filtered.empty else 0
-    total_cancel_count = quality_cancel_count + wc_cancel_count + live_cancel_count
-
-    st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
-    render_section(
-        "Action centre",
-        "⚡",
-        "Cancellation-focused queues highlighting records that need attention in the selected period",
-    )
-
-    action_items = [
-        ("Quality cancellations", quality_cancel_count, "!", "#FEF2F2", "#B91C1C", "Review cancelled applications and the associated Quality Remarks for recurring loss points."),
-        ("Welcome call cancellations", wc_cancel_count, "☎", "#FFF7ED", "#C2410C", "Review Welcome Call cancellations and remarks to identify avoidable customer drop-offs."),
-        ("Live-stage cancellations", live_cancel_count, "×", "#FEF2F2", "#991B1B", "Review final-stage cancellations, customer feedback and cancellation reasons."),
-    ]
-
-    action_html = []
-    for title, count, icon, bg, fg, copy in action_items:
-        action_html.append(
-            f"""
-            <div class="action-card">
-                <div class="action-top">
-                    <div class="action-icon" style="background:{bg};color:{fg};">{icon}</div>
-                    <div class="action-label">{escape(title)}</div>
-                </div>
-                <div class="action-count">{count:,}</div>
-                <div class="action-copy">{escape(copy)}</div>
-            </div>
-            """
-        )
-    st.html('<div class="action-wrap">' + ''.join(action_html) + '</div>')
-
-    st.caption(f"Total cancellation records across the three tracked stages in this period: {total_cancel_count:,}")
-
-    with st.expander("Open cancellation queues", expanded=False):
-        aq1, aq2, aq3 = st.tabs(["Quality cancellations", "Welcome cancellations", "Live-stage cancellations"])
-
-        with aq1:
-            quality_cancel_df = ag1_filtered[ag1_filtered["Q_Status"] == "Cancelled"].copy()
-            if not quality_cancel_df.empty:
-                quality_cancel_df = add_date_strings(quality_cancel_df, "Standardized_Date", "Sale Date")
-                cols = pick_existing(
-                    quality_cancel_df,
-                    ["Sale Date", "Customer Name", "CLI", "Quality Status", "Quality Remarks"],
-                )
-                st.dataframe(quality_cancel_df[cols], use_container_width=True, hide_index=True, height=260)
-            else:
-                st.success("No Quality Cancellation applications in the selected period.")
-
-        with aq2:
-            if wc_col:
-                wc_cancel_df = ag1_filtered[ag1_filtered["WC_Clean"] == "Cancelled"].copy()
-                if not wc_cancel_df.empty:
-                    wc_cancel_df = add_date_strings(wc_cancel_df, "Standardized_Date", "Sale Date")
-                    cols = pick_existing(
-                        wc_cancel_df,
-                        ["Sale Date", "Customer Name", "CLI", wc_col, "Welcome call Remarks"],
-                    )
-                    st.dataframe(wc_cancel_df[cols], use_container_width=True, hide_index=True, height=260)
-                else:
-                    st.success("No Welcome Call Cancellation applications in the selected period.")
-            else:
-                st.info("Welcome Call status is not available in the current source data.")
-
-        with aq3:
-            live_cancel_df = ag2_filtered[ag2_filtered["P_Status"] == "Cancelled"].copy()
-            if not live_cancel_df.empty:
-                live_cancel_df = add_date_strings(live_cancel_df, "Sale Date", "Sale Date")
-                cols = pick_existing(
-                    live_cancel_df,
-                    [
-                        "Sale Date",
-                        "Customer Name",
-                        "Telephone No.",
-                        "Portal Status",
-                        "Cancellation Reason",
-                        "Comments",
-                        "Voice of Customer",
-                    ],
-                )
-                st.dataframe(live_cancel_df[cols], use_container_width=True, hide_index=True, height=260)
-            else:
-                st.success("No Live-stage Cancellation applications in the selected period.")
-
-    # ========================================================================
-    # PIPELINE SNAPSHOT + PERFORMANCE PULSE
-    # ========================================================================
-    st.divider()
-    funnel_col = st.container()
-
-    with funnel_col:
-        render_section(
-            "Pipeline snapshot",
-            "◎",
-            "Four true stages. Committed remains alongside Live and is not treated as a fifth stage.",
-        )
-        stages, committed_count = stage_snapshot(ag1_filtered, ag2_filtered, wc_col)
-        total_for_funnel = max(total_apps, 1)
-        funnel_rows = []
-        for name, count, color in stages:
-            width = min(max(pct(count, total_for_funnel), 0), 100)
-            companion = ""
-            if name == "Live":
-                companion = f'<div class="funnel-companion">Committed: {committed_count:,}</div>'
-            funnel_rows.append(
-                f"""
-                <div class="funnel-row">
-                    <div class="funnel-name">
-                        {escape(name)}
-                        {companion}
-                    </div>
-                    <div class="funnel-track">
-                        <div class="funnel-fill" style="width:{width:.1f}%;background:{color};"></div>
-                    </div>
-                    <div class="funnel-value">{count:,} · {width:.1f}%</div>
-                </div>
-                """
-            )
-        st.html(
-            '<div class="funnel-shell">'
-            '<div class="funnel-note">'
-            'Selected-period stage snapshot: Quality = Approved, Welcome = Done, Live = Live. '
-            'Committed is companion information only.'
-            '</div>'
-            + ''.join(funnel_rows)
-            + '</div>'
-        )
 
     # ------------------------------------------------------------------------
     # INSIGHT FLAGS
