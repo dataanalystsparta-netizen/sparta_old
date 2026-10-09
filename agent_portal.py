@@ -2384,7 +2384,7 @@ try:
                 return True
             if wd == 5:
                 week_num = (dt.day - 1) // 7 + 1
-                return week_num in [1, 3, 5]
+                return week_num in [1, 3]
             return False
 
         range_dates = [
