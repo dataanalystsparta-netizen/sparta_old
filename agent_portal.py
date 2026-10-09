@@ -1642,15 +1642,25 @@ def map_quality(val):
 
 
 def map_portal(val):
-    s = str(val).lower().strip()
+    """Normalize onboarding outcomes for the Live Status breakdown.
+
+    Cancellation/rejection has precedence so values such as "To Be Cancelled"
+    are always counted in Cancelled, even if other words are present. Pending
+    values in the onboarding-status field are grouped as Onboarding Pending.
+    """
+    s = str(val).strip().lower()
+    if not s or s in {"none", "nan", "nat", "null"}:
+        return "Others"
+
+    # All cancellation / rejection variants roll into one Cancelled category.
+    if any(token in s for token in ("cancel", "reject")):
+        return "Cancelled"
     if "live" in s:
         return "Live"
-    if "com" in s:
+    if "comm" in s:
         return "Committed"
-    if any(x in s for x in ["pend", "pnd", "other work", "delay"]):
-        return "Pending"
-    if any(x in s for x in ["can", "rej"]):
-        return "Cancelled"
+    if any(token in s for token in ("pend", "pnd", "other work", "delay")):
+        return "Onboarding Pending"
     return "Others"
 
 
@@ -2162,8 +2172,11 @@ try:
             trend_previous_counts[label] = int((previous_ag1["WC_Clean"] == status).sum())
 
     for label, status in [
-        ("Live", "Live"), ("Committed", "Committed"),
-        ("Cancelled", "Cancelled"), ("Others", "Others"),
+        ("Live", "Live"),
+        ("Committed", "Committed"),
+        ("Cancelled", "Cancelled"),
+        ("Onboarding Pending", "Onboarding Pending"),
+        ("Others", "Others"),
     ]:
         # Quality/Welcome and Portal status groups reuse some labels. Keep the
         # portal trend keys separate so they cannot overwrite other groups.
@@ -2200,6 +2213,7 @@ try:
         ("Live", len(ag2_filtered[ag2_filtered["P_Status"] == "Live"]), live_total_denominator),
         ("Committed", len(ag2_filtered[ag2_filtered["P_Status"] == "Committed"]), live_total_denominator),
         ("Cancelled", len(ag2_filtered[ag2_filtered["P_Status"] == "Cancelled"]), live_total_denominator),
+        ("Onboarding Pending", len(ag2_filtered[ag2_filtered["P_Status"] == "Onboarding Pending"]), live_total_denominator),
         ("Others", len(ag2_filtered[ag2_filtered["P_Status"] == "Others"]), live_total_denominator),
     ]
 
@@ -2211,17 +2225,34 @@ try:
     with top_left:
         render_section("Performance snapshot", "✦", "Your selected date range at a glance")
 
-        b1, b2, b3, b4 = st.columns([1.15, 2.6, 2.6, 2.35], gap="small")
-        with b1:
+        # Four primary KPI panels in a clean 2 x 2 layout.
+        # Nested status values keep their individual trends inside each panel.
+        kpi_top_left, kpi_top_right = st.columns(2, gap="small")
+        with kpi_top_left:
             with st.container(border=True):
                 st.markdown("**Overview**")
-                render_kpi(group_1[0][0], group_1[0][1], group_1[0][2], previous_count=trend_previous_counts.get("Total Apps"))
-        with b2:
+                render_kpi(
+                    group_1[0][0], group_1[0][1], group_1[0][2],
+                    previous_count=trend_previous_counts.get("Total Apps"),
+                )
+        with kpi_top_right:
             kpi_panel("Quality audit status", group_2, trend_previous_counts)
-        with b3:
+
+        kpi_bottom_left, kpi_bottom_right = st.columns(2, gap="small")
+        with kpi_bottom_left:
             kpi_panel("Welcome call status", group_3, trend_previous_counts)
-        with b4:
-            kpi_panel("Live status", group_4, {"Live": trend_previous_counts.get("Portal Live", 0), "Committed": trend_previous_counts.get("Portal Committed", 0), "Cancelled": trend_previous_counts.get("Portal Cancelled", 0), "Others": trend_previous_counts.get("Portal Others", 0)})
+        with kpi_bottom_right:
+            kpi_panel(
+                "Live status",
+                group_4,
+                {
+                    "Live": trend_previous_counts.get("Portal Live", 0),
+                    "Committed": trend_previous_counts.get("Portal Committed", 0),
+                    "Cancelled": trend_previous_counts.get("Portal Cancelled", 0),
+                    "Onboarding Pending": trend_previous_counts.get("Portal Onboarding Pending", 0),
+                    "Others": trend_previous_counts.get("Portal Others", 0),
+                },
+            )
 
         # Compact activity consistency. Period-to-period trends now live on
         # the main KPI cards, so repeated Performance Pulse comparison cards
@@ -2694,7 +2725,7 @@ try:
         render_section("Live status", "04")
         if not ag2_filtered.empty:
             period_port = ag2_filtered.groupby(["Period", "P_Status"]).size().unstack(fill_value=0)
-            port_order = ["Live", "Committed", "Cancelled", "Others"]
+            port_order = ["Live", "Committed", "Cancelled", "Onboarding Pending", "Others"]
             period_port = period_port.reindex(columns=port_order, fill_value=0)
             period_port = period_port.loc[:, (period_port != 0).any(axis=0)]
             if not period_port.empty:
@@ -2703,7 +2734,7 @@ try:
                     period_port.style
                     .format(lambda x: "-" if x == 0 else x)
                     .background_gradient(cmap="Greens", subset=pd.IndexSlice[:, period_port.columns.intersection(["Live"])], vmin=1, vmax=vmax_port)
-                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_port.columns.intersection(["Committed"])], vmin=1, vmax=vmax_port)
+                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_port.columns.intersection(["Committed", "Onboarding Pending"])], vmin=1, vmax=vmax_port)
                     .background_gradient(cmap="Reds", subset=pd.IndexSlice[:, period_port.columns.intersection(["Cancelled"])], vmin=1, vmax=vmax_port)
                     .map(lambda x: "background-color: transparent" if x == 0 else "")
                 )
@@ -2869,7 +2900,7 @@ try:
 
         quality_options = ["Approved", "Cancelled", "Rework", "Rejected", "Others"]
         welcome_options = ["Done", "Follow up", "Pending", "Paperwork", "Cancelled", "Others"]
-        live_options = ["Live", "Committed", "Pending", "Cancelled", "Others"]
+        live_options = ["Live", "Committed", "Cancelled", "Onboarding Pending", "Others"]
 
         with st.expander("☷  Advanced status filters", expanded=False):
             st.caption(
