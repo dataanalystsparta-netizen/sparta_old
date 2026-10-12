@@ -1649,37 +1649,17 @@ def map_quality(val):
     return "Others"
 
 
-def map_portal(val):
-    """Normalize onboarding outcomes for the Live Status breakdown.
-
-    Cancellation/rejection has precedence so values such as "To Be Cancelled"
-    are always counted in Cancelled, even if other words are present. Pending
-    values in the onboarding-status field are grouped as Onboarding Pending.
-    """
-    s = str(val).strip().lower()
-    if not s or s in {"none", "nan", "nat", "null"}:
-        return "Others"
-
-    # All cancellation / rejection variants roll into one Cancelled category.
-    if any(token in s for token in ("cancel", "reject")):
-        return "Cancelled"
-    if "live" in s:
-        return "Live"
-    if "comm" in s:
-        return "Committed"
-    if any(token in s for token in ("pend", "pnd", "other work", "delay")):
-        return "Onboarding Pending"
-    return "Others"
-
-
 def map_wc(val):
-    """Normalize Welcome Call outcomes; rejection belongs in WC Cancelled."""
+    """Normalize Welcome Call outcomes; Welcome Rejected belongs to Cancelled."""
+    try:
+        if pd.isna(val):
+            return "Others"
+    except (TypeError, ValueError):
+        pass
     s = str(val).strip().lower()
-    if not s or s in {"none", "nan", "nat", "null", "-"}:
+    if not s or s in {"none", "nan", "nat", "null", "-", "n/a"}:
         return "Others"
-
-    # Rejection/cancellation takes precedence. In particular, Welcome Rejected
-    # is a Welcome Call cancellation outcome, not WC Others.
+    # This check intentionally precedes positive/pending matching.
     if any(token in s for token in ("cancel", "reject", "rejected", "rej")):
         return "Cancelled"
     if any(token in s for token in ("done", "pass", "comp", "approved", "approve")):
@@ -1693,56 +1673,272 @@ def map_wc(val):
     return "Others"
 
 
-LIVE_KPI_STATUS_ORDER = [
+# ---------------------------------------------------------------------------
+# CENTRAL, MUTUALLY EXCLUSIVE DOWNSTREAM CLASSIFICATION
+# ---------------------------------------------------------------------------
+DOWNSTREAM_CATEGORY_ORDER = [
     "Live",
-    "Committed",
-    "Cancelled",
-    "Onboarding Pending",
-    "Confirmation Approved",
-    "Confirmation Followup",
-    "Confirmation Pending",
-    "Others",
+    "Committed Rem.",
+    "Committed Cancelled",
+    "Live Cancelled",
+    "Unclassified / Review",
 ]
+# Main Live Status cards and previous-period trend cards use exactly the same
+# mutually exclusive reporting categories.
+LIVE_KPI_STATUS_ORDER = list(DOWNSTREAM_CATEGORY_ORDER)
 
 
-def _is_blank_status(value):
-    if pd.isna(value):
+def normalize_workflow_status(value):
+    """Normalise a *status field* without inspecting comments/reason text."""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    raw = str(value).strip()
+    if not raw or raw.lower() in {"nan", "none", "null", "nat", "-", "n/a"}:
+        return ""
+    # Harmonise visually equivalent hyphens / repeated whitespace while
+    # retaining the words that distinguish business statuses.
+    raw = raw.replace("\u2010", "-").replace("\u2011", "-")
+    raw = raw.replace("\u2012", "-").replace("\u2013", "-").replace("\u2014", "-")
+    raw = re.sub(r"\s*[-]+\s*", " ", raw)
+    raw = re.sub(r"\s*:\s*", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip().lower()
+    return raw
+
+
+def _is_explicit_cancel_status(value):
+    """Recognise explicit terminal cancellation/rejection in a status field."""
+    status = normalize_workflow_status(value)
+    if not status:
+        return False
+    exact = {
+        "cancel", "cancelled", "canceled", "rejected", "reject", "rejection",
+        "to be cancelled", "to be canceled", "order cancelled", "order canceled",
+        "connectivity order cancelled", "connectivity order canceled",
+        "onboarding cancelled", "onboarding canceled", "onboarding rejected",
+        "live cancelled", "live canceled", "live rejected",
+        "port cancelled", "port canceled", "port rejected",
+    }
+    if status in exact:
         return True
-    return str(value).strip().lower() in {"", "none", "nan", "nat", "null", "-"}
+    # Status values may include a brief, structured qualifier (e.g. "Order
+    # Cancelled by Provider"). Do not search free-text remarks/reasons here.
+    return status.startswith((
+        "cancelled ", "canceled ", "rejected ", "reject ",
+        "to be cancelled ", "to be canceled ",
+        "order cancelled ", "order canceled ",
+        "connectivity order cancelled ", "connectivity order canceled ",
+        "onboarding cancelled ", "onboarding canceled ", "onboarding rejected ",
+        "live cancelled ", "live canceled ", "live rejected ",
+        "port cancelled ", "port canceled ", "port rejected ",
+    ))
 
 
-def map_live_kpi_status(primary_status, call_status=""):
-    """Use onboarding Status first; fall back to CallStatus only when blank.
+def _is_confirmation_cancel_status(value):
+    """Recognise an explicit cancellation outcome in the Confirmation field."""
+    status = normalize_workflow_status(value)
+    if not status:
+        return False
+    if status in {
+        "to be cancelled", "to be canceled", "cancel", "cancelled", "canceled",
+        "reject", "rejected", "rejection", "confirmation cancelled",
+        "confirmation canceled", "confirmation rejected",
+    }:
+        return True
+    return status.startswith((
+        "to be cancelled ", "to be canceled ", "confirmation cancelled ",
+        "confirmation canceled ", "confirmation rejected ",
+    ))
 
-    To Be Cancelled and rejection variants roll into Cancelled. Confirmation
-    Approved/Followup/Pending remain visible as separate categories when they
-    are the fallback status, instead of being incorrectly counted as Others.
+
+def _is_confirmation_progress_status(value):
+    """Known confirmation progress values; unknown values remain unknown."""
+    status = normalize_workflow_status(value)
+    if not status:
+        return False
+    prefixes = (
+        "confirmation approved", "confirmation followup", "confirmation follow up",
+        "confirmation pending",
+    )
+    if status.startswith(prefixes):
+        return True
+    return status in {
+        # Older Sparta2 exports sometimes store the shorter status labels.
+        "approved", "approve", "followup", "follow up", "pending", "pnd",
+        "committed", "committed rem", "committed reminder", "committed pending",
+    }
+
+
+def _onboarding_state(value):
+    """Return live / cancelled / committed-pending / blank / unknown."""
+    status = normalize_workflow_status(value)
+    if not status:
+        return "blank"
+
+    # These exact current outcomes are explicitly known to mean Live.
+    # Normalisation makes Port-Pending and Port Pending equivalent.
+    if status in {
+        "onboarding approved", "port pending", "live", "live approved",
+        "onboarding live",
+    } or status.startswith("live "):
+        return "live"
+
+    # A cancellation/rejection stated in the primary onboarding outcome is a
+    # downstream/live-stage cancellation, not a confirmation-stage cancellation.
+    if _is_explicit_cancel_status(status):
+        return "live_cancelled"
+
+    if status in {
+        "committed", "committed rem", "committed reminder", "committed pending",
+        "committed live",
+    } or status.startswith("committed "):
+        return "committed"
+
+    # Preserve established legacy mappings for clear pending/other-work/delay
+    # status values. The primary Port Pending live outcome was handled above.
+    if status in {
+        "onboarding pending", "pending onboarding", "pending", "pnd",
+        "other work", "other work assigned", "delayed", "delay", "in progress",
+        "provisioning pending", "dispatch pending", "onboarding in progress",
+    } or "pending" in status or "other work" in status or "delay" in status:
+        return "pending"
+
+    return "unknown"
+
+
+def classify_downstream_record(row):
+    """Return (category, review_flag) for exactly one downstream record.
+
+    Precedence:
+      1. A decisive primary onboarding Live/cancelled outcome wins; contradictory
+         downstream stage values set a review flag rather than double-counting.
+      2. With a known primary onboarding status, an explicit confirmation-stage
+         cancellation is Committed Cancelled; confirmation approval alone never
+         overrides Onboarding Pending.
+      3. Known committed/pending onboarding outcomes become Committed Rem.
+      4. With a blank onboarding status, decisive Confirmation status values may
+         classify the record. Explicit Provisioning/Dispatch cancellation is
+         Live Cancelled only if there is no contradictory later confirmation.
+      5. Unknown primary statuses and genuinely inconclusive blanks remain
+         Unclassified / Review. Comments/reason fields are never used as flags.
     """
-    if not _is_blank_status(primary_status):
-        return map_portal(primary_status)
+    if hasattr(row, "get"):
+        primary_raw = row.get("Status", "")
+        confirmation_raw = row.get("CallStatus", row.get("Confirmation Status", ""))
+        provisioning_raw = row.get("Provisioning Status", "")
+        dispatch_raw = row.get("LetterStatus", row.get("Dispatch Status", ""))
+    else:
+        primary_raw = ""
+        confirmation_raw = ""
+        provisioning_raw = ""
+        dispatch_raw = ""
 
-    fallback = "" if _is_blank_status(call_status) else str(call_status).strip()
-    normalized = re.sub(r"\s+", " ", fallback).strip().lower()
-    if not normalized:
-        return "Others"
+    confirmation = normalize_workflow_status(confirmation_raw)
+    primary_state = _onboarding_state(primary_raw)
+    confirmation_cancel = _is_confirmation_cancel_status(confirmation_raw)
+    confirmation_progress = _is_confirmation_progress_status(confirmation_raw)
+    provisioning_cancel = _is_explicit_cancel_status(provisioning_raw)
+    dispatch_cancel = _is_explicit_cancel_status(dispatch_raw)
+    earlier_stage_cancel = provisioning_cancel or dispatch_cancel
 
-    if any(token in normalized for token in ("cancel", "reject", "rejected", "rej")):
-        return "Cancelled"
+    # The current primary onboarding outcome is authoritative when it is a
+    # decisive terminal outcome. Contradictions are visible for investigation.
+    if primary_state == "live":
+        conflicts = []
+        if confirmation_cancel:
+            conflicts.append("Confirmation shows cancellation while onboarding shows Live")
+        if earlier_stage_cancel:
+            conflicts.append("Provisioning/Dispatch shows cancellation while onboarding shows Live")
+        return "Live", "; ".join(conflicts)
 
-    if "confirmation" in normalized:
-        if "pend" in normalized or "pnd" in normalized:
-            return "Confirmation Pending"
-        if "follow" in normalized or "f/u" in normalized:
-            return "Confirmation Followup"
-        if "approv" in normalized or "approve" in normalized:
-            return "Confirmation Approved"
+    if primary_state == "live_cancelled":
+        conflicts = []
+        if confirmation_progress:
+            conflicts.append("Confirmation progress conflicts with onboarding cancellation/rejection")
+        if confirmation_cancel:
+            conflicts.append("Confirmation cancellation may be pre-Live while onboarding indicates Live Cancelled")
+        return "Live Cancelled", "; ".join(conflicts)
 
-    # If CallStatus itself carries a standard onboarding status, preserve the
-    # portal's existing normalization for Live / Committed / Pending values.
-    mapped = map_portal(fallback)
-    if mapped != "Others":
-        return mapped
-    return "Others"
+    # A non-empty, unknown onboarding value is not overridden by lower-stage
+    # fields: keep it visible and flag for review rather than invent meaning.
+    if primary_state == "unknown":
+        return "Unclassified / Review", (
+            f"Unrecognised onboarding status: {str(primary_raw).strip()}"
+        )
+
+    # A specific confirmation cancellation belongs to Committed Cancelled only
+    # when onboarding has not already established a Live/Live Cancelled outcome.
+    if confirmation_cancel:
+        return "Committed Cancelled", ""
+
+    if primary_state in {"committed", "pending"}:
+        flag = ""
+        if earlier_stage_cancel:
+            flag = "Onboarding is committed/pending but Provisioning/Dispatch shows cancellation/rejection"
+        return "Committed Rem.", flag
+
+    # Primary onboarding status is blank. A valid confirmation stage can establish
+    # a committed/reminder outcome, but not Live solely from Confirmation Approved.
+    if primary_state == "blank":
+        # A true legacy Live value in CallStatus is retained for historical rows;
+        # CRM Confirmation Approved is deliberately handled as Committed Rem.
+        if confirmation in {"live", "live approved", "onboarding approved", "port pending"}:
+            flag = "Legacy Live outcome is stored in CallStatus; verify source mapping"
+            if earlier_stage_cancel:
+                flag += "; Provisioning/Dispatch cancellation also present"
+            return "Live", flag
+
+        if confirmation_progress:
+            flag = ""
+            if earlier_stage_cancel:
+                flag = "Confirmation progress conflicts with Provisioning/Dispatch cancellation/rejection"
+            return "Committed Rem.", flag
+
+        # A non-empty unknown confirmation status prevents an earlier-stage
+        # cancellation from being treated as a definitive terminal outcome.
+        if confirmation:
+            return "Unclassified / Review", f"Unrecognised confirmation status with blank onboarding status: {str(confirmation_raw).strip()}"
+
+        if earlier_stage_cancel:
+            return "Live Cancelled", "Cancellation/rejection identified from an explicit Provisioning/Dispatch status; onboarding/confirmation are blank"
+
+        return "Unclassified / Review", "Onboarding and confirmation statuses are blank"
+
+    return "Unclassified / Review", "Status combination requires review"
+
+
+def classify_downstream_frame(frame):
+    """Attach the one central category and any conflict/review flag to a copy."""
+    result = frame.copy()
+    if result.empty:
+        result["Downstream_Category"] = pd.Series(index=result.index, dtype="object")
+        result["Downstream_Review_Flag"] = pd.Series(index=result.index, dtype="object")
+        result["P_Status"] = result["Downstream_Category"]
+        return result
+    classified = [classify_downstream_record(row) for _, row in result.iterrows()]
+    result["Downstream_Category"] = [value[0] for value in classified]
+    result["Downstream_Review_Flag"] = [value[1] for value in classified]
+    # Compatibility alias for existing charts / insights; this is no longer a
+    # separate classification rule.
+    result["P_Status"] = result["Downstream_Category"]
+    return result
+
+
+def map_portal(val):
+    """Compatibility wrapper; all downstream mapping goes through one classifier."""
+    return classify_downstream_record({"Status": val})[0]
+
+
+def map_live_kpi_status(primary_status, call_status="", provisioning_status="", dispatch_status=""):
+    """Compatibility wrapper for the central classifier, including legacy fallback fields."""
+    return classify_downstream_record({
+        "Status": primary_status,
+        "CallStatus": call_status,
+        "Provisioning Status": provisioning_status,
+        "LetterStatus": dispatch_status,
+    })[0]
 
 
 def build_wc_done_live_kpi_rows(apps_frame, portal_frame, welcome_status_col):
@@ -1793,10 +1989,13 @@ def build_wc_done_live_kpi_rows(apps_frame, portal_frame, welcome_status_col):
 
     portal = add_record_keys(portal, "Sale Date", "Telephone No.")
     portal = portal[portal["_RecordKey"].astype(str).isin(wc_done_keys)].copy()
-    portal["Live_KPI_Status"] = portal.apply(
-        lambda row: map_live_kpi_status(row.get("Status", ""), row.get("CallStatus", "")),
-        axis=1,
-    )
+    # Classification is calculated once on the full downstream frame upstream.
+    # Reuse it here so eligibility remains a separate decision from category.
+    if "Downstream_Category" not in portal.columns:
+        portal = classify_downstream_frame(portal)
+    portal["Live_KPI_Status"] = portal["Downstream_Category"]
+    if "Downstream_Review_Flag" not in portal.columns:
+        portal["Downstream_Review_Flag"] = ""
     return portal
 
 
@@ -1875,14 +2074,16 @@ def render_kpi(label, value, total, previous_count=None):
     lbl = str(label).lower()
     accent = "#94A3B8"
 
-    if "total" in lbl:
+    # Cancellation/rejection must win over terms such as "Live" or
+    # "Committed" in the same category label, so terminal-loss cards are red.
+    if "can" in lbl or "rej" in lbl:
+        accent = "#EF4444"
+    elif "total" in lbl:
         accent = "#3B82F6"
     elif any(x in lbl for x in ["appr", "done", "live"]):
         accent = "#10B981"
     elif any(x in lbl for x in ["rew", "pend", "paper", "comm"]):
         accent = "#F59E0B"
-    elif "can" in lbl or "rej" in lbl:
-        accent = "#EF4444"
 
     percent = (value / total * 100) if total > 0 else 0
     pc_html = (
@@ -1974,8 +2175,8 @@ def stage_snapshot(apps_df, portal_df, welcome_col):
     wc_done = 0
     if welcome_col and "WC_Clean" in apps_df.columns:
         wc_done = len(apps_df[apps_df["WC_Clean"] == "Done"])
-    live = len(portal_df[portal_df["P_Status"] == "Live"]) if not portal_df.empty else 0
-    committed = len(portal_df[portal_df["P_Status"] == "Committed"]) if not portal_df.empty else 0
+    live = len(portal_df[portal_df["Downstream_Category"] == "Live"]) if not portal_df.empty and "Downstream_Category" in portal_df.columns else 0
+    committed = len(portal_df[portal_df["Downstream_Category"] == "Committed Rem."]) if not portal_df.empty and "Downstream_Category" in portal_df.columns else 0
 
     stages = [
         ("Applications", total, "#3B82F6"),
@@ -2027,10 +2228,9 @@ def summary_for_period(base_apps, base_portal, start_date, end_date, welcome_col
     else:
         apps["Q_Status"] = "Others"
 
-    if "Status" in portal.columns:
-        portal["P_Status"] = portal["Status"].apply(map_portal)
-    else:
-        portal["P_Status"] = "Others"
+    if "Downstream_Category" not in portal.columns:
+        portal = classify_downstream_frame(portal)
+    portal["P_Status"] = portal["Downstream_Category"]
 
     total_apps = len(apps)
     total_portal = len(portal)
@@ -2041,7 +2241,7 @@ def summary_for_period(base_apps, base_portal, start_date, end_date, welcome_col
         apps["WC_Clean"] = apps[welcome_col].apply(map_wc)
         wc_done = len(apps[apps["WC_Clean"] == "Done"])
 
-    live = len(portal[portal["P_Status"] == "Live"])
+    live = len(portal[portal["Downstream_Category"] == "Live"])
     live_denominator = total_portal if total_portal > 0 else total_apps
 
     return {
@@ -2144,6 +2344,9 @@ try:
     agent_compact = re.sub(r"[^a-z0-9]", "", str(agent).lower())
     ag1 = df1[df1["Advisor"].apply(lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower()) == agent_compact)].copy()
     ag2 = df2_raw[df2_raw["Advisor"].apply(lambda x: re.sub(r"[^a-z0-9]", "", str(x).lower()) == agent_compact)].copy()
+    # One mutually exclusive category per downstream record, reused by KPIs,
+    # trends, daily/monthly tables, insights, and the Recent Applications Log.
+    ag2 = classify_downstream_frame(ag2)
     if not attendance_df.empty:
         ag_attendance = attendance_df[
             attendance_df["Attendance_Agent"].apply(
@@ -2245,7 +2448,7 @@ try:
     ag2_filtered = ag2[date_range_mask(ag2["Date_Parsed"], start_date, end_date)].copy()
 
     ag1_filtered["Q_Status"] = ag1_filtered["Quality Status"].apply(map_quality)
-    ag2_filtered["P_Status"] = ag2_filtered["Status"].apply(map_portal)
+    ag2_filtered["P_Status"] = ag2_filtered["Downstream_Category"]
 
     wc_col = (
         "Status"
@@ -2258,9 +2461,9 @@ try:
         ag1_filtered["WC_Clean"] = ag1_filtered[wc_col].apply(map_wc)
 
     # The Live Status KPI counts only downstream records whose corresponding
-    # application is Welcome Done/Approved. It falls back to CallStatus when
-    # the primary onboarding Status is blank. The broader ag2_filtered frame
-    # remains untouched for the Recent Applications Log and breakdown tables.
+    # application is Welcome Done/Approved. Eligibility is separate from the
+    # central downstream classification; the broader frame remains intact for
+    # the log, insights, and daily/monthly breakdowns.
     live_kpi_filtered = build_wc_done_live_kpi_rows(
         ag1_filtered, ag2_filtered, wc_col
     )
@@ -2277,10 +2480,9 @@ try:
         previous_ag1["Q_Status"] = previous_ag1["Quality Status"].apply(map_quality)
     else:
         previous_ag1["Q_Status"] = "Others"
-    if "Status" in previous_ag2.columns:
-        previous_ag2["P_Status"] = previous_ag2["Status"].apply(map_portal)
-    else:
-        previous_ag2["P_Status"] = "Others"
+    if "Downstream_Category" not in previous_ag2.columns:
+        previous_ag2 = classify_downstream_frame(previous_ag2)
+    previous_ag2["P_Status"] = previous_ag2["Downstream_Category"]
     if wc_col and wc_col in previous_ag1.columns:
         previous_ag1["WC_Clean"] = previous_ag1[wc_col].apply(map_wc)
 
@@ -2382,6 +2584,34 @@ try:
                     for status_label in LIVE_KPI_STATUS_ORDER
                 },
             )
+            # Preserve visibility of the old CallStatus fallback detail without
+            # treating confirmation-stage values as additional categories. These
+            # counts are a subset of the categories above and are not additive.
+            confirmation_detail_counts = {
+                "Confirmation Approved": 0,
+                "Confirmation Followup": 0,
+                "Confirmation Pending": 0,
+            }
+            for _, eligible_row in live_kpi_filtered.iterrows():
+                if normalize_workflow_status(eligible_row.get("Status", "")):
+                    continue
+                fallback_status = normalize_workflow_status(eligible_row.get("CallStatus", ""))
+                if fallback_status.startswith("confirmation approved") or fallback_status == "approved":
+                    confirmation_detail_counts["Confirmation Approved"] += 1
+                elif fallback_status.startswith(("confirmation followup", "confirmation follow up")) or fallback_status in {"followup", "follow up"}:
+                    confirmation_detail_counts["Confirmation Followup"] += 1
+                elif fallback_status.startswith("confirmation pending") or fallback_status in {"pending", "pnd"}:
+                    confirmation_detail_counts["Confirmation Pending"] += 1
+            confirmation_details = [
+                f"{label}: {count:,}"
+                for label, count in confirmation_detail_counts.items()
+                if count > 0
+            ]
+            if confirmation_details:
+                st.caption(
+                    "Confirmation fallback detail (included in categories above; not additive): "
+                    + " · ".join(confirmation_details)
+                )
 
         # Compact activity consistency. Period-to-period trends now live on
         # the main KPI cards, so repeated Performance Pulse comparison cards
@@ -2755,8 +2985,8 @@ try:
                 flags_html += '<div class="insight-card" style="border-color:#EF4444"><p class="insight-title">Welcome Call</p><p class="insight-phrase">High WC Cancellation</p><p class="insight-comment">Address customer doubts in the sales call to avoid Welcome call cancellations!</p></div>'
 
     if total_ag2 > 0:
-        l_live = len(ag2_filtered[ag2_filtered["P_Status"] == "Live"]) / total_ag2
-        l_can = len(ag2_filtered[ag2_filtered["P_Status"] == "Cancelled"]) / total_ag2
+        l_live = len(ag2_filtered[ag2_filtered["Downstream_Category"] == "Live"]) / total_ag2
+        l_can = len(ag2_filtered[ag2_filtered["Downstream_Category"].isin(["Committed Cancelled", "Live Cancelled"])]) / total_ag2
         if l_live > 0.20:
             flags_html += '<div class="insight-card" style="border-color:#10B981"><p class="insight-title">Live Stage</p><p class="insight-phrase">Strong Conversion</p><p class="insight-comment">Good live rate! Great overall quality of applications!</p></div>'
         elif l_live < 0.20:
@@ -2854,7 +3084,7 @@ try:
         render_section("Live status", "04")
         if not ag2_filtered.empty:
             period_port = ag2_filtered.groupby(["Period", "P_Status"]).size().unstack(fill_value=0)
-            port_order = ["Live", "Committed", "Cancelled", "Onboarding Pending", "Others"]
+            port_order = DOWNSTREAM_CATEGORY_ORDER
             period_port = period_port.reindex(columns=port_order, fill_value=0)
             period_port = period_port.loc[:, (period_port != 0).any(axis=0)]
             if not period_port.empty:
@@ -2863,8 +3093,9 @@ try:
                     period_port.style
                     .format(lambda x: "-" if x == 0 else x)
                     .background_gradient(cmap="Greens", subset=pd.IndexSlice[:, period_port.columns.intersection(["Live"])], vmin=1, vmax=vmax_port)
-                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_port.columns.intersection(["Committed", "Onboarding Pending"])], vmin=1, vmax=vmax_port)
-                    .background_gradient(cmap="Reds", subset=pd.IndexSlice[:, period_port.columns.intersection(["Cancelled"])], vmin=1, vmax=vmax_port)
+                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_port.columns.intersection(["Committed Rem."])], vmin=1, vmax=vmax_port)
+                    .background_gradient(cmap="Reds", subset=pd.IndexSlice[:, period_port.columns.intersection(["Committed Cancelled", "Live Cancelled"])], vmin=1, vmax=vmax_port)
+                    .background_gradient(cmap="Greys", subset=pd.IndexSlice[:, period_port.columns.intersection(["Unclassified / Review"])], vmin=1, vmax=vmax_port)
                     .map(lambda x: "background-color: transparent" if x == 0 else "")
                 )
                 st.dataframe(styled_port, use_container_width=True, height=370)
@@ -2878,13 +3109,26 @@ try:
     if not ag1.empty:
         ag2_clean = ag2.copy()
         ag2_clean["Telephone No."] = ag2_clean["Telephone No."].astype(str).str.strip()
-        ag2_clean = ag2_clean.rename(columns={"Status": "Portal Status", "Committed Date": "Live Date"})
+        ag2_clean = ag2_clean.rename(columns={
+            "Status": "Portal Status",
+            "Committed Date": "Live Date",
+            "Downstream_Category": "Derived Downstream Category",
+            "Downstream_Review_Flag": "Classification Review",
+        })
 
         # Use the same agreed Sale Date + Phone primary key in the detailed
         # portal log. This prevents a customer with the same number on a later
         # sale from receiving the wrong downstream status.
         ag2_clean = add_record_keys(ag2_clean, "Sale Date", "Telephone No.")
-        ag2_unique = ag2_clean.sort_values("Date_Parsed").drop_duplicates("_RecordKey", keep="last")
+        # Never let missing/invalid keys join to one another in the log. For
+        # repeated valid legacy keys, retain the existing latest-row-in-source
+        # rule; CRM duplicate keys are already reduced to the latest mirror row.
+        usable_log_keys = ag2_clean["_RecordKey"].fillna("").astype(str).str.strip().ne("")
+        ag2_unique = (
+            ag2_clean.loc[usable_log_keys]
+            .sort_values("Date_Parsed")
+            .drop_duplicates("_RecordKey", keep="last")
+        )
 
         ag1_log_base = ag1.copy()
         ag1_log_base = add_record_keys(ag1_log_base, "Standardized_Date", "CLI")
@@ -2901,6 +3145,8 @@ try:
                     "Voice of Customer",
                     "Cancellation Reason",
                     "Portal Status",
+                    "Derived Downstream Category",
+                    "Classification Review",
                     "Live Date",
                 ]
             ],
@@ -2934,6 +3180,8 @@ try:
             ("Provisioning", "Provisioning Remarks"),
             ("Live Status", "CallStatus"),
             ("Live Status", "Portal Status"),
+            ("Live Status", "Derived Downstream Category"),
+            ("Live Status", "Classification Review"),
             ("Live Status", "Live Date"),
             ("Live Status", "Comments"),
             ("Live Status", "Voice of Customer"),
@@ -3026,12 +3274,13 @@ try:
             log_filter_source["WC_Filter_Status"] = "Others"
 
         log_filter_source["P_Filter_Status"] = log_filter_source.get(
-            "Portal Status", pd.Series("", index=log_filter_source.index)
-        ).apply(map_portal)
+            "Derived Downstream Category",
+            pd.Series("Unclassified / Review", index=log_filter_source.index),
+        ).fillna("Unclassified / Review")
 
         quality_options = ["Approved", "Cancelled", "Rework", "Rejected", "Others"]
         welcome_options = ["Done", "Follow up", "Pending", "Paperwork", "Cancelled", "Others"]
-        live_options = ["Live", "Committed", "Cancelled", "Onboarding Pending", "Others"]
+        live_options = list(DOWNSTREAM_CATEGORY_ORDER)
 
         with st.expander("☷  Advanced status filters", expanded=False):
             st.caption(
@@ -3100,7 +3349,8 @@ try:
                     "Quality Status", "Quality Remarks", "Status",
                     "Welcome call Remarks", "LetterStatus",
                     "Provisioning Status", "Provisioning Remarks", "CallStatus",
-                    "Portal Status", "Comments", "Voice of Customer", "Cancellation Reason",
+                    "Portal Status", "Derived Downstream Category", "Classification Review",
+                    "Comments", "Voice of Customer", "Cancellation Reason",
                 ],
             )
             if searchable_cols:
@@ -3313,6 +3563,16 @@ try:
                     if any(x in v for x in ["rejected", "reject", "cancelled", "canceled", "to be cancelled"]):
                         return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
 
+                if kind == "derived":
+                    if v == "live":
+                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
+                    if v == "committed rem.":
+                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
+                    if v in {"committed cancelled", "live cancelled"}:
+                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
+                    if v == "unclassified / review":
+                        return f"background-color:{BG_BLUE};color:{DARK_BLUE};font-weight:800;"
+
                 return ""
 
             q_style = status_style(get_val("Quality Status"), "quality")
@@ -3321,6 +3581,13 @@ try:
             prov_style = status_style(get_val("Provisioning Status"), "provisioning")
             call_style = status_style(get_val("CallStatus"), "confirmation")
             portal_style = status_style(get_val("Portal Status"), "portal")
+            derived_style = status_style(get_val("Derived Downstream Category"), "derived")
+            review_value = get_val("Classification Review")
+            review_style = (
+                f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
+                if review_value and review_value not in {"-", "none", "nan", "nat", "null"}
+                else ""
+            )
 
             for i, col_tuple in enumerate(row.index):
                 col = col_tuple[1] if isinstance(col_tuple, tuple) and len(col_tuple) > 1 else str(col_tuple)
@@ -3340,6 +3607,8 @@ try:
                     "CallStatus": call_style,
                     "Comments": call_style,
                     "Portal Status": portal_style,
+                    "Derived Downstream Category": derived_style,
+                    "Classification Review": review_style,
                 }
                 current_style = style_by_col.get(col, "")
 
