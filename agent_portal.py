@@ -1687,6 +1687,15 @@ def map_wc(val):
     return "Others"
 
 
+def map_wc_with_quality(welcome_value, quality_value):
+    """Map Welcome Call status, treating otherwise-unknown WC as Pending when QA is pending/rework."""
+    welcome_status = map_wc(welcome_value)
+    quality_status = map_quality(quality_value)
+    if welcome_status == "Others" and quality_status in {"QA-Pending", "Rework"}:
+        return "Pending"
+    return welcome_status
+
+
 # ---------------------------------------------------------------------------
 # CENTRAL, MUTUALLY EXCLUSIVE DOWNSTREAM CLASSIFICATION
 # ---------------------------------------------------------------------------
@@ -2471,7 +2480,11 @@ try:
         else None
     )
     if wc_col:
-        ag1_filtered["WC_Clean"] = ag1_filtered[wc_col].apply(map_wc)
+        ag1_filtered["WC_Clean"] = ag1_filtered.apply(
+            lambda row: map_wc_with_quality(
+                row.get(wc_col, ""), row.get("Quality Status", "")
+            ), axis=1
+        )
 
     # The Live Status KPI counts only downstream records whose corresponding
     # application is Welcome Done/Approved. Eligibility is separate from the
@@ -2497,7 +2510,11 @@ try:
         previous_ag2 = classify_downstream_frame(previous_ag2)
     previous_ag2["P_Status"] = previous_ag2["Downstream_Category"]
     if wc_col and wc_col in previous_ag1.columns:
-        previous_ag1["WC_Clean"] = previous_ag1[wc_col].apply(map_wc)
+        previous_ag1["WC_Clean"] = previous_ag1.apply(
+            lambda row: map_wc_with_quality(
+                row.get(wc_col, ""), row.get("Quality Status", "")
+            ), axis=1
+        )
 
     previous_live_kpi = build_wc_done_live_kpi_rows(
         previous_ag1, previous_ag2, wc_col
@@ -2622,10 +2639,8 @@ try:
                 if count > 0
             ]
             if confirmation_details:
-                st.caption(
-                    "Confirmation fallback detail (included in categories above; not additive): "
-                    + " · ".join(confirmation_details)
-                )
+                st.markdown("**Confirmation fallback detail**")
+                st.caption(" · ".join(confirmation_details))
 
         # Compact activity consistency. Period-to-period trends now live on
         # the main KPI cards, so repeated Performance Pulse comparison cards
@@ -3127,7 +3142,7 @@ try:
         ag2_clean = ag2_clean.rename(columns={
             "Status": "Portal Status",
             "Committed Date": "Live Date",
-            "Downstream_Category": "Derived Downstream Category",
+            "Downstream_Category": "_Internal_Downstream_Category",
             "Downstream_Review_Flag": "Classification Review",
         })
 
@@ -3160,7 +3175,7 @@ try:
                     "Voice of Customer",
                     "Cancellation Reason",
                     "Portal Status",
-                    "Derived Downstream Category",
+                    "_Internal_Downstream_Category",
                     "Classification Review",
                     "Live Date",
                 ]
@@ -3168,6 +3183,20 @@ try:
             on="_RecordKey",
             how="left",
         )
+
+        # Show WC Pending in the log when the raw WC value maps to Others but
+        # the quality stage is still QA-Pending or Rework.
+        if "Status" in merged_log.columns:
+            _wc_display = merged_log.apply(
+                lambda row: map_wc_with_quality(
+                    row.get("Status", ""), row.get("Quality Status", "")
+                ), axis=1
+            )
+            _wc_override = (
+                merged_log["Status"].apply(map_wc).eq("Others")
+                & merged_log["Quality Status"].apply(map_quality).isin(["QA-Pending", "Rework"])
+            )
+            merged_log.loc[_wc_override, "Status"] = "WC Pending"
 
         merged_log["Sale Date"] = (
             pd.to_datetime(merged_log["Date_Parsed"], errors="coerce")
@@ -3195,7 +3224,6 @@ try:
             ("Provisioning", "Provisioning Remarks"),
             ("Live Status", "CallStatus"),
             ("Live Status", "Portal Status"),
-            ("Live Status", "Derived Downstream Category"),
             ("Live Status", "Classification Review"),
             ("Live Status", "Live Date"),
             ("Live Status", "Comments"),
@@ -3284,16 +3312,20 @@ try:
             "Status" if "Status" in log_filter_source.columns else None
         )
         if wc_filter_source_col:
-            log_filter_source["WC_Filter_Status"] = log_filter_source[wc_filter_source_col].apply(map_wc)
+            log_filter_source["WC_Filter_Status"] = log_filter_source.apply(
+                lambda row: map_wc_with_quality(
+                    row.get(wc_filter_source_col, ""), row.get("Quality Status", "")
+                ), axis=1
+            )
         else:
             log_filter_source["WC_Filter_Status"] = "Others"
 
         log_filter_source["P_Filter_Status"] = log_filter_source.get(
-            "Derived Downstream Category",
+            "_Internal_Downstream_Category",
             pd.Series("Unclassified / Review", index=log_filter_source.index),
         ).fillna("Unclassified / Review")
 
-        quality_options = ["Approved", "Cancelled", "Rework", "Rejected", "Others"]
+        quality_options = ["Approved", "QA-Pending", "Cancelled", "Rework", "Rejected", "Others"]
         welcome_options = ["Done", "Follow up", "Pending", "Paperwork", "Cancelled", "Others"]
         live_options = list(DOWNSTREAM_CATEGORY_ORDER)
 
@@ -3364,7 +3396,7 @@ try:
                     "Quality Status", "Quality Remarks", "Status",
                     "Welcome call Remarks", "LetterStatus",
                     "Provisioning Status", "Provisioning Remarks", "CallStatus",
-                    "Portal Status", "Derived Downstream Category", "Classification Review",
+                    "Portal Status", "Classification Review",
                     "Comments", "Voice of Customer", "Cancellation Reason",
                 ],
             )
@@ -3596,7 +3628,6 @@ try:
             prov_style = status_style(get_val("Provisioning Status"), "provisioning")
             call_style = status_style(get_val("CallStatus"), "confirmation")
             portal_style = status_style(get_val("Portal Status"), "portal")
-            derived_style = status_style(get_val("Derived Downstream Category"), "derived")
             review_value = get_val("Classification Review")
             review_style = (
                 f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
@@ -3622,7 +3653,6 @@ try:
                     "CallStatus": call_style,
                     "Comments": call_style,
                     "Portal Status": portal_style,
-                    "Derived Downstream Category": derived_style,
                     "Classification Review": review_style,
                 }
                 current_style = style_by_col.get(col, "")
