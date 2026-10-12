@@ -1637,20 +1637,29 @@ def fetch_data():
 
 
 def map_quality(val):
-    # Match explicit QA-Pending spelling variants without conflating generic
-    # unknown workflow values with the dedicated QA-Pending category.
-    s = re.sub(r"\s+", " ", str(val).strip().lower())
-    compact = re.sub(r"[^a-z0-9]+", "", s)
-    if compact == "qapending":
+    """Map quality-audit source values to stable reporting categories.
+
+    QA-Cancelled remains in QA-Pending, matching the Executive Dashboard's
+    quality-stage convention. Only workflow status is inspected; remarks are
+    not used to infer a category.
+    """
+    s = normalize_workflow_status(val)
+    if not s:
+        return "Others"
+
+    # Check explicit pending-stage values before generic cancellation tokens.
+    if s in {"qa pending", "qa-pending", "pending", "qa cancelled", "qa-cancelled"}:
         return "QA-Pending"
-    if any(x in s for x in ["appr", "pass"]):
-        return "Approved"
-    if any(x in s for x in ["rew", "repro"]):
+    if s.startswith(("qa pending ", "qa-pending ", "qa cancelled ", "qa-cancelled ")):
+        return "QA-Pending"
+    if "rework" in s or "rework required" in s or s.startswith(("rew", "repro")):
         return "Rework"
-    if any(x in s for x in ["can"]):
-        return "Cancelled"
-    if any(x in s for x in ["rej"]):
+    if "reject" in s or s.startswith("rej"):
         return "Rejected"
+    if "cancel" in s:
+        return "Cancelled"
+    if "approved" in s or "approve" in s or "pass" in s:
+        return "Approved"
     return "Others"
 
 
@@ -2076,14 +2085,6 @@ def trend_badge_html(label, current, previous):
 
 
 def render_kpi(label, value, total, previous_count=None):
-    # Zero-valued KPIs are intentionally not rendered, even when the previous
-    # period had a non-zero count. This keeps the panel focused on active values.
-    try:
-        if pd.isna(value) or float(value) <= 0:
-            return
-    except (TypeError, ValueError):
-        pass
-
     lbl = str(label).lower()
     accent = "#94A3B8"
 
@@ -2120,8 +2121,8 @@ def render_kpi(label, value, total, previous_count=None):
 
 def kpi_panel(title, kpis, previous_counts=None):
     previous_counts = previous_counts or {}
-    # A historical non-zero value must not cause a current zero-value card to
-    # appear; only categories with current-period activity are displayed.
+    # Do not render zero-valued KPI cards, even if the previous period had
+    # activity. The panel reflects only non-zero values in the selected range.
     active = [x for x in kpis if x[1] > 0]
     if not active:
         return
@@ -2504,9 +2505,9 @@ try:
 
     trend_previous_counts = {"Total Apps": len(previous_ag1)}
     for label, status in [
-        ("Approved", "Approved"), ("QA-Pending", "QA-Pending"),
-        ("Rework", "Rework"), ("Cancelled", "Cancelled"),
-        ("Rejected", "Rejected"), ("Others", "Others"),
+        ("Approved", "Approved"), ("Rework", "Rework"),
+        ("Cancelled", "Cancelled"), ("Rejected", "Rejected"),
+        ("Others", "Others"),
     ]:
         trend_previous_counts[label] = int((previous_ag1["Q_Status"] == status).sum())
 
@@ -2535,10 +2536,10 @@ try:
     group_1 = [("Total Apps", total_apps, total_apps)]
     group_2 = [
         ("Approved", len(ag1_filtered[ag1_filtered["Q_Status"] == "Approved"]), total_apps),
-        ("QA-Pending", len(ag1_filtered[ag1_filtered["Q_Status"] == "QA-Pending"]), total_apps),
         ("Rework", len(ag1_filtered[ag1_filtered["Q_Status"] == "Rework"]), total_apps),
         ("Cancelled", len(ag1_filtered[ag1_filtered["Q_Status"] == "Cancelled"]), total_apps),
         ("Rejected", len(ag1_filtered[ag1_filtered["Q_Status"] == "Rejected"]), total_apps),
+        ("QA-Pending", len(ag1_filtered[ag1_filtered["Q_Status"] == "QA-Pending"]), total_apps),
         ("Others", len(ag1_filtered[ag1_filtered["Q_Status"] == "Others"]), total_apps),
     ]
 
@@ -2576,13 +2577,12 @@ try:
         # Nested status values keep their individual trends inside each panel.
         kpi_top_left, kpi_top_right = st.columns(2, gap="small")
         with kpi_top_left:
-            if group_1[0][1] > 0:
-                with st.container(border=True):
-                    st.markdown("**Overview**")
-                    render_kpi(
-                        group_1[0][0], group_1[0][1], group_1[0][2],
-                        previous_count=trend_previous_counts.get("Total Apps"),
-                    )
+            with st.container(border=True):
+                st.markdown("**Overview**")
+                render_kpi(
+                    group_1[0][0], group_1[0][1], group_1[0][2],
+                    previous_count=trend_previous_counts.get("Total Apps"),
+                )
         with kpi_top_right:
             kpi_panel("Quality audit status", group_2, trend_previous_counts)
 
@@ -3058,7 +3058,7 @@ try:
         render_section("Quality audit", "02")
         if not ag1_filtered.empty:
             period_qual = ag1_filtered.groupby(["Period", "Q_Status"]).size().unstack(fill_value=0)
-            qual_order = ["Approved", "QA-Pending", "Rework", "Cancelled", "Rejected", "Others"]
+            qual_order = ["Approved", "Rework", "Cancelled", "Rejected", "QA-Pending", "Others"]
             period_qual = period_qual.reindex(columns=qual_order, fill_value=0)
             period_qual = period_qual.loc[:, (period_qual != 0).any(axis=0)]
             if not period_qual.empty:
@@ -3067,8 +3067,9 @@ try:
                     period_qual.style
                     .format(lambda x: "-" if x == 0 else x)
                     .background_gradient(cmap="Greens", subset=pd.IndexSlice[:, period_qual.columns.intersection(["Approved"])], vmin=1, vmax=vmax_qual)
-                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_qual.columns.intersection(["QA-Pending", "Rework"])], vmin=1, vmax=vmax_qual)
+                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_qual.columns.intersection(["Rework"])], vmin=1, vmax=vmax_qual)
                     .background_gradient(cmap="Reds", subset=pd.IndexSlice[:, period_qual.columns.intersection(["Cancelled", "Rejected"])], vmin=1, vmax=vmax_qual)
+                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_qual.columns.intersection(["QA-Pending"])], vmin=1, vmax=vmax_qual)
                     .map(lambda x: "background-color: transparent" if x == 0 else "")
                 )
                 st.dataframe(styled_qual, use_container_width=True, height=370)
@@ -3639,27 +3640,6 @@ try:
                     current_style += "border-right:3px solid #E2E8F0;"
 
                 styles[i] = current_style
-
-            # The final log columns (for example Voice of Customer and
-            # Cancellation Reason) previously appeared uncoloured even when a
-            # status to their left established the row's status colour. Extend
-            # the last applicable background/text colour across the trailing
-            # uncoloured cells, retaining any existing borders.
-            coloured_positions = [
-                idx for idx, cell_style in enumerate(styles)
-                if "background-color:" in cell_style
-            ]
-            if coloured_positions:
-                last_coloured = coloured_positions[-1]
-                colour_declarations = []
-                for declaration in styles[last_coloured].split(";"):
-                    declaration = declaration.strip()
-                    if declaration.startswith(("background-color:", "color:", "font-weight:")):
-                        colour_declarations.append(declaration)
-                inherited_colour = ";".join(colour_declarations) + ";"
-                for idx in range(last_coloured + 1, len(styles)):
-                    if "background-color:" not in styles[idx]:
-                        styles[idx] = inherited_colour + styles[idx]
 
             return styles
 
