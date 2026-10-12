@@ -1672,11 +1672,19 @@ def map_portal(val):
     return "Others"
 
 
-def map_wc(val):
-    """Normalize Welcome Call outcomes; rejection belongs in WC Cancelled."""
+def map_wc(val, quality_status=""):
+    """Normalize Welcome Call outcomes.
+
+    A blank Welcome Call status is Pending unless the corresponding Quality
+    Status is a QA rejection; rejected applications retain a blank WC category
+    and are excluded from WC Pending/Others counts.
+    """
     s = str(val).strip().lower()
     if not s or s in {"none", "nan", "nat", "null", "-"}:
-        return "Others"
+        q = str(quality_status).strip().lower()
+        if any(token in q for token in ("qa-reject", "qa reject", "quality reject", "rejected", "reject")):
+            return "Blank"
+        return "Pending"
 
     # Rejection/cancellation takes precedence. In particular, Welcome Rejected
     # is a Welcome Call cancellation outcome, not WC Others.
@@ -1691,6 +1699,13 @@ def map_wc(val):
     if any(token in s for token in ("paper", "ppw")):
         return "Paperwork"
     return "Others"
+
+
+def map_wc_row(row, welcome_status_col):
+    """Map WC status with the quality status from the same application row."""
+    quality_col = next((c for c in ("Quality Status", "Q_Status") if c in row.index), None)
+    quality_value = row.get(quality_col, "") if quality_col else ""
+    return map_wc(row.get(welcome_status_col, ""), quality_value)
 
 
 LIVE_KPI_STATUS_ORDER = [
@@ -1718,10 +1733,8 @@ def map_live_kpi_status(primary_status, call_status=""):
     Approved/Followup/Pending remain visible as separate categories when they
     are the fallback status, instead of being incorrectly counted as Others.
     """
-    if not _is_blank_status(primary_status):
-        return map_portal(primary_status)
-
-    fallback = "" if _is_blank_status(call_status) else str(call_status).strip()
+    chosen = primary_status if not _is_blank_status(primary_status) else call_status
+    fallback = "" if _is_blank_status(chosen) else str(chosen).strip()
     normalized = re.sub(r"\s+", " ", fallback).strip().lower()
     if not normalized:
         return "Others"
@@ -1761,7 +1774,7 @@ def build_wc_done_live_kpi_rows(apps_frame, portal_frame, welcome_status_col):
         empty["Live_KPI_Status"] = pd.Series(dtype="object")
         return empty
 
-    apps_done = apps_frame[apps_frame[welcome_status_col].apply(map_wc) == "Done"].copy()
+    apps_done = apps_frame[apps_frame.apply(lambda row: map_wc_row(row, welcome_status_col) == "Done", axis=1)].copy()
     if apps_done.empty:
         empty = portal_frame.iloc[0:0].copy()
         empty["Live_KPI_Status"] = pd.Series(dtype="object")
@@ -2038,7 +2051,7 @@ def summary_for_period(base_apps, base_portal, start_date, end_date, welcome_col
 
     wc_done = 0
     if welcome_col and welcome_col in apps.columns:
-        apps["WC_Clean"] = apps[welcome_col].apply(map_wc)
+        apps["WC_Clean"] = apps.apply(lambda row: map_wc_row(row, welcome_col), axis=1)
         wc_done = len(apps[apps["WC_Clean"] == "Done"])
 
     live = len(portal[portal["P_Status"] == "Live"])
@@ -2255,7 +2268,7 @@ try:
         else None
     )
     if wc_col:
-        ag1_filtered["WC_Clean"] = ag1_filtered[wc_col].apply(map_wc)
+        ag1_filtered["WC_Clean"] = ag1_filtered.apply(lambda row: map_wc_row(row, wc_col), axis=1)
 
     # The Live Status KPI counts only downstream records whose corresponding
     # application is Welcome Done/Approved. It falls back to CallStatus when
@@ -2282,7 +2295,7 @@ try:
     else:
         previous_ag2["P_Status"] = "Others"
     if wc_col and wc_col in previous_ag1.columns:
-        previous_ag1["WC_Clean"] = previous_ag1[wc_col].apply(map_wc)
+        previous_ag1["WC_Clean"] = previous_ag1.apply(lambda row: map_wc_row(row, wc_col), axis=1)
 
     previous_live_kpi = build_wc_done_live_kpi_rows(
         previous_ag1, previous_ag2, wc_col
