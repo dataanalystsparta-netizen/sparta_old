@@ -2245,8 +2245,8 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
     as_of = as_of or datetime.date.today()
     as_of_date = as_of.date() if isinstance(as_of, datetime.datetime) else as_of
 
-    base_columns = ["Month", "Present", "SPD", "Applications"]
-    daily_base_columns = ["Date", "Present", "SPD", "Applications"]
+    base_columns = ["Month", "Total Attendance", "SPD", "Applications"]
+    daily_base_columns = ["Date", "Attendance", "SPD", "Applications"]
     status_specs = [
         ("Quality", "_QualityStatus"),
         ("Welcome", "_WelcomeStatus"),
@@ -2342,6 +2342,18 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
             labels_for_group.items(), key=lambda item: item[1].casefold()
         ))
 
+    def monthly_attendance_code(value):
+        code = str(value or "-").strip().upper()
+        if code in {"P", "PRESENT"}:
+            return "P"
+        if code in {"HD", "HALF DAY", "HALF-DAY", "HALFDAY"}:
+            return "HD"
+        if code in {"AB", "A", "ABSENT", "ABSENCE"}:
+            return "Ab"
+        if code in {"UL", "UNPAID LEAVE", "UNPAID-LEAVE"}:
+            return "UL"
+        return "-" if code in {"", "NAN", "NONE", "NULL", "NAT", "-"} else code
+
     attendance = attendance_frame.copy() if attendance_frame is not None else pd.DataFrame()
     if not attendance.empty:
         if "Date_Parsed" not in attendance.columns:
@@ -2361,10 +2373,13 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
     if not attendance.empty:
         attendance_by_date = dict(zip(
             attendance["_AttendanceDate"],
-            attendance["Attendance_Code"].astype(str).str.strip().str.upper()
+            attendance["Attendance_Code"].apply(monthly_attendance_code)
         ))
 
-    attendance_units = {"P": 1.0, "HD": 0.5}
+    # Attendance units are counted only on scheduled working days. Leave and
+    # absence both contribute zero; a half-day contributes 0.5.
+    attendance_units = {"P": 1.0, "HD": 0.5, "Ab": 0.0, "UL": 0.0}
+
     rows = []
     daily_rows = []
     months = sorted(monthly_data["_Month"].dropna().unique())
@@ -2388,7 +2403,7 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
         application_count = int(len(month_apps))
         row = {
             "Month": month_period.to_timestamp().strftime("%b-%Y"),
-            "Present": f"{present_units:g}/{len(working_dates)}",
+            "Total Attendance": f"{present_units:g}",
             "SPD": f"{application_count / present_units:.2f}" if present_units > 0 else "—",
             "Applications": application_count,
         }
@@ -2411,7 +2426,7 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
             daily_row = {
                 "Date": sale_day.strftime("%a, %d %b"),
                 "_MonthKey": month_period.strftime("%Y-%m"),
-                "Present": f"{day_present_units:g}/{day_working_denominator}" if not day_is_holiday else "—/0",
+                "Attendance": monthly_attendance_code(attendance_by_date.get(sale_day, "-")),
                 "SPD": f"{app_count / day_present_units:.2f}" if day_present_units > 0 else "—",
                 "Applications": app_count,
             }
@@ -3259,8 +3274,9 @@ try:
     st.caption(
         "This table is agent-specific and independent of the main date filter. "
         "September starts at the CRM cutover (18 Sep 2026); the current month is month-to-date. "
-        "Present = attendance units (P=1, HD=0.5, Ab/UL=0) / scheduled working days; "
-        "SPD = CRM applications ÷ attendance units. Sundays and 1st/3rd Saturdays are excluded."
+        "Monthly Total Attendance = summed attendance units on scheduled working days (P=1, HD=0.5, Ab/UL=0). "
+        "Expanded daily rows show the attendance code (P, Ab, HD or UL). SPD = CRM applications ÷ total attendance. "
+        "Sundays and 1st/3rd Saturdays are excluded from monthly attendance totals."
     )
     monthly_crm_summary, daily_crm_summary = build_crm_monthly_summary(
         ag1, ag2, ag_attendance, as_of=today_date
@@ -3286,7 +3302,7 @@ try:
                 text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
             return text or str(label).strip()
 
-        summary_columns = ["Month", "Present", "SPD", "Applications"]
+        summary_columns = ["Month", "Total Attendance", "SPD", "Applications"]
         status_columns = [
             col for col in monthly_crm_summary.columns
             if col not in set(summary_columns)
@@ -3425,7 +3441,7 @@ try:
                 f'aria-label="Expand {escape(month_label)}">+</button>'
                 f'<strong>{escape(month_label)}</strong></td>'
             )
-            table_rows_html.append(basic_cell_html(month_row["Present"], "numeric-cell"))
+            table_rows_html.append(basic_cell_html(month_row["Total Attendance"], "numeric-cell attendance-total-cell"))
             table_rows_html.append(basic_cell_html(month_row["SPD"], "numeric-cell spd-cell"))
             table_rows_html.append(basic_cell_html(f'{int(month_row["Applications"]):,}', "numeric-cell applications-cell"))
             for col in status_columns:
@@ -3442,7 +3458,7 @@ try:
                 table_rows_html.append(
                     f'<td class="date-cell"><span class="daily-indent">↳</span>{escape(str(day_row["Date"]))}</td>'
                 )
-                table_rows_html.append(basic_cell_html(day_row["Present"], "numeric-cell"))
+                table_rows_html.append(basic_cell_html(day_row["Attendance"], "numeric-cell attendance-code-cell"))
                 table_rows_html.append(basic_cell_html(day_row["SPD"], "numeric-cell spd-cell"))
                 table_rows_html.append(basic_cell_html(f'{int(day_row["Applications"]):,}', "numeric-cell applications-cell"))
                 for col in status_columns:
@@ -3474,6 +3490,8 @@ try:
           .daily-row .date-cell {{ background: #F8FAFC; color: #475569; text-align: left; padding-left: 22px; }}
           .daily-indent {{ color: #94A3B8; margin-right: 6px; }}
           .numeric-cell {{ text-align: center; font-variant-numeric: tabular-nums; }}
+          .attendance-total-cell {{ color: #102451; font-weight: 850; }}
+          .attendance-code-cell {{ color: #475569; font-weight: 800; }}
           .spd-cell {{ color: #0F766E; font-weight: 750; }}
           .applications-cell {{ color: #102451; font-weight: 850; }}
           .month-toggle {{ width: 21px; height: 21px; line-height: 17px; padding: 0; margin-right: 7px; border: 1px solid #CBD5E1; border-radius: 6px; background: #FFFFFF; color: #1D4ED8; font-size: 15px; font-weight: 800; cursor: pointer; vertical-align: middle; }}
@@ -3482,6 +3500,33 @@ try:
           .daily-row[hidden] {{ display: none !important; }}
         </style>
         <script>
+          // Resize the Streamlit iframe to the visible table only. This keeps
+          // collapsed months compact and grows the table when daily rows open.
+          function resizeStreamlitFrame() {{
+            const body = document.body;
+            const root = document.documentElement;
+            const contentHeight = Math.max(
+              body ? body.scrollHeight : 0,
+              root ? root.scrollHeight : 0
+            ) + 4;
+            // Resize the containing iframe directly when the browser allows
+            // same-origin access to the srcdoc frame. The postMessage below is
+            // retained as a compatibility path for Streamlit component hosts.
+            try {{
+              if (window.frameElement) {{
+                window.frameElement.style.height = contentHeight + "px";
+                window.frameElement.setAttribute("height", String(contentHeight));
+              }}
+            }} catch (resizeError) {{
+              // Fall back to the Streamlit frame-height message below.
+            }}
+            window.parent.postMessage({{
+              isStreamlitMessage: true,
+              type: "streamlit:setFrameHeight",
+              height: contentHeight
+            }}, "*");
+          }}
+
           document.querySelectorAll(".month-toggle").forEach(function(button) {{
             button.addEventListener("click", function() {{
               const month = button.getAttribute("data-toggle-month");
@@ -3492,11 +3537,22 @@ try:
               button.setAttribute("aria-expanded", isExpanded ? "false" : "true");
               button.textContent = isExpanded ? "+" : "−";
               button.setAttribute("aria-label", (isExpanded ? "Expand " : "Collapse ") + month);
+              requestAnimationFrame(resizeStreamlitFrame);
+              setTimeout(resizeStreamlitFrame, 50);
             }});
           }});
+
+          requestAnimationFrame(resizeStreamlitFrame);
+          setTimeout(resizeStreamlitFrame, 50);
         </script>
         """
-        components.html(table_html, height=700, scrolling=True)
+        # The initial iframe height is calculated from the two header rows and
+        # the collapsed month rows; JavaScript resizes it as rows are toggled.
+        collapsed_height = min(
+            640,
+            max(118, 66 + (len(monthly_crm_summary) * 34) + 12),
+        )
+        components.html(table_html, height=collapsed_height, scrolling=False)
 
     # ------------------------------------------------------------------------
     # RECENT APPLICATIONS LOG
