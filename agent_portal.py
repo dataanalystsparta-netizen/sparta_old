@@ -3358,22 +3358,82 @@ try:
         if table_styles:
             monthly_style = monthly_style.set_table_styles(table_styles, overwrite=False)
 
-        # Light group-specific gradients make counts scannable; zero values
-        # display as a dash. No blank-status column is created.
-        for cols, colour_map in [
-            (quality_cols, "Blues"),
-            (welcome_cols, "BuGn"),
-            (committed_cols, "Purples"),
-            (onboarding_cols, "YlOrBr"),
-        ]:
-            if cols:
-                monthly_style = monthly_style.background_gradient(
-                    cmap=colour_map,
-                    subset=cols,
-                    vmin=0,
-                    vmax=max(1, int(monthly_display[cols].to_numpy().max())),
-                    axis=None,
-                )
+        # Semantic status colours: colour follows what the header represents,
+        # while shade intensity follows the count. Zero counts remain very pale
+        # (and continue to display as a dash); unknown statuses use neutral grey.
+        def status_colour_family(group_name, short_label):
+            label = re.sub(r"[^a-z0-9]+", " ", str(short_label).casefold()).strip()
+            tokens = set(label.split())
+            compact = label.replace(" ", "")
+
+            # Terminal cancellation/rejection labels are red.
+            if tokens.intersection({"reject", "rejected", "cancelled", "canceled"}) or compact in {
+                "tobecancelled", "tobecanceled"
+            }:
+                return "red"
+            # Workflow in progress / needs follow-up is yellow.
+            if (
+                tokens.intersection({"pending", "rework"})
+                or compact in {"followup", "follow-up", "followuprequired"}
+                or "followup" in compact
+                or "portpending" in compact
+            ):
+                return "yellow"
+            if "approved" in tokens or compact == "approved":
+                return "green"
+            return "neutral"
+
+        # Low-to-high colour ramps. The upper endpoint becomes more saturated
+        # as the count increases, making the larger values stand out naturally.
+        status_palettes = {
+            "yellow": ("#FFFBEB", "#F59E0B"),
+            "green": ("#ECFDF5", "#059669"),
+            "red": ("#FEF2F2", "#DC2626"),
+            "neutral": ("#F8FAFC", "#CBD5E1"),
+        }
+
+        def blend_hex(low_hex, high_hex, ratio):
+            low_rgb = tuple(int(low_hex[i:i + 2], 16) for i in (1, 3, 5))
+            high_rgb = tuple(int(high_hex[i:i + 2], 16) for i in (1, 3, 5))
+            rgb = tuple(round(a + (b - a) * ratio) for a, b in zip(low_rgb, high_rgb))
+            return "#" + "".join(f"{component:02X}" for component in rgb)
+
+        status_families = {
+            col: status_colour_family(col[0], col[1])
+            for col in status_cols
+        }
+        family_max = {}
+        for family in status_palettes:
+            values = []
+            for col, col_family in status_families.items():
+                if col_family == family:
+                    values.extend(pd.to_numeric(monthly_display[col], errors="coerce").dropna().tolist())
+            family_max[family] = max([float(v) for v in values] + [0.0])
+
+        def semantic_status_styles(data):
+            styles = pd.DataFrame("", index=data.index, columns=data.columns)
+            for col, family in status_families.items():
+                low_hex, high_hex = status_palettes[family]
+                maximum = family_max.get(family, 0.0)
+                numeric_values = pd.to_numeric(data[col], errors="coerce")
+                for row_idx, value in numeric_values.items():
+                    if pd.isna(value) or float(value) <= 0:
+                        ratio = 0.0
+                    elif maximum <= 0:
+                        ratio = 0.0
+                    else:
+                        # Keep non-zero values visibly tinted, with the highest
+                        # count in that semantic family using its strongest shade.
+                        ratio = 0.16 + 0.84 * min(1.0, float(value) / maximum)
+                    background = blend_hex(low_hex, high_hex, ratio)
+                    foreground = "#FFFFFF" if (family in {"green", "red"} and ratio >= 0.68) else "#334155"
+                    styles.loc[row_idx, col] = (
+                        f"background-color: {background}; color: {foreground}; "
+                        "font-weight: 750; text-align: center;"
+                    )
+            return styles
+
+        monthly_style = monthly_style.apply(semantic_status_styles, axis=None)
 
         st.dataframe(
             monthly_style,
