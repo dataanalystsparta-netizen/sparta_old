@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
@@ -2223,7 +2224,7 @@ def add_date_strings(frame, source_col, output_col):
 
 
 def _monthly_table_is_holiday(day_value):
-    """Working-day rule: Sundays and 1st/3rd Saturdays are holidays; 5th Saturdays are working days."""
+    """Working-day rule: Sundays and the 1st/3rd Saturdays are holidays."""
     day = day_value.date() if isinstance(day_value, (pd.Timestamp, datetime.datetime)) else day_value
     weekday = day.weekday()
     if weekday == 6:
@@ -2235,38 +2236,34 @@ def _monthly_table_is_holiday(day_value):
 
 
 def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=None):
-    """Build a CRM-mirror-only monthly report for one already-filtered agent.
+    """Build monthly and daily CRM-only summaries for one already-filtered agent.
 
-    Status values are pivoted into individual, group-prefixed columns (for
-    example, ``Quality · QA-Approved`` and ``Onboarding · Onboarding Pending``).
-    Blank/missing status fields are intentionally omitted from category columns
-    and are never counted as a separate status. Application totals still count
-    every eligible CRM application regardless of whether a workflow status is
-    populated.
-
-    CRM application/downstream rows are matched by Sale Date + phone number;
-    duplicated keys retain the last row, consistent with the main loader.
+    Returns (monthly_summary, daily_summary). The daily summary includes every
+    date within each represented CRM month, including zero-sales working days,
+    so each month can be expanded in the interactive table.
     """
     as_of = as_of or datetime.date.today()
     as_of_date = as_of.date() if isinstance(as_of, datetime.datetime) else as_of
 
     base_columns = ["Month", "Present", "SPD", "Applications"]
+    daily_base_columns = ["Date", "Present", "SPD", "Applications"]
     status_specs = [
         ("Quality", "_QualityStatus"),
         ("Welcome", "_WelcomeStatus"),
         ("Committed", "_ConfirmationStatus"),
         ("Onboarding", "_OnboardingStatus"),
     ]
-    empty_result = pd.DataFrame(columns=base_columns)
+    empty_monthly = pd.DataFrame(columns=base_columns)
+    empty_daily = pd.DataFrame(columns=daily_base_columns)
     if apps_frame is None or apps_frame.empty or "Source" not in apps_frame.columns:
-        return empty_result
+        return empty_monthly, empty_daily
 
     # This report deliberately uses only rows whose source is the CRM mirror.
     crm_apps = apps_frame[
         apps_frame["Source"].fillna("").astype(str).str.strip().eq("CRM Mirror")
     ].copy()
     if crm_apps.empty:
-        return empty_result
+        return empty_monthly, empty_daily
 
     if "Date_Parsed" not in crm_apps.columns:
         crm_apps["Date_Parsed"] = parse_date_series(
@@ -2275,10 +2272,11 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
     crm_apps["Date_Parsed"] = pd.to_datetime(crm_apps["Date_Parsed"], errors="coerce")
     crm_apps = crm_apps[
         crm_apps["Date_Parsed"].notna()
+        & (crm_apps["Date_Parsed"].dt.date >= CRM_SOURCE_START.date())
         & (crm_apps["Date_Parsed"].dt.date <= as_of_date)
     ].copy()
     if crm_apps.empty:
-        return empty_result
+        return empty_monthly, empty_daily
 
     if "_RecordKey" not in crm_apps.columns:
         crm_apps = add_record_keys(crm_apps, "Standardized_Date", "CLI")
@@ -2286,9 +2284,8 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
     crm_apps = crm_apps[crm_apps["_RecordKey"].ne("")].copy()
     crm_apps = crm_apps.drop_duplicates(subset=["_RecordKey"], keep="last")
     if crm_apps.empty:
-        return empty_result
+        return empty_monthly, empty_daily
 
-    # Rename application-side values before attaching confirmation/onboarding.
     for col in ("Quality Status", "Status"):
         if col not in crm_apps.columns:
             crm_apps[col] = ""
@@ -2324,9 +2321,8 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
         validate="one_to_one",
     )
     monthly_data["_Month"] = monthly_data["Date_Parsed"].dt.to_period("M")
+    monthly_data["_SaleDay"] = monthly_data["Date_Parsed"].dt.date
 
-    # Normalise category keys so case, repeated spaces, and harmless hyphen
-    # variants do not create duplicate columns. Truly blank values stay empty.
     status_labels = {}
     for group_name, source_col in status_specs:
         if source_col not in monthly_data.columns:
@@ -2342,7 +2338,6 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
             label = re.sub(r"\s+", " ", clean_reason_text(raw_value)).strip()
             if label:
                 labels_for_group.setdefault(normalized_key, label)
-        # Stable display order, alphabetically by the first observed label.
         status_labels[group_name] = dict(sorted(
             labels_for_group.items(), key=lambda item: item[1].casefold()
         ))
@@ -2362,8 +2357,16 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
         attendance["_AttendanceDate"] = attendance["Date_Parsed"].dt.date
         attendance = attendance.drop_duplicates(subset=["_AttendanceDate"], keep="last")
 
+    attendance_by_date = {}
+    if not attendance.empty:
+        attendance_by_date = dict(zip(
+            attendance["_AttendanceDate"],
+            attendance["Attendance_Code"].astype(str).str.strip().str.upper()
+        ))
+
     attendance_units = {"P": 1.0, "HD": 0.5}
     rows = []
+    daily_rows = []
     months = sorted(monthly_data["_Month"].dropna().unique())
     for month_period in months:
         month_apps = monthly_data[monthly_data["_Month"] == month_period].copy()
@@ -2372,21 +2375,15 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
         if month_start > month_end:
             continue
 
-        working_dates = [
+        all_dates = [
             month_start + datetime.timedelta(days=offset)
             for offset in range((month_end - month_start).days + 1)
-            if not _monthly_table_is_holiday(month_start + datetime.timedelta(days=offset))
         ]
-        working_date_set = set(working_dates)
-        present_units = 0.0
-        if not attendance.empty and working_date_set:
-            month_attendance = attendance[
-                attendance["_AttendanceDate"].isin(working_date_set)
-            ]
-            present_units = sum(
-                attendance_units.get(str(code).strip().upper(), 0.0)
-                for code in month_attendance["Attendance_Code"].tolist()
-            )
+        working_dates = [day for day in all_dates if not _monthly_table_is_holiday(day)]
+        present_units = sum(
+            attendance_units.get(attendance_by_date.get(day, ""), 0.0)
+            for day in working_dates
+        )
 
         application_count = int(len(month_apps))
         row = {
@@ -2397,17 +2394,37 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
         }
         for group_name, _source_col in status_specs:
             key_col = f"_StatusKey_{group_name}"
-            month_counts = month_apps[key_col].value_counts(dropna=False).to_dict()
+            month_counts = month_apps[key_col].value_counts().to_dict()
             for normalized_key, display_label in status_labels[group_name].items():
-                column_label = f"{group_name} · {display_label}"
-                row[column_label] = int(month_counts.get(normalized_key, 0))
+                row[f"{group_name} · {display_label}"] = int(month_counts.get(normalized_key, 0))
         rows.append(row)
 
-    if not rows:
-        return empty_result
+        # Daily rows are created for every date in the month window, including
+        # dates with no sales. Holiday dates remain visible but have no working
+        # day denominator; fifth Saturdays are working days under the revised rule.
+        for sale_day in all_dates:
+            day_apps = month_apps[month_apps["_SaleDay"] == sale_day]
+            day_is_holiday = _monthly_table_is_holiday(sale_day)
+            day_present_units = attendance_units.get(attendance_by_date.get(sale_day, ""), 0.0)
+            day_working_denominator = 0 if day_is_holiday else 1
+            app_count = int(len(day_apps))
+            daily_row = {
+                "Date": sale_day.strftime("%a, %d %b"),
+                "_MonthKey": month_period.strftime("%Y-%m"),
+                "Present": f"{day_present_units:g}/{day_working_denominator}" if not day_is_holiday else "—/0",
+                "SPD": f"{app_count / day_present_units:.2f}" if day_present_units > 0 else "—",
+                "Applications": app_count,
+            }
+            for group_name, _source_col in status_specs:
+                key_col = f"_StatusKey_{group_name}"
+                day_counts = day_apps[key_col].value_counts().to_dict()
+                for normalized_key, display_label in status_labels[group_name].items():
+                    daily_row[f"{group_name} · {display_label}"] = int(day_counts.get(normalized_key, 0))
+            daily_rows.append(daily_row)
 
-    # Make the table schema stable across every monthly row and preserve the
-    # requested grouped order. No blank-status columns are ever created.
+    if not rows:
+        return empty_monthly, empty_daily
+
     dynamic_columns = []
     for group_name, _source_col in status_specs:
         dynamic_columns.extend(
@@ -2415,145 +2432,14 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
             for label in status_labels[group_name].values()
         )
     result_columns = base_columns + dynamic_columns
-    result = pd.DataFrame(rows).reindex(columns=result_columns, fill_value=0)
-    for col in dynamic_columns:
-        result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0).astype(int)
-    result["Applications"] = pd.to_numeric(result["Applications"], errors="coerce").fillna(0).astype(int)
-    return result
-
-
-
-def build_crm_daily_summary(apps_frame, portal_frame, attendance_frame, as_of=None):
-    """Build CRM-only daily sales/status detail using the monthly table's rules."""
-    as_of = as_of or datetime.date.today()
-    as_of_date = as_of.date() if isinstance(as_of, datetime.datetime) else as_of
-    base_columns = ["Date", "Present", "SPD", "Applications"]
-    status_specs = [
-        ("Quality", "_QualityStatus"),
-        ("Welcome", "_WelcomeStatus"),
-        ("Committed", "_ConfirmationStatus"),
-        ("Onboarding", "_OnboardingStatus"),
-    ]
-    empty_result = pd.DataFrame(columns=base_columns)
-    if apps_frame is None or apps_frame.empty or "Source" not in apps_frame.columns:
-        return empty_result
-
-    apps = apps_frame[
-        apps_frame["Source"].fillna("").astype(str).str.strip().eq("CRM Mirror")
-    ].copy()
-    if apps.empty:
-        return empty_result
-    if "Date_Parsed" not in apps.columns:
-        apps["Date_Parsed"] = parse_date_series(
-            apps.get("Sale Date", pd.Series(index=apps.index, dtype=object))
-        )
-    apps["Date_Parsed"] = pd.to_datetime(apps["Date_Parsed"], errors="coerce")
-    apps = apps[
-        apps["Date_Parsed"].notna()
-        & (apps["Date_Parsed"].dt.date >= CRM_SOURCE_START.date())
-        & (apps["Date_Parsed"].dt.date <= as_of_date)
-    ].copy()
-    if apps.empty:
-        return empty_result
-    if "_RecordKey" not in apps.columns:
-        apps = add_record_keys(apps, "Standardized_Date", "CLI")
-    apps["_RecordKey"] = apps["_RecordKey"].fillna("").astype(str).str.strip()
-    apps = apps[apps["_RecordKey"].ne("")].drop_duplicates("_RecordKey", keep="last").copy()
-    if apps.empty:
-        return empty_result
-
-    for col in ("Quality Status", "Status"):
-        if col not in apps.columns:
-            apps[col] = ""
-    apps = apps.rename(columns={"Quality Status": "_QualityStatus", "Status": "_WelcomeStatus"})
-    apps = apps[ ["_RecordKey", "Date_Parsed", "_QualityStatus", "_WelcomeStatus"] ].copy()
-
-    portal_statuses = pd.DataFrame(columns=["_RecordKey", "_OnboardingStatus", "_ConfirmationStatus"])
-    if portal_frame is not None and not portal_frame.empty and "Source" in portal_frame.columns:
-        portal = portal_frame[
-            portal_frame["Source"].fillna("").astype(str).str.strip().eq("CRM Mirror")
-        ].copy()
-        if "_RecordKey" not in portal.columns:
-            portal = add_record_keys(portal, "Sale Date", "Telephone No.")
-        portal["_RecordKey"] = portal["_RecordKey"].fillna("").astype(str).str.strip()
-        portal = portal[portal["_RecordKey"].ne("")].copy()
-        for col in ("Status", "CallStatus"):
-            if col not in portal.columns:
-                portal[col] = ""
-        portal_statuses = portal[["_RecordKey", "Status", "CallStatus"]].rename(columns={
-            "Status": "_OnboardingStatus", "CallStatus": "_ConfirmationStatus"
-        }).drop_duplicates("_RecordKey", keep="last")
-
-    daily = apps.merge(portal_statuses, on="_RecordKey", how="left", validate="one_to_one")
-    daily["_Day"] = daily["Date_Parsed"].dt.date
-    status_labels = {}
-    for group_name, source_col in status_specs:
-        key_col = f"_StatusKey_{group_name}"
-        daily[key_col] = daily[source_col].apply(normalize_workflow_status)
-        labels = {}
-        for raw_value, norm_key in zip(daily[source_col].tolist(), daily[key_col].tolist()):
-            if not norm_key:
-                continue
-            label = re.sub(r"\s+", " ", clean_reason_text(raw_value)).strip()
-            if label:
-                labels.setdefault(norm_key, label)
-        status_labels[group_name] = dict(sorted(labels.items(), key=lambda item: item[1].casefold()))
-
-    attendance = attendance_frame.copy() if attendance_frame is not None else pd.DataFrame()
-    if not attendance.empty:
-        if "Date_Parsed" not in attendance.columns:
-            attendance["Date_Parsed"] = parse_date_series(
-                attendance.get("Date", pd.Series(index=attendance.index, dtype=object))
-            )
-        attendance["Date_Parsed"] = pd.to_datetime(attendance["Date_Parsed"], errors="coerce")
-        if "Attendance_Code" not in attendance.columns:
-            attendance["Attendance_Code"] = attendance.get(
-                "Attendance", pd.Series("-", index=attendance.index)
-            ).apply(normalize_attendance_status)
-        attendance = attendance[attendance["Date_Parsed"].notna()].copy()
-        attendance["_AttendanceDate"] = attendance["Date_Parsed"].dt.date
-        attendance = attendance.drop_duplicates("_AttendanceDate", keep="last")
-    attendance_by_day = {}
-    if not attendance.empty:
-        attendance_by_day = dict(zip(attendance["_AttendanceDate"], attendance["Attendance_Code"]))
-
-    months = sorted(daily["Date_Parsed"].dt.to_period("M").dropna().unique())
-    rows = []
-    attendance_units = {"P": 1.0, "HD": 0.5}
-    for period in months:
-        first_day = max(period.start_time.date(), CRM_SOURCE_START.date())
-        last_day = min(period.end_time.date(), as_of_date)
-        for offset in range((last_day - first_day).days + 1):
-            day = first_day + datetime.timedelta(days=offset)
-            day_apps = daily[daily["_Day"] == day]
-            app_count = int(len(day_apps))
-            attendance_code = str(attendance_by_day.get(day, "-") or "-").strip().upper()
-            attendance_code = attendance_code if attendance_code in {"P", "HD", "AB", "UL"} else "-"
-            present_units = attendance_units.get(attendance_code, 0.0)
-            row = {
-                "Date": day.strftime("%d %b %Y"),
-                "Present": attendance_code,
-                "SPD": f"{app_count / present_units:.2f}" if present_units > 0 else "—",
-                "Applications": app_count,
-            }
-            for group_name, _source_col in status_specs:
-                key_col = f"_StatusKey_{group_name}"
-                counts = day_apps[key_col].value_counts().to_dict()
-                for normalized_key, label in status_labels[group_name].items():
-                    row[f"{group_name} · {label}"] = int(counts.get(normalized_key, 0))
-            rows.append(row)
-
-    if not rows:
-        return empty_result
-    dynamic_columns = [
-        f"{group_name} · {label}"
-        for group_name, _source_col in status_specs
-        for label in status_labels[group_name].values()
-    ]
-    result = pd.DataFrame(rows).reindex(columns=base_columns + dynamic_columns, fill_value=0)
-    for col in dynamic_columns + ["Applications"]:
-        result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0).astype(int)
-    return result
+    monthly_result = pd.DataFrame(rows).reindex(columns=result_columns, fill_value=0)
+    daily_columns = daily_base_columns + dynamic_columns + ["_MonthKey"]
+    daily_result = pd.DataFrame(daily_rows).reindex(columns=daily_columns, fill_value=0)
+    for frame in (monthly_result, daily_result):
+        for col in dynamic_columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0).astype(int)
+        frame["Applications"] = pd.to_numeric(frame["Applications"], errors="coerce").fillna(0).astype(int)
+    return monthly_result, daily_result
 
 def pick_existing(frame, candidates):
     return [c for c in candidates if c in frame.columns]
@@ -3311,7 +3197,7 @@ try:
             )
             st.caption(
                 f"{calendar.month_name[m_idx]} {sel_year} · peak: {calendar_max:,} sales · "
-                "format: date + attendance/sales · Sundays + 1st/3rd Saturdays are holidays; 5th Saturdays are working days"
+                "format: date + attendance/sales · Sundays + 1st/3rd Saturdays are holidays"
             )
 
 
@@ -3374,20 +3260,17 @@ try:
         "This table is agent-specific and independent of the main date filter. "
         "September starts at the CRM cutover (18 Sep 2026); the current month is month-to-date. "
         "Present = attendance units (P=1, HD=0.5, Ab/UL=0) / scheduled working days; "
-        "SPD = CRM applications ÷ attendance units. Sundays and 1st/3rd Saturdays are excluded; 5th Saturdays are working days."
+        "SPD = CRM applications ÷ attendance units. Sundays and 1st/3rd Saturdays are excluded."
     )
-    monthly_crm_summary = build_crm_monthly_summary(ag1, ag2, ag_attendance, as_of=today_date)
-    if "monthly_crm_daily_expanded" not in st.session_state:
-        st.session_state["monthly_crm_daily_expanded"] = False
-    toggle_label = "− Hide daily sales" if st.session_state["monthly_crm_daily_expanded"] else "＋ Show daily sales"
-    if st.button(toggle_label, key="monthly_crm_daily_toggle"):
-        st.session_state["monthly_crm_daily_expanded"] = not st.session_state["monthly_crm_daily_expanded"]
+    monthly_crm_summary, daily_crm_summary = build_crm_monthly_summary(
+        ag1, ag2, ag_attendance, as_of=today_date
+    )
     if monthly_crm_summary.empty:
         st.info("No CRM mirror applications are available for your account yet.")
     else:
-        # Render a compact two-row header. The first header row groups each
-        # workflow's status columns; the second row contains the shorter status
-        # names (e.g. Quality > Approved/Rework/Reject).
+        # Compact two-level headers: workflow groups on the first row and
+        # individual status names on the second row. Each month row expands
+        # inline to reveal every date in that month.
         workflow_groups = ["Quality", "Welcome", "Committed", "Onboarding"]
 
         def compact_status_header(group_name, label):
@@ -3403,76 +3286,16 @@ try:
                 text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
             return text or str(label).strip()
 
-        display_pairs = []
-        for col in monthly_crm_summary.columns:
-            if col in {"Month", "Present", "SPD", "Applications"}:
-                display_pairs.append(("Monthly Summary", col))
-                continue
+        summary_columns = ["Month", "Present", "SPD", "Applications"]
+        status_columns = [
+            col for col in monthly_crm_summary.columns
+            if col not in set(summary_columns)
+        ]
+        display_pairs = [("Monthly Summary", name) for name in summary_columns]
+        for col in status_columns:
             group_name, raw_label = col.split(" · ", 1)
             display_pairs.append((group_name, compact_status_header(group_name, raw_label)))
 
-        monthly_display = monthly_crm_summary.copy()
-        monthly_display.columns = pd.MultiIndex.from_tuples(display_pairs, names=[None, None])
-
-        summary_columns = [("Monthly Summary", name) for name in ("Month", "Present", "SPD", "Applications")]
-        quality_cols = [pair for pair in display_pairs if pair[0] == "Quality"]
-        welcome_cols = [pair for pair in display_pairs if pair[0] == "Welcome"]
-        committed_cols = [pair for pair in display_pairs if pair[0] == "Committed"]
-        onboarding_cols = [pair for pair in display_pairs if pair[0] == "Onboarding"]
-        status_cols = quality_cols + welcome_cols + committed_cols + onboarding_cols
-
-        monthly_style = (
-            monthly_display.style
-            .format({summary_columns[3]: "{:,.0f}"}, na_rep="—")
-            .format({col: (lambda value: "—" if pd.isna(value) or value == 0 else f"{int(value):,}") for col in status_cols}, na_rep="—")
-            .set_properties(
-                **{
-                    "border-bottom": "1px solid #E5EAF2",
-                    "padding": "5px 7px",
-                    "font-size": "0.72rem",
-                    "color": "#1E293B",
-                    "white-space": "nowrap",
-                    "text-align": "center",
-                }
-            )
-            .set_properties(
-                subset=[summary_columns[0]],
-                **{"font-weight": "800", "color": "#102451", "background-color": "#F1F5FF", "text-align": "left"},
-            )
-            .set_properties(
-                subset=summary_columns[1:],
-                **{"text-align": "center", "font-weight": "800"},
-            )
-            .set_properties(subset=status_cols, **{"text-align": "center", "font-weight": "750"})
-            .set_table_styles([
-                {"selector": "table", "props": [
-                    ("border-collapse", "separate"), ("border-spacing", "0"),
-                    ("border", "1px solid #D9E2F0"), ("border-radius", "10px"),
-                    ("overflow", "hidden"), ("font-family", "Arial, sans-serif"),
-                ]},
-                {"selector": "th.col_heading.level0", "props": [
-                    ("background-color", "#102451"), ("color", "#FFFFFF"),
-                    ("font-size", "0.66rem"), ("font-weight", "850"),
-                    ("letter-spacing", "0.35px"), ("padding", "7px 7px"),
-                    ("text-align", "center"), ("white-space", "normal"),
-                    ("border-right", "1px solid #31446A"),
-                    ("border-bottom", "1px solid #31446A"),
-                ]},
-                {"selector": "th.col_heading.level1", "props": [
-                    ("background-color", "#EAF0F8"), ("color", "#26364F"),
-                    ("font-size", "0.60rem"), ("font-weight", "800"),
-                    ("letter-spacing", "0.05px"), ("padding", "5px 6px"),
-                    ("text-align", "center"), ("white-space", "normal"),
-                    ("border-right", "1px solid #D9E2F0"),
-                ]},
-                {"selector": "tbody tr:nth-child(even) td", "props": [("background-color", "#F8FAFC")]},
-                {"selector": "tbody tr:hover td", "props": [("background-color", "#EFF6FF")]},
-                {"selector": "th.row_heading", "props": [("display", "none")]},
-            ])
-        )
-
-        # Header accents match the workflow groups. Because the columns are a
-        # MultiIndex, pandas renders the groups on row one and statuses on row two.
         header_colours = {
             "Monthly Summary": "#102451",
             "Quality": "#1D4ED8",
@@ -3480,39 +3303,17 @@ try:
             "Committed": "#6D28D9",
             "Onboarding": "#92400E",
         }
-        table_styles = []
-        seen_groups = set()
-        for idx, (group_name, _label) in enumerate(display_pairs):
-            if group_name in seen_groups:
-                continue
-            seen_groups.add(group_name)
-            table_styles.append({
-                "selector": f"th.col_heading.level0.col{idx}",
-                "props": [
-                    ("background-color", header_colours.get(group_name, "#102451")),
-                    ("color", "#FFFFFF"),
-                ],
-            })
-        if table_styles:
-            monthly_style = monthly_style.set_table_styles(table_styles, overwrite=False)
 
-        # Semantic status colours: colour follows what the header represents,
-        # while shade intensity follows the count. Zero counts remain very pale
-        # (and continue to display as a dash); unknown statuses use neutral grey.
         def status_colour_family(group_name, short_label):
             label = re.sub(r"[^a-z0-9]+", " ", str(short_label).casefold()).strip()
             tokens = set(label.split())
             compact = label.replace(" ", "")
-
-            # Terminal cancellation/rejection labels are red.
             if tokens.intersection({"reject", "rejected", "cancelled", "canceled"}) or compact in {
                 "tobecancelled", "tobecanceled"
             }:
                 return "red"
-            # Workflow in progress / needs follow-up is yellow.
             if (
                 tokens.intersection({"pending", "rework"})
-                or compact in {"followup", "follow-up", "followuprequired"}
                 or "followup" in compact
                 or "portpending" in compact
             ):
@@ -3521,8 +3322,6 @@ try:
                 return "green"
             return "neutral"
 
-        # Low-to-high colour ramps. The upper endpoint becomes more saturated
-        # as the count increases, making the larger values stand out naturally.
         status_palettes = {
             "yellow": ("#FFFBEB", "#F59E0B"),
             "green": ("#ECFDF5", "#059669"),
@@ -3536,125 +3335,168 @@ try:
             rgb = tuple(round(a + (b - a) * ratio) for a, b in zip(low_rgb, high_rgb))
             return "#" + "".join(f"{component:02X}" for component in rgb)
 
-        status_families = {
-            col: status_colour_family(col[0], col[1])
-            for col in status_cols
-        }
-        family_max = {}
-        for family in status_palettes:
-            values = []
-            for col, col_family in status_families.items():
-                if col_family == family:
-                    values.extend(pd.to_numeric(monthly_display[col], errors="coerce").dropna().tolist())
-            family_max[family] = max([float(v) for v in values] + [0.0])
+        status_families = {}
+        for group_name, short_label in display_pairs:
+            if group_name != "Monthly Summary":
+                matching_col = next(
+                    col for col in status_columns
+                    if col.split(" · ", 1)[0] == group_name
+                    and compact_status_header(group_name, col.split(" · ", 1)[1]) == short_label
+                )
+                status_families[matching_col] = status_colour_family(group_name, short_label)
 
-        def semantic_status_styles(data):
-            styles = pd.DataFrame("", index=data.index, columns=data.columns)
-            for col, family in status_families.items():
-                low_hex, high_hex = status_palettes[family]
-                maximum = family_max.get(family, 0.0)
-                numeric_values = pd.to_numeric(data[col], errors="coerce")
-                for row_idx, value in numeric_values.items():
-                    if pd.isna(value) or float(value) <= 0:
-                        ratio = 0.0
-                    elif maximum <= 0:
-                        ratio = 0.0
-                    else:
-                        # Keep non-zero values visibly tinted, with the highest
-                        # count in that semantic family using its strongest shade.
-                        ratio = 0.16 + 0.84 * min(1.0, float(value) / maximum)
-                    background = blend_hex(low_hex, high_hex, ratio)
-                    foreground = "#FFFFFF" if (family in {"green", "red"} and ratio >= 0.68) else "#334155"
-                    styles.loc[row_idx, col] = (
-                        f"background-color: {background}; color: {foreground}; "
-                        "font-weight: 750; text-align: center;"
-                    )
-            return styles
-
-        monthly_style = monthly_style.apply(semantic_status_styles, axis=None)
-
-        st.dataframe(
-            monthly_style,
-            use_container_width=True,
-            hide_index=True,
-            height=min(620, max(190, 54 + 42 * len(monthly_display))),
-        )
-
-    if st.session_state.get("monthly_crm_daily_expanded", False):
-        daily_crm_summary = build_crm_daily_summary(ag1, ag2, ag_attendance, as_of=today_date)
-        st.markdown("#### Daily CRM sales")
-        if daily_crm_summary.empty:
-            st.info("No daily CRM sales are available for your account yet.")
-        else:
-            daily_pairs = []
-            for col in daily_crm_summary.columns:
-                if col in {"Date", "Present", "SPD", "Applications"}:
-                    daily_pairs.append(("Daily Summary", col))
-                else:
-                    group_name, raw_label = col.split(" · ", 1)
-                    daily_pairs.append((group_name, compact_status_header(group_name, raw_label)))
-            daily_display = daily_crm_summary.copy()
-            daily_display.columns = pd.MultiIndex.from_tuples(daily_pairs, names=[None, None])
-            daily_summary_cols = [pair for pair in daily_pairs if pair[0] == "Daily Summary"]
-            daily_status_cols = [pair for pair in daily_pairs if pair[0] != "Daily Summary"]
-            daily_style = (
-                daily_display.style
-                .format({col: (lambda value: "—" if pd.isna(value) or value == 0 else f"{int(value):,}") for col in daily_status_cols}, na_rep="—")
-                .set_properties(**{
-                    "border-bottom": "1px solid #E5EAF2", "padding": "4px 6px",
-                    "font-size": "0.70rem", "color": "#1E293B", "white-space": "nowrap",
-                    "text-align": "center",
-                })
-                .set_table_styles([
-                    {"selector": "table", "props": [("border-collapse", "separate"), ("border-spacing", "0"), ("border", "1px solid #D9E2F0"), ("border-radius", "9px"), ("overflow", "hidden")]},
-                    {"selector": "th.col_heading.level0", "props": [("background-color", "#102451"), ("color", "#FFFFFF"), ("font-size", "0.64rem"), ("font-weight", "850"), ("padding", "6px"), ("text-align", "center"), ("white-space", "normal")]},
-                    {"selector": "th.col_heading.level1", "props": [("background-color", "#EAF0F8"), ("color", "#26364F"), ("font-size", "0.59rem"), ("font-weight", "800"), ("padding", "4px 5px"), ("text-align", "center"), ("white-space", "normal")]},
-                    {"selector": "tbody tr:nth-child(even) td", "props": [("background-color", "#F8FAFC")]},
-                    {"selector": "th.row_heading", "props": [("display", "none")]},
-                ])
+        # Scale monthly and daily shades separately so daily counts remain
+        # visually meaningful instead of being washed out by monthly totals.
+        shade_max = {}
+        for col, family in status_families.items():
+            month_values = pd.to_numeric(monthly_crm_summary[col], errors="coerce").fillna(0)
+            day_values = (
+                pd.to_numeric(daily_crm_summary[col], errors="coerce").fillna(0)
+                if col in daily_crm_summary.columns else pd.Series(dtype=float)
             )
-            daily_header_colours = {
-                "Daily Summary": "#102451", "Quality": "#1D4ED8", "Welcome": "#0F766E",
-                "Committed": "#6D28D9", "Onboarding": "#92400E",
-            }
-            daily_table_styles = []
-            daily_seen = set()
-            for idx, (group_name, _label) in enumerate(daily_pairs):
-                if group_name in daily_seen:
-                    continue
-                daily_seen.add(group_name)
-                daily_table_styles.append({
-                    "selector": f"th.col_heading.level0.col{idx}",
-                    "props": [("background-color", daily_header_colours.get(group_name, "#102451")), ("color", "#FFFFFF")],
-                })
-            if daily_table_styles:
-                daily_style = daily_style.set_table_styles(daily_table_styles, overwrite=False)
-            # Reuse the same status-semantic palette as the monthly table.
-            daily_families = {col: status_colour_family(col[0], col[1]) for col in daily_status_cols}
-            daily_max = {}
-            for family in status_palettes:
-                vals = []
-                for col, fam in daily_families.items():
-                    if fam == family:
-                        vals.extend(pd.to_numeric(daily_display[col], errors="coerce").dropna().tolist())
-                daily_max[family] = max([float(v) for v in vals] + [0.0])
-            def daily_semantic_status_styles(data):
-                styles = pd.DataFrame("", index=data.index, columns=data.columns)
-                for col, family in daily_families.items():
-                    low_hex, high_hex = status_palettes[family]
-                    maximum = daily_max.get(family, 0.0)
-                    numeric_values = pd.to_numeric(data[col], errors="coerce")
-                    for row_idx, value in numeric_values.items():
-                        ratio = 0.0 if pd.isna(value) or float(value) <= 0 or maximum <= 0 else 0.16 + 0.84 * min(1.0, float(value) / maximum)
-                        background = blend_hex(low_hex, high_hex, ratio)
-                        foreground = "#FFFFFF" if (family in {"green", "red"} and ratio >= 0.68) else "#334155"
-                        styles.loc[row_idx, col] = f"background-color: {background}; color: {foreground}; font-weight: 750; text-align: center;"
-                return styles
-            daily_style = daily_style.apply(daily_semantic_status_styles, axis=None)
-            st.dataframe(
-                daily_style, use_container_width=True, hide_index=True,
-                height=min(760, max(260, 38 * len(daily_display) + 56)),
+            shade_max[(family, "month")] = max(
+                shade_max.get((family, "month"), 0),
+                float(month_values.max()) if not month_values.empty else 0,
             )
+            shade_max[(family, "day")] = max(
+                shade_max.get((family, "day"), 0),
+                float(day_values.max()) if not day_values.empty else 0,
+            )
+
+        def status_cell_html(col, value, row_kind):
+            try:
+                count = int(value) if pd.notna(value) else 0
+            except (TypeError, ValueError):
+                count = 0
+            family = status_families.get(col, "neutral")
+            low_hex, high_hex = status_palettes[family]
+            maximum = shade_max.get((family, row_kind), 0)
+            ratio = 0.0 if count <= 0 or maximum <= 0 else 0.16 + 0.84 * min(1.0, count / maximum)
+            background = blend_hex(low_hex, high_hex, ratio)
+            foreground = "#FFFFFF" if family in {"green", "red"} and ratio >= 0.68 else "#334155"
+            display_value = "—" if count <= 0 else f"{count:,}"
+            return (
+                f'<td class="status-cell" style="background:{background};color:{foreground};'
+                f'font-weight:750;text-align:center;">{display_value}</td>'
+            )
+
+        def basic_cell_html(value, extra_class=""):
+            safe_value = escape(str(value))
+            return f'<td class="{extra_class}">{safe_value}</td>'
+
+        group_counts = {}
+        for group_name, _label in display_pairs:
+            group_counts[group_name] = group_counts.get(group_name, 0) + 1
+
+        header_row_one = ['<th class="group-header summary-group" colspan="4">Monthly Summary</th>']
+        for group_name in workflow_groups:
+            count = sum(1 for pair in display_pairs if pair[0] == group_name)
+            if count:
+                header_row_one.append(
+                    f'<th class="group-header" colspan="{count}" '
+                    f'style="background:{header_colours[group_name]}">{escape(group_name)}</th>'
+                )
+
+        header_row_two = []
+        for group_name, label in display_pairs:
+            if group_name == "Monthly Summary":
+                shown_label = label
+            else:
+                shown_label = label
+            header_row_two.append(
+                f'<th class="sub-header" style="border-top:3px solid '
+                f'{header_colours.get(group_name, "#CBD5E1")}">{escape(shown_label)}</th>'
+            )
+
+        table_rows_html = []
+        for _, month_row in monthly_crm_summary.iterrows():
+            month_label = str(month_row["Month"])
+            month_key = pd.Period(month_label, freq="M").strftime("%Y-%m") if False else ""
+            # Derive the key from the month label without relying on locale-sensitive parsing.
+            parsed_month = pd.to_datetime(month_label, format="%b-%Y", errors="coerce")
+            if pd.isna(parsed_month):
+                month_key = re.sub(r"[^A-Za-z0-9_-]", "", month_label)
+            else:
+                month_key = parsed_month.strftime("%Y-%m")
+            table_rows_html.append(f'<tr class="month-row" data-month-row="{escape(month_key)}">')
+            table_rows_html.append(
+                f'<td class="month-cell"><button type="button" class="month-toggle" '
+                f'data-toggle-month="{escape(month_key)}" aria-expanded="false" '
+                f'aria-label="Expand {escape(month_label)}">+</button>'
+                f'<strong>{escape(month_label)}</strong></td>'
+            )
+            table_rows_html.append(basic_cell_html(month_row["Present"], "numeric-cell"))
+            table_rows_html.append(basic_cell_html(month_row["SPD"], "numeric-cell spd-cell"))
+            table_rows_html.append(basic_cell_html(f'{int(month_row["Applications"]):,}', "numeric-cell applications-cell"))
+            for col in status_columns:
+                table_rows_html.append(status_cell_html(col, month_row.get(col, 0), "month"))
+            table_rows_html.append("</tr>")
+
+            month_daily = daily_crm_summary[
+                daily_crm_summary["_MonthKey"].astype(str).eq(month_key)
+            ] if not daily_crm_summary.empty else pd.DataFrame()
+            for _, day_row in month_daily.iterrows():
+                table_rows_html.append(
+                    f'<tr class="daily-row" data-month="{escape(month_key)}" hidden>'
+                )
+                table_rows_html.append(
+                    f'<td class="date-cell"><span class="daily-indent">↳</span>{escape(str(day_row["Date"]))}</td>'
+                )
+                table_rows_html.append(basic_cell_html(day_row["Present"], "numeric-cell"))
+                table_rows_html.append(basic_cell_html(day_row["SPD"], "numeric-cell spd-cell"))
+                table_rows_html.append(basic_cell_html(f'{int(day_row["Applications"]):,}', "numeric-cell applications-cell"))
+                for col in status_columns:
+                    table_rows_html.append(status_cell_html(col, day_row.get(col, 0), "day"))
+                table_rows_html.append("</tr>")
+
+        table_html = f"""
+        <div class="crm-monthly-wrap">
+          <table class="crm-monthly-table">
+            <thead>
+              <tr>{''.join(header_row_one)}</tr>
+              <tr>{''.join(header_row_two)}</tr>
+            </thead>
+            <tbody>{''.join(table_rows_html)}</tbody>
+          </table>
+        </div>
+        <style>
+          * {{ box-sizing: border-box; }}
+          body {{ margin: 0; padding: 2px; font-family: Arial, sans-serif; color: #1E293B; }}
+          .crm-monthly-wrap {{ width: 100%; overflow: auto; border: 1px solid #D9E2F0; border-radius: 10px; }}
+          .crm-monthly-table {{ border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; font-size: 12px; }}
+          .crm-monthly-table th, .crm-monthly-table td {{ padding: 6px 8px; border-right: 1px solid #E2E8F0; border-bottom: 1px solid #E2E8F0; white-space: nowrap; }}
+          .group-header {{ background: #102451; color: #FFFFFF; font-size: 11px; font-weight: 850; letter-spacing: .35px; text-align: center; padding: 8px 7px !important; }}
+          .summary-group {{ background: #102451; }}
+          .sub-header {{ background: #EAF0F8; color: #26364F; font-size: 10px; font-weight: 800; text-align: center; }}
+          .month-row td {{ background-color: #F1F5FF; font-weight: 750; }}
+          .month-row .month-cell {{ color: #102451; text-align: left; }}
+          .daily-row td {{ font-size: 11px; }}
+          .daily-row .date-cell {{ background: #F8FAFC; color: #475569; text-align: left; padding-left: 22px; }}
+          .daily-indent {{ color: #94A3B8; margin-right: 6px; }}
+          .numeric-cell {{ text-align: center; font-variant-numeric: tabular-nums; }}
+          .spd-cell {{ color: #0F766E; font-weight: 750; }}
+          .applications-cell {{ color: #102451; font-weight: 850; }}
+          .month-toggle {{ width: 21px; height: 21px; line-height: 17px; padding: 0; margin-right: 7px; border: 1px solid #CBD5E1; border-radius: 6px; background: #FFFFFF; color: #1D4ED8; font-size: 15px; font-weight: 800; cursor: pointer; vertical-align: middle; }}
+          .month-toggle:hover {{ background: #DBEAFE; border-color: #60A5FA; }}
+          tbody tr:hover td {{ box-shadow: inset 0 0 0 9999px rgba(219,234,254,.18); }}
+          .daily-row[hidden] {{ display: none !important; }}
+        </style>
+        <script>
+          document.querySelectorAll(".month-toggle").forEach(function(button) {{
+            button.addEventListener("click", function() {{
+              const month = button.getAttribute("data-toggle-month");
+              const isExpanded = button.getAttribute("aria-expanded") === "true";
+              document.querySelectorAll('tr[data-month="' + month + '"]').forEach(function(row) {{
+                row.hidden = isExpanded;
+              }});
+              button.setAttribute("aria-expanded", isExpanded ? "false" : "true");
+              button.textContent = isExpanded ? "+" : "−";
+              button.setAttribute("aria-label", (isExpanded ? "Expand " : "Collapse ") + month);
+            }});
+          }});
+        </script>
+        """
+        components.html(table_html, height=700, scrolling=True)
 
     # ------------------------------------------------------------------------
     # RECENT APPLICATIONS LOG
