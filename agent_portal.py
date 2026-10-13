@@ -2234,44 +2234,30 @@ def _monthly_table_is_holiday(day_value):
     return False
 
 
-def _monthly_status_count_text(values):
-    """Summarise every raw workflow-status value, grouping harmless formatting variants."""
-    counts = {}
-    labels = {}
-    for value in values:
-        text = clean_reason_text(value)
-        if not text or text.strip().lower() in {"nan", "none", "null", "nat", "-", "n/a"}:
-            key = "__blank__"
-            label = "(Blank)"
-        else:
-            text = re.sub(r"\s+", " ", text).strip()
-            key = normalize_workflow_status(text) or "__blank__"
-            label = "(Blank)" if key == "__blank__" else text
-        counts[key] = counts.get(key, 0) + 1
-        labels.setdefault(key, label)
-
-    if not counts:
-        return "—"
-    ordered = sorted(counts, key=lambda key: (-counts[key], labels[key].casefold()))
-    return "\n".join(f"{labels[key]}: {counts[key]:,}" for key in ordered)
-
-
 def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=None):
     """Build a CRM-mirror-only monthly report for one already-filtered agent.
 
-    The application rows provide counts and raw Quality/Welcome statuses. The
-    matching downstream rows provide raw Confirmation and Onboarding statuses.
-    Valid Sale Date + phone record keys are required; duplicate keys retain the
-    last CRM row, consistent with the main CRM loader. The report is independent
-    of the global date filter so it can show the full available CRM month history.
+    Status values are pivoted into individual, group-prefixed columns (for
+    example, ``Quality · QA-Approved`` and ``Onboarding · Onboarding Pending``).
+    Blank/missing status fields are intentionally omitted from category columns
+    and are never counted as a separate status. Application totals still count
+    every eligible CRM application regardless of whether a workflow status is
+    populated.
+
+    CRM application/downstream rows are matched by Sale Date + phone number;
+    duplicated keys retain the last row, consistent with the main loader.
     """
     as_of = as_of or datetime.date.today()
     as_of_date = as_of.date() if isinstance(as_of, datetime.datetime) else as_of
 
-    empty_result = pd.DataFrame(columns=[
-        "Month", "Present", "SPD", "Applications", "Quality Status",
-        "Welcome", "Committed", "Onboarding",
-    ])
+    base_columns = ["Month", "Present", "SPD", "Applications"]
+    status_specs = [
+        ("Quality", "_QualityStatus"),
+        ("Welcome", "_WelcomeStatus"),
+        ("Committed", "_ConfirmationStatus"),
+        ("Onboarding", "_OnboardingStatus"),
+    ]
+    empty_result = pd.DataFrame(columns=base_columns)
     if apps_frame is None or apps_frame.empty or "Source" not in apps_frame.columns:
         return empty_result
 
@@ -2283,7 +2269,9 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
         return empty_result
 
     if "Date_Parsed" not in crm_apps.columns:
-        crm_apps["Date_Parsed"] = parse_date_series(crm_apps.get("Sale Date", pd.Series(index=crm_apps.index, dtype=object)))
+        crm_apps["Date_Parsed"] = parse_date_series(
+            crm_apps.get("Sale Date", pd.Series(index=crm_apps.index, dtype=object))
+        )
     crm_apps["Date_Parsed"] = pd.to_datetime(crm_apps["Date_Parsed"], errors="coerce")
     crm_apps = crm_apps[
         crm_apps["Date_Parsed"].notna()
@@ -2296,25 +2284,23 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
         crm_apps = add_record_keys(crm_apps, "Standardized_Date", "CLI")
     crm_apps["_RecordKey"] = crm_apps["_RecordKey"].fillna("").astype(str).str.strip()
     crm_apps = crm_apps[crm_apps["_RecordKey"].ne("")].copy()
-    # Matching CRM rows are unique by Sale Date + phone. This is a defensive
-    # safeguard and follows the loader's keep-last duplicate policy.
     crm_apps = crm_apps.drop_duplicates(subset=["_RecordKey"], keep="last")
     if crm_apps.empty:
         return empty_result
 
-    # Rename application-side Welcome status before attaching the portal-side
-    # Onboarding and Confirmation fields so that the two meanings never collide.
-    if "Quality Status" not in crm_apps.columns:
-        crm_apps["Quality Status"] = ""
-    if "Status" not in crm_apps.columns:
-        crm_apps["Status"] = ""
+    # Rename application-side values before attaching confirmation/onboarding.
+    for col in ("Quality Status", "Status"):
+        if col not in crm_apps.columns:
+            crm_apps[col] = ""
     crm_apps = crm_apps.rename(columns={
         "Quality Status": "_QualityStatus",
         "Status": "_WelcomeStatus",
     })
     crm_apps = crm_apps[["_RecordKey", "Date_Parsed", "_QualityStatus", "_WelcomeStatus"]]
 
-    portal_statuses = pd.DataFrame(columns=["_RecordKey", "_OnboardingStatus", "_ConfirmationStatus"])
+    portal_statuses = pd.DataFrame(
+        columns=["_RecordKey", "_OnboardingStatus", "_ConfirmationStatus"]
+    )
     if portal_frame is not None and not portal_frame.empty and "Source" in portal_frame.columns:
         crm_portal = portal_frame[
             portal_frame["Source"].fillna("").astype(str).str.strip().eq("CRM Mirror")
@@ -2323,10 +2309,9 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
             crm_portal = add_record_keys(crm_portal, "Sale Date", "Telephone No.")
         crm_portal["_RecordKey"] = crm_portal["_RecordKey"].fillna("").astype(str).str.strip()
         crm_portal = crm_portal[crm_portal["_RecordKey"].ne("")].copy()
-        if "Status" not in crm_portal.columns:
-            crm_portal["Status"] = ""
-        if "CallStatus" not in crm_portal.columns:
-            crm_portal["CallStatus"] = ""
+        for col in ("Status", "CallStatus"):
+            if col not in crm_portal.columns:
+                crm_portal[col] = ""
         portal_statuses = crm_portal[["_RecordKey", "Status", "CallStatus"]].rename(columns={
             "Status": "_OnboardingStatus",
             "CallStatus": "_ConfirmationStatus",
@@ -2340,13 +2325,39 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
     )
     monthly_data["_Month"] = monthly_data["Date_Parsed"].dt.to_period("M")
 
+    # Normalise category keys so case, repeated spaces, and harmless hyphen
+    # variants do not create duplicate columns. Truly blank values stay empty.
+    status_labels = {}
+    for group_name, source_col in status_specs:
+        if source_col not in monthly_data.columns:
+            monthly_data[source_col] = ""
+        key_col = f"_StatusKey_{group_name}"
+        monthly_data[key_col] = monthly_data[source_col].apply(normalize_workflow_status)
+        labels_for_group = {}
+        for raw_value, normalized_key in zip(
+            monthly_data[source_col].tolist(), monthly_data[key_col].tolist()
+        ):
+            if not normalized_key:
+                continue
+            label = re.sub(r"\s+", " ", clean_reason_text(raw_value)).strip()
+            if label:
+                labels_for_group.setdefault(normalized_key, label)
+        # Stable display order, alphabetically by the first observed label.
+        status_labels[group_name] = dict(sorted(
+            labels_for_group.items(), key=lambda item: item[1].casefold()
+        ))
+
     attendance = attendance_frame.copy() if attendance_frame is not None else pd.DataFrame()
     if not attendance.empty:
         if "Date_Parsed" not in attendance.columns:
-            attendance["Date_Parsed"] = parse_date_series(attendance.get("Date", pd.Series(index=attendance.index, dtype=object)))
+            attendance["Date_Parsed"] = parse_date_series(
+                attendance.get("Date", pd.Series(index=attendance.index, dtype=object))
+            )
         attendance["Date_Parsed"] = pd.to_datetime(attendance["Date_Parsed"], errors="coerce")
         if "Attendance_Code" not in attendance.columns:
-            attendance["Attendance_Code"] = attendance.get("Attendance", pd.Series("-", index=attendance.index)).apply(normalize_attendance_status)
+            attendance["Attendance_Code"] = attendance.get(
+                "Attendance", pd.Series("-", index=attendance.index)
+            ).apply(normalize_attendance_status)
         attendance = attendance[attendance["Date_Parsed"].notna()].copy()
         attendance["_AttendanceDate"] = attendance["Date_Parsed"].dt.date
         attendance = attendance.drop_duplicates(subset=["_AttendanceDate"], keep="last")
@@ -2369,35 +2380,46 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
         working_date_set = set(working_dates)
         present_units = 0.0
         if not attendance.empty and working_date_set:
-            month_attendance = attendance[attendance["_AttendanceDate"].isin(working_date_set)]
+            month_attendance = attendance[
+                attendance["_AttendanceDate"].isin(working_date_set)
+            ]
             present_units = sum(
                 attendance_units.get(str(code).strip().upper(), 0.0)
                 for code in month_attendance["Attendance_Code"].tolist()
             )
 
         application_count = int(len(month_apps))
-        status_count_fields = {
-            "Quality Status": "_QualityStatus",
-            "Welcome": "_WelcomeStatus",
-            "Committed": "_ConfirmationStatus",
-            "Onboarding": "_OnboardingStatus",
-        }
         row = {
             "Month": month_period.to_timestamp().strftime("%b-%Y"),
             "Present": f"{present_units:g}/{len(working_dates)}",
             "SPD": f"{application_count / present_units:.2f}" if present_units > 0 else "—",
             "Applications": application_count,
         }
-        for label, source_col in status_count_fields.items():
-            if source_col not in month_apps.columns:
-                row[label] = "—"
-            else:
-                row[label] = _monthly_status_count_text(month_apps[source_col])
+        for group_name, _source_col in status_specs:
+            key_col = f"_StatusKey_{group_name}"
+            month_counts = month_apps[key_col].value_counts(dropna=False).to_dict()
+            for normalized_key, display_label in status_labels[group_name].items():
+                column_label = f"{group_name} · {display_label}"
+                row[column_label] = int(month_counts.get(normalized_key, 0))
         rows.append(row)
 
     if not rows:
         return empty_result
-    return pd.DataFrame(rows, columns=empty_result.columns)
+
+    # Make the table schema stable across every monthly row and preserve the
+    # requested grouped order. No blank-status columns are ever created.
+    dynamic_columns = []
+    for group_name, _source_col in status_specs:
+        dynamic_columns.extend(
+            f"{group_name} · {label}"
+            for label in status_labels[group_name].values()
+        )
+    result_columns = base_columns + dynamic_columns
+    result = pd.DataFrame(rows).reindex(columns=result_columns, fill_value=0)
+    for col in dynamic_columns:
+        result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0).astype(int)
+    result["Applications"] = pd.to_numeric(result["Applications"], errors="coerce").fillna(0).astype(int)
+    return result
 
 
 def pick_existing(frame, candidates):
@@ -3207,108 +3229,6 @@ try:
         st.html(f'<div class="insight-wrap">{flags_html}</div>')
 
     # ------------------------------------------------------------------------
-    # DATA BREAKDOWN
-    # ------------------------------------------------------------------------
-    st.html('<div style="height:6px"></div>')
-    render_section("Data breakdown", "▦", "Daily or monthly view of your application funnel")
-
-    ag1_filtered["Date"] = ag1_filtered["Date_Parsed"].dt.date
-    ag2_filtered["Date"] = ag2_filtered["Date_Parsed"].dt.date
-
-    view_mode = st.radio(
-        "View tables by:",
-        ["Daily", "Monthly"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="breakdown_view_mode",
-    )
-
-    if view_mode == "Daily":
-        ag1_filtered["Period"] = ag1_filtered["Date_Parsed"].dt.date
-        ag2_filtered["Period"] = ag2_filtered["Date_Parsed"].dt.date
-        chart_group_col = "Date"
-    else:
-        ag1_filtered["Period"] = ag1_filtered["Date_Parsed"].dt.strftime("%Y-%m")
-        ag2_filtered["Period"] = ag2_filtered["Date_Parsed"].dt.strftime("%Y-%m")
-        chart_group_col = "Period"
-
-    ca, cb, cc, cd = st.columns(4, gap="small")
-
-    with ca:
-        render_section("Applications", "01")
-        if not ag1_filtered.empty:
-            period_apps = ag1_filtered.groupby("Period").size().to_frame("Total Apps")
-            vmax_apps = max(period_apps.max().max(), 1.1)
-            styled_apps = (
-                period_apps.style
-                .format(lambda x: "-" if x == 0 else x)
-                .background_gradient(cmap="Greens", vmin=1, vmax=vmax_apps)
-                .map(lambda x: "background-color: transparent" if x == 0 else "")
-            )
-            st.dataframe(styled_apps, use_container_width=True, height=370)
-
-    with cb:
-        render_section("Quality audit", "02")
-        if not ag1_filtered.empty:
-            period_qual = ag1_filtered.groupby(["Period", "Q_Status"]).size().unstack(fill_value=0)
-            qual_order = ["Approved", "Rework", "Cancelled", "Rejected", "QA-Pending", "Others"]
-            period_qual = period_qual.reindex(columns=qual_order, fill_value=0)
-            period_qual = period_qual.loc[:, (period_qual != 0).any(axis=0)]
-            if not period_qual.empty:
-                vmax_qual = max(period_qual.max().max(), 1.1)
-                styled_qual = (
-                    period_qual.style
-                    .format(lambda x: "-" if x == 0 else x)
-                    .background_gradient(cmap="Greens", subset=pd.IndexSlice[:, period_qual.columns.intersection(["Approved"])], vmin=1, vmax=vmax_qual)
-                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_qual.columns.intersection(["Rework"])], vmin=1, vmax=vmax_qual)
-                    .background_gradient(cmap="Reds", subset=pd.IndexSlice[:, period_qual.columns.intersection(["Cancelled", "Rejected"])], vmin=1, vmax=vmax_qual)
-                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_qual.columns.intersection(["QA-Pending"])], vmin=1, vmax=vmax_qual)
-                    .map(lambda x: "background-color: transparent" if x == 0 else "")
-                )
-                st.dataframe(styled_qual, use_container_width=True, height=370)
-
-    with cc:
-        render_section("Welcome call", "03")
-        if wc_col and not ag1_filtered.empty:
-            period_wc = ag1_filtered.groupby(["Period", "WC_Clean"]).size().unstack(fill_value=0)
-            wc_order = ["Done", "Pending", "Paperwork", "Cancelled", "Others"]
-            period_wc = period_wc.reindex(columns=wc_order, fill_value=0)
-            period_wc = period_wc.loc[:, (period_wc != 0).any(axis=0)]
-            if not period_wc.empty:
-                vmax_wc = max(period_wc.max().max(), 1.1)
-                styled_wc = (
-                    period_wc.style
-                    .format(lambda x: "-" if x == 0 else x)
-                    .background_gradient(cmap="Greens", subset=pd.IndexSlice[:, period_wc.columns.intersection(["Done"])], vmin=1, vmax=vmax_wc)
-                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_wc.columns.intersection(["Pending", "Paperwork"])], vmin=1, vmax=vmax_wc)
-                    .background_gradient(cmap="Reds", subset=pd.IndexSlice[:, period_wc.columns.intersection(["Cancelled"])], vmin=1, vmax=vmax_wc)
-                    .map(lambda x: "background-color: transparent" if x == 0 else "")
-                )
-                st.dataframe(styled_wc, use_container_width=True, height=370)
-        else:
-            st.info("No Welcome Call data.")
-
-    with cd:
-        render_section("Live status", "04")
-        if not ag2_filtered.empty:
-            period_port = ag2_filtered.groupby(["Period", "P_Status"]).size().unstack(fill_value=0)
-            port_order = DOWNSTREAM_CATEGORY_ORDER
-            period_port = period_port.reindex(columns=port_order, fill_value=0)
-            period_port = period_port.loc[:, (period_port != 0).any(axis=0)]
-            if not period_port.empty:
-                vmax_port = max(period_port.max().max(), 1.1)
-                styled_port = (
-                    period_port.style
-                    .format(lambda x: "-" if x == 0 else x)
-                    .background_gradient(cmap="Greens", subset=pd.IndexSlice[:, period_port.columns.intersection(["Live"])], vmin=1, vmax=vmax_port)
-                    .background_gradient(cmap="Wistia", subset=pd.IndexSlice[:, period_port.columns.intersection(["Committed Rem."])], vmin=1, vmax=vmax_port)
-                    .background_gradient(cmap="Reds", subset=pd.IndexSlice[:, period_port.columns.intersection(["Committed Cancelled", "Live Cancelled"])], vmin=1, vmax=vmax_port)
-                    .background_gradient(cmap="Greys", subset=pd.IndexSlice[:, period_port.columns.intersection(["Unclassified / Review"])], vmin=1, vmax=vmax_port)
-                    .map(lambda x: "background-color: transparent" if x == 0 else "")
-                )
-                st.dataframe(styled_port, use_container_width=True, height=370)
-
-    # ------------------------------------------------------------------------
     # MONTHLY CRM-ONLY SUMMARY
     # ------------------------------------------------------------------------
     st.html('<div style="height:6px"></div>')
@@ -3327,21 +3247,96 @@ try:
     if monthly_crm_summary.empty:
         st.info("No CRM mirror applications are available for your account yet.")
     else:
-        monthly_status_columns = ["Quality Status", "Welcome", "Committed", "Onboarding"]
-        monthly_style = monthly_crm_summary.style.set_properties(
-            subset=monthly_status_columns,
-            **{
-                "white-space": "pre-wrap",
-                "text-align": "left",
-                "vertical-align": "top",
-                "min-width": "170px",
-            },
+        # Separate every nonblank raw status into its own count column. Prefixes
+        # identify the workflow group and use coordinated colours for scanning.
+        quality_cols = [c for c in monthly_crm_summary.columns if c.startswith("Quality · ")]
+        welcome_cols = [c for c in monthly_crm_summary.columns if c.startswith("Welcome · ")]
+        committed_cols = [c for c in monthly_crm_summary.columns if c.startswith("Committed · ")]
+        onboarding_cols = [c for c in monthly_crm_summary.columns if c.startswith("Onboarding · ")]
+        status_cols = quality_cols + welcome_cols + committed_cols + onboarding_cols
+
+        monthly_style = (
+            monthly_crm_summary.style
+            .format({"Applications": "{:,.0f}"}, na_rep="—")
+            .format({col: (lambda value: "—" if pd.isna(value) or value == 0 else f"{int(value):,}") for col in status_cols}, na_rep="—")
+            .set_properties(
+                **{
+                    "border-bottom": "1px solid #E5EAF2",
+                    "padding": "9px 10px",
+                    "font-size": "0.78rem",
+                    "color": "#1E293B",
+                    "white-space": "nowrap",
+                }
+            )
+            .set_properties(
+                subset=["Month"],
+                **{"font-weight": "800", "color": "#102451", "background-color": "#F1F5FF"},
+            )
+            .set_properties(
+                subset=["Present", "SPD", "Applications"],
+                **{"text-align": "center", "font-weight": "800"},
+            )
+            .set_properties(subset=status_cols, **{"text-align": "center", "font-weight": "750"})
+            .set_table_styles([
+                {"selector": "table", "props": [
+                    ("border-collapse", "separate"), ("border-spacing", "0"),
+                    ("border", "1px solid #D9E2F0"), ("border-radius", "10px"),
+                    ("overflow", "hidden"), ("font-family", "Arial, sans-serif"),
+                ]},
+                {"selector": "th", "props": [
+                    ("background-color", "#102451"), ("color", "#FFFFFF"),
+                    ("font-size", "0.70rem"), ("font-weight", "850"),
+                    ("letter-spacing", "0.2px"), ("padding", "10px 11px"),
+                    ("text-align", "center"), ("white-space", "normal"),
+                    ("border-right", "1px solid #31446A"),
+                ]},
+                {"selector": "tbody tr:nth-child(even) td", "props": [("background-color", "#F8FAFC")]},
+                {"selector": "tbody tr:hover td", "props": [("background-color", "#EFF6FF")]},
+                {"selector": "th.row_heading", "props": [("display", "none")]},
+            ])
         )
+
+        # Header accent colours clearly distinguish the four workflow groups.
+        header_colours = {
+            "Quality": ("#1D4ED8", "#EAF1FF"),
+            "Welcome": ("#0F766E", "#E6FFFB"),
+            "Committed": ("#6D28D9", "#F3E8FF"),
+            "Onboarding": ("#92400E", "#FFF7ED"),
+        }
+        table_styles = []
+        for idx, col in enumerate(monthly_crm_summary.columns):
+            group = next((name for name in header_colours if col.startswith(name + " · ")), None)
+            if group:
+                header_bg, _cell_bg = header_colours[group]
+                table_styles.append({
+                    "selector": f"th.col_heading.col{idx}",
+                    "props": [("background-color", header_bg), ("color", "#FFFFFF")],
+                })
+        if table_styles:
+            monthly_style = monthly_style.set_table_styles(table_styles, overwrite=False)
+
+        # Light, group-specific gradients make the status counts scannable while
+        # zero counts remain visually quiet and are shown as dashes.
+        for cols, colour_map in [
+            (quality_cols, "Blues"),
+            (welcome_cols, "BuGn"),
+            (committed_cols, "Purples"),
+            (onboarding_cols, "YlOrBr"),
+        ]:
+            if cols:
+                monthly_style = monthly_style.background_gradient(
+                    cmap=colour_map,
+                    subset=cols,
+                    vmin=0,
+                    vmax=max(1, int(monthly_crm_summary[cols].to_numpy().max())),
+                    axis=None,
+                )
+
         st.dataframe(
             monthly_style,
             use_container_width=True,
             hide_index=True,
-            height=min(560, max(150, 74 * len(monthly_crm_summary) + 44)),
+            height=min(620, max(170, 48 + 42 * len(monthly_crm_summary))),
         )
 
     # ------------------------------------------------------------------------
