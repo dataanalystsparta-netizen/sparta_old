@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
@@ -3285,8 +3284,8 @@ try:
         st.info("No CRM mirror applications are available for your account yet.")
     else:
         # Compact two-level headers: workflow groups on the first row and
-        # individual status names on the second row. Each month row expands
-        # inline to reveal every date in that month.
+        # individual status names on the second row. Native Streamlit controls
+        # above the table toggle each month's daily rows without iframe overlap.
         workflow_groups = ["Quality", "Welcome", "Committed", "Onboarding"]
 
         def compact_status_header(group_name, label):
@@ -3424,22 +3423,51 @@ try:
                 f'{header_colours.get(group_name, "#CBD5E1")}">{escape(shown_label)}</th>'
             )
 
+        def monthly_summary_key(month_label):
+            # Derive the key from the month label without relying on locale-sensitive parsing.
+            parsed_month = pd.to_datetime(str(month_label), format="%b-%Y", errors="coerce")
+            if pd.isna(parsed_month):
+                return re.sub(r"[^A-Za-z0-9_-]", "", str(month_label))
+            return parsed_month.strftime("%Y-%m")
+
+        # Expansion is controlled by native Streamlit buttons, not JavaScript
+        # inside an iframe. This makes Streamlit recalculate the component's
+        # real height on every toggle, so every section below the table moves
+        # down instead of being covered by expanded daily rows.
+        expanded_state_key = "crm_monthly_expanded_months"
+        if expanded_state_key not in st.session_state:
+            st.session_state[expanded_state_key] = []
+        expanded_months = set(st.session_state.get(expanded_state_key, []))
+        month_labels = monthly_crm_summary["Month"].astype(str).tolist()
+        st.caption("Expand or collapse daily rows by month:")
+        for control_start in range(0, len(month_labels), 4):
+            control_labels = month_labels[control_start:control_start + 4]
+            control_columns = st.columns(len(control_labels))
+            for offset, month_label in enumerate(control_labels):
+                month_key = monthly_summary_key(month_label)
+                with control_columns[offset]:
+                    marker = "−" if month_key in expanded_months else "+"
+                    if st.button(
+                        f"{marker} {month_label}",
+                        key=f"crm_month_toggle_{month_key}",
+                        use_container_width=True,
+                    ):
+                        updated_months = set(st.session_state.get(expanded_state_key, []))
+                        if month_key in updated_months:
+                            updated_months.remove(month_key)
+                        else:
+                            updated_months.add(month_key)
+                        st.session_state[expanded_state_key] = sorted(updated_months)
+                        st.rerun()
+
         table_rows_html = []
         for _, month_row in monthly_crm_summary.iterrows():
             month_label = str(month_row["Month"])
-            month_key = pd.Period(month_label, freq="M").strftime("%Y-%m") if False else ""
-            # Derive the key from the month label without relying on locale-sensitive parsing.
-            parsed_month = pd.to_datetime(month_label, format="%b-%Y", errors="coerce")
-            if pd.isna(parsed_month):
-                month_key = re.sub(r"[^A-Za-z0-9_-]", "", month_label)
-            else:
-                month_key = parsed_month.strftime("%Y-%m")
+            month_key = monthly_summary_key(month_label)
+            month_expanded = month_key in expanded_months
             table_rows_html.append(f'<tr class="month-row" data-month-row="{escape(month_key)}">')
             table_rows_html.append(
-                f'<td class="month-cell"><button type="button" class="month-toggle" '
-                f'data-toggle-month="{escape(month_key)}" aria-expanded="false" '
-                f'aria-label="Expand {escape(month_label)}">+</button>'
-                f'<strong>{escape(month_label)}</strong></td>'
+                f'<td class="month-cell"><strong>{escape(month_label)}</strong></td>'
             )
             table_rows_html.append(basic_cell_html(month_row["Total Attendance"], "numeric-cell attendance-total-cell"))
             table_rows_html.append(basic_cell_html(month_row["SPD"], "numeric-cell spd-cell"))
@@ -3451,19 +3479,18 @@ try:
             month_daily = daily_crm_summary[
                 daily_crm_summary["_MonthKey"].astype(str).eq(month_key)
             ] if not daily_crm_summary.empty else pd.DataFrame()
-            for _, day_row in month_daily.iterrows():
-                table_rows_html.append(
-                    f'<tr class="daily-row" data-month="{escape(month_key)}" hidden>'
-                )
-                table_rows_html.append(
-                    f'<td class="date-cell"><span class="daily-indent">↳</span>{escape(str(day_row["Date"]))}</td>'
-                )
-                table_rows_html.append(basic_cell_html(day_row["Attendance"], "numeric-cell attendance-code-cell"))
-                table_rows_html.append(basic_cell_html(day_row["SPD"], "numeric-cell spd-cell"))
-                table_rows_html.append(basic_cell_html(f'{int(day_row["Applications"]):,}', "numeric-cell applications-cell"))
-                for col in status_columns:
-                    table_rows_html.append(status_cell_html(col, day_row.get(col, 0), "day"))
-                table_rows_html.append("</tr>")
+            if month_expanded:
+                for _, day_row in month_daily.iterrows():
+                    table_rows_html.append('<tr class="daily-row">')
+                    table_rows_html.append(
+                        f'<td class="date-cell"><span class="daily-indent">↳</span>{escape(str(day_row["Date"]))}</td>'
+                    )
+                    table_rows_html.append(basic_cell_html(day_row["Attendance"], "numeric-cell attendance-code-cell"))
+                    table_rows_html.append(basic_cell_html(day_row["SPD"], "numeric-cell spd-cell"))
+                    table_rows_html.append(basic_cell_html(f'{int(day_row["Applications"]):,}', "numeric-cell applications-cell"))
+                    for col in status_columns:
+                        table_rows_html.append(status_cell_html(col, day_row.get(col, 0), "day"))
+                    table_rows_html.append("</tr>")
 
         table_html = f"""
         <div class="crm-monthly-wrap">
@@ -3476,83 +3503,33 @@ try:
           </table>
         </div>
         <style>
-          * {{ box-sizing: border-box; }}
-          body {{ margin: 0; padding: 2px; font-family: Arial, sans-serif; color: #1E293B; }}
-          .crm-monthly-wrap {{ width: 100%; overflow: auto; border: 1px solid #D9E2F0; border-radius: 10px; }}
-          .crm-monthly-table {{ border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; font-size: 12px; }}
-          .crm-monthly-table th, .crm-monthly-table td {{ padding: 6px 8px; border-right: 1px solid #E2E8F0; border-bottom: 1px solid #E2E8F0; white-space: nowrap; }}
-          .group-header {{ background: #102451; color: #FFFFFF; font-size: 11px; font-weight: 850; letter-spacing: .35px; text-align: center; padding: 8px 7px !important; }}
-          .summary-group {{ background: #102451; }}
-          .sub-header {{ background: #EAF0F8; color: #26364F; font-size: 10px; font-weight: 800; text-align: center; }}
-          .month-row td {{ background-color: #F1F5FF; font-weight: 750; }}
-          .month-row .month-cell {{ color: #102451; text-align: left; }}
-          .daily-row td {{ font-size: 11px; }}
-          .daily-row .date-cell {{ background: #F8FAFC; color: #475569; text-align: left; padding-left: 22px; }}
-          .daily-indent {{ color: #94A3B8; margin-right: 6px; }}
-          .numeric-cell {{ text-align: center; font-variant-numeric: tabular-nums; }}
-          .attendance-total-cell {{ color: #102451; font-weight: 850; }}
-          .attendance-code-cell {{ color: #475569; font-weight: 800; }}
-          .spd-cell {{ color: #0F766E; font-weight: 750; }}
-          .applications-cell {{ color: #102451; font-weight: 850; }}
-          .month-toggle {{ width: 21px; height: 21px; line-height: 17px; padding: 0; margin-right: 7px; border: 1px solid #CBD5E1; border-radius: 6px; background: #FFFFFF; color: #1D4ED8; font-size: 15px; font-weight: 800; cursor: pointer; vertical-align: middle; }}
-          .month-toggle:hover {{ background: #DBEAFE; border-color: #60A5FA; }}
-          tbody tr:hover td {{ box-shadow: inset 0 0 0 9999px rgba(219,234,254,.18); }}
-          .daily-row[hidden] {{ display: none !important; }}
+          .crm-monthly-wrap, .crm-monthly-wrap * {{ box-sizing: border-box; }}
+          .crm-monthly-wrap {{ width: 100%; overflow: auto; border: 1px solid #D9E2F0; border-radius: 10px; font-family: Arial, sans-serif; color: #1E293B; }}
+          .crm-monthly-wrap .crm-monthly-table {{ border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; font-size: 12px; }}
+          .crm-monthly-wrap .crm-monthly-table th, .crm-monthly-wrap .crm-monthly-table td {{ padding: 6px 8px; border-right: 1px solid #E2E8F0; border-bottom: 1px solid #E2E8F0; white-space: nowrap; }}
+          .crm-monthly-wrap .group-header {{ background: #102451; color: #FFFFFF; font-size: 11px; font-weight: 850; letter-spacing: .35px; text-align: center; padding: 8px 7px !important; }}
+          .crm-monthly-wrap .summary-group {{ background: #102451; }}
+          .crm-monthly-wrap .sub-header {{ background: #EAF0F8; color: #26364F; font-size: 10px; font-weight: 800; text-align: center; }}
+          .crm-monthly-wrap .month-row td {{ background-color: #F1F5FF; font-weight: 750; }}
+          .crm-monthly-wrap .month-row .month-cell {{ color: #102451; text-align: left; }}
+          .crm-monthly-wrap .daily-row td {{ font-size: 11px; }}
+          .crm-monthly-wrap .daily-row .date-cell {{ background: #F8FAFC; color: #475569; text-align: left; padding-left: 22px; }}
+          .crm-monthly-wrap .daily-indent {{ color: #94A3B8; margin-right: 6px; }}
+          .crm-monthly-wrap .numeric-cell {{ text-align: center; font-variant-numeric: tabular-nums; }}
+          .crm-monthly-wrap .attendance-total-cell {{ color: #102451; font-weight: 850; }}
+          .crm-monthly-wrap .attendance-code-cell {{ color: #475569; font-weight: 800; }}
+          .crm-monthly-wrap .spd-cell {{ color: #0F766E; font-weight: 750; }}
+          .crm-monthly-wrap .applications-cell {{ color: #102451; font-weight: 850; }}
+          .crm-monthly-wrap tbody tr:hover td {{ box-shadow: inset 0 0 0 9999px rgba(219,234,254,.18); }}
         </style>
-        <script>
-          // Resize the Streamlit iframe to the visible table only. This keeps
-          // collapsed months compact and grows the table when daily rows open.
-          function resizeStreamlitFrame() {{
-            const body = document.body;
-            const root = document.documentElement;
-            const contentHeight = Math.max(
-              body ? body.scrollHeight : 0,
-              root ? root.scrollHeight : 0
-            ) + 4;
-            // Resize the containing iframe directly when the browser allows
-            // same-origin access to the srcdoc frame. The postMessage below is
-            // retained as a compatibility path for Streamlit component hosts.
-            try {{
-              if (window.frameElement) {{
-                window.frameElement.style.height = contentHeight + "px";
-                window.frameElement.setAttribute("height", String(contentHeight));
-              }}
-            }} catch (resizeError) {{
-              // Fall back to the Streamlit frame-height message below.
-            }}
-            window.parent.postMessage({{
-              isStreamlitMessage: true,
-              type: "streamlit:setFrameHeight",
-              height: contentHeight
-            }}, "*");
-          }}
-
-          document.querySelectorAll(".month-toggle").forEach(function(button) {{
-            button.addEventListener("click", function() {{
-              const month = button.getAttribute("data-toggle-month");
-              const isExpanded = button.getAttribute("aria-expanded") === "true";
-              document.querySelectorAll('tr[data-month="' + month + '"]').forEach(function(row) {{
-                row.hidden = isExpanded;
-              }});
-              button.setAttribute("aria-expanded", isExpanded ? "false" : "true");
-              button.textContent = isExpanded ? "+" : "−";
-              button.setAttribute("aria-label", (isExpanded ? "Expand " : "Collapse ") + month);
-              requestAnimationFrame(resizeStreamlitFrame);
-              setTimeout(resizeStreamlitFrame, 50);
-            }});
-          }});
-
-          requestAnimationFrame(resizeStreamlitFrame);
-          setTimeout(resizeStreamlitFrame, 50);
-        </script>
         """
-        # The initial iframe height is calculated from the two header rows and
-        # the collapsed month rows; JavaScript resizes it as rows are toggled.
-        collapsed_height = min(
-            640,
-            max(118, 66 + (len(monthly_crm_summary) * 34) + 12),
-        )
-        components.html(table_html, height=collapsed_height, scrolling=False)
+        # IMPORTANT: Render this table with st.html, not components.html.
+        # components.html places content inside a fixed-height iframe; when the
+        # table's rendered height exceeds that iframe, its rows can visually
+        # overlap later Streamlit sections. st.html places the HTML in the page
+        # flow, so the rendered table contributes its real height and pushes the
+        # Recent Applications Log and all following content down naturally.
+        st.html(table_html)
 
     # ------------------------------------------------------------------------
     # RECENT APPLICATIONS LOG
