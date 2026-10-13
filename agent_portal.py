@@ -3235,13 +3235,13 @@ try:
     render_section(
         "Monthly CRM performance",
         "▦",
-        "CRM mirror only · status counts show raw workflow values",
+        "CRM mirror only! · Status counts show raw workflow values as present in the CRM",
     )
     st.caption(
-        "This table is agent-specific and independent of the main date filter. "
-        "September starts at the CRM cutover (18 Sep 2026); the current month is month-to-date. "
+        "This table is independent of the main date filter. "
+        "September starts at the CRM cutover (18 Sep 2026), when the CRM was first used; the current month is month-to-date. "
         "Present = attendance units (P=1, HD=0.5, Ab/UL=0) / scheduled working days; "
-        "SPD = CRM applications ÷ attendance units. Sundays and 1st/3rd/5th Saturdays are excluded."
+        "SPD (Sales per day) = CRM applications ÷ attendance units. It computes the average number of applications you get in a day. Sundays and 1st/3rd Saturdays are excluded."
     )
     monthly_crm_summary = build_crm_monthly_summary(ag1, ag2, ag_attendance, as_of=today_date)
     if monthly_crm_summary.empty:
