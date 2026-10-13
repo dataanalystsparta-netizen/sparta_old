@@ -3247,33 +3247,62 @@ try:
     if monthly_crm_summary.empty:
         st.info("No CRM mirror applications are available for your account yet.")
     else:
-        # Separate every nonblank raw status into its own count column. Prefixes
-        # identify the workflow group and use coordinated colours for scanning.
-        quality_cols = [c for c in monthly_crm_summary.columns if c.startswith("Quality · ")]
-        welcome_cols = [c for c in monthly_crm_summary.columns if c.startswith("Welcome · ")]
-        committed_cols = [c for c in monthly_crm_summary.columns if c.startswith("Committed · ")]
-        onboarding_cols = [c for c in monthly_crm_summary.columns if c.startswith("Onboarding · ")]
+        # Render a compact two-row header. The first header row groups each
+        # workflow's status columns; the second row contains the shorter status
+        # names (e.g. Quality > Approved/Rework/Reject).
+        workflow_groups = ["Quality", "Welcome", "Committed", "Onboarding"]
+
+        def compact_status_header(group_name, label):
+            text = str(label).strip()
+            prefixes = {
+                "Quality": r"^QA[-\s]+",
+                "Welcome": r"^(?:Welcome|WC)[-\s]+",
+                "Committed": r"^(?:Confirmation|Committed)[-\s]+",
+                "Onboarding": r"^Onboarding[-\s]+",
+            }
+            pattern = prefixes.get(group_name)
+            if pattern:
+                text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+            return text or str(label).strip()
+
+        display_pairs = []
+        for col in monthly_crm_summary.columns:
+            if col in {"Month", "Present", "SPD", "Applications"}:
+                display_pairs.append(("Monthly Summary", col))
+                continue
+            group_name, raw_label = col.split(" · ", 1)
+            display_pairs.append((group_name, compact_status_header(group_name, raw_label)))
+
+        monthly_display = monthly_crm_summary.copy()
+        monthly_display.columns = pd.MultiIndex.from_tuples(display_pairs, names=[None, None])
+
+        summary_columns = [("Monthly Summary", name) for name in ("Month", "Present", "SPD", "Applications")]
+        quality_cols = [pair for pair in display_pairs if pair[0] == "Quality"]
+        welcome_cols = [pair for pair in display_pairs if pair[0] == "Welcome"]
+        committed_cols = [pair for pair in display_pairs if pair[0] == "Committed"]
+        onboarding_cols = [pair for pair in display_pairs if pair[0] == "Onboarding"]
         status_cols = quality_cols + welcome_cols + committed_cols + onboarding_cols
 
         monthly_style = (
-            monthly_crm_summary.style
-            .format({"Applications": "{:,.0f}"}, na_rep="—")
+            monthly_display.style
+            .format({summary_columns[3]: "{:,.0f}"}, na_rep="—")
             .format({col: (lambda value: "—" if pd.isna(value) or value == 0 else f"{int(value):,}") for col in status_cols}, na_rep="—")
             .set_properties(
                 **{
                     "border-bottom": "1px solid #E5EAF2",
-                    "padding": "9px 10px",
-                    "font-size": "0.78rem",
+                    "padding": "5px 7px",
+                    "font-size": "0.72rem",
                     "color": "#1E293B",
                     "white-space": "nowrap",
+                    "text-align": "center",
                 }
             )
             .set_properties(
-                subset=["Month"],
-                **{"font-weight": "800", "color": "#102451", "background-color": "#F1F5FF"},
+                subset=[summary_columns[0]],
+                **{"font-weight": "800", "color": "#102451", "background-color": "#F1F5FF", "text-align": "left"},
             )
             .set_properties(
-                subset=["Present", "SPD", "Applications"],
+                subset=summary_columns[1:],
                 **{"text-align": "center", "font-weight": "800"},
             )
             .set_properties(subset=status_cols, **{"text-align": "center", "font-weight": "750"})
@@ -3283,12 +3312,20 @@ try:
                     ("border", "1px solid #D9E2F0"), ("border-radius", "10px"),
                     ("overflow", "hidden"), ("font-family", "Arial, sans-serif"),
                 ]},
-                {"selector": "th", "props": [
+                {"selector": "th.col_heading.level0", "props": [
                     ("background-color", "#102451"), ("color", "#FFFFFF"),
-                    ("font-size", "0.70rem"), ("font-weight", "850"),
-                    ("letter-spacing", "0.2px"), ("padding", "10px 11px"),
+                    ("font-size", "0.66rem"), ("font-weight", "850"),
+                    ("letter-spacing", "0.35px"), ("padding", "7px 7px"),
                     ("text-align", "center"), ("white-space", "normal"),
                     ("border-right", "1px solid #31446A"),
+                    ("border-bottom", "1px solid #31446A"),
+                ]},
+                {"selector": "th.col_heading.level1", "props": [
+                    ("background-color", "#EAF0F8"), ("color", "#26364F"),
+                    ("font-size", "0.60rem"), ("font-weight", "800"),
+                    ("letter-spacing", "0.05px"), ("padding", "5px 6px"),
+                    ("text-align", "center"), ("white-space", "normal"),
+                    ("border-right", "1px solid #D9E2F0"),
                 ]},
                 {"selector": "tbody tr:nth-child(even) td", "props": [("background-color", "#F8FAFC")]},
                 {"selector": "tbody tr:hover td", "props": [("background-color", "#EFF6FF")]},
@@ -3296,27 +3333,33 @@ try:
             ])
         )
 
-        # Header accent colours clearly distinguish the four workflow groups.
+        # Header accents match the workflow groups. Because the columns are a
+        # MultiIndex, pandas renders the groups on row one and statuses on row two.
         header_colours = {
-            "Quality": ("#1D4ED8", "#EAF1FF"),
-            "Welcome": ("#0F766E", "#E6FFFB"),
-            "Committed": ("#6D28D9", "#F3E8FF"),
-            "Onboarding": ("#92400E", "#FFF7ED"),
+            "Monthly Summary": "#102451",
+            "Quality": "#1D4ED8",
+            "Welcome": "#0F766E",
+            "Committed": "#6D28D9",
+            "Onboarding": "#92400E",
         }
         table_styles = []
-        for idx, col in enumerate(monthly_crm_summary.columns):
-            group = next((name for name in header_colours if col.startswith(name + " · ")), None)
-            if group:
-                header_bg, _cell_bg = header_colours[group]
-                table_styles.append({
-                    "selector": f"th.col_heading.col{idx}",
-                    "props": [("background-color", header_bg), ("color", "#FFFFFF")],
-                })
+        seen_groups = set()
+        for idx, (group_name, _label) in enumerate(display_pairs):
+            if group_name in seen_groups:
+                continue
+            seen_groups.add(group_name)
+            table_styles.append({
+                "selector": f"th.col_heading.level0.col{idx}",
+                "props": [
+                    ("background-color", header_colours.get(group_name, "#102451")),
+                    ("color", "#FFFFFF"),
+                ],
+            })
         if table_styles:
             monthly_style = monthly_style.set_table_styles(table_styles, overwrite=False)
 
-        # Light, group-specific gradients make the status counts scannable while
-        # zero counts remain visually quiet and are shown as dashes.
+        # Light group-specific gradients make counts scannable; zero values
+        # display as a dash. No blank-status column is created.
         for cols, colour_map in [
             (quality_cols, "Blues"),
             (welcome_cols, "BuGn"),
@@ -3328,7 +3371,7 @@ try:
                     cmap=colour_map,
                     subset=cols,
                     vmin=0,
-                    vmax=max(1, int(monthly_crm_summary[cols].to_numpy().max())),
+                    vmax=max(1, int(monthly_display[cols].to_numpy().max())),
                     axis=None,
                 )
 
@@ -3336,7 +3379,7 @@ try:
             monthly_style,
             use_container_width=True,
             hide_index=True,
-            height=min(620, max(170, 48 + 42 * len(monthly_crm_summary))),
+            height=min(620, max(190, 54 + 42 * len(monthly_display))),
         )
 
     # ------------------------------------------------------------------------
