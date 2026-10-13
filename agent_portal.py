@@ -2222,6 +2222,184 @@ def add_date_strings(frame, source_col, output_col):
     return frame
 
 
+def _monthly_table_is_holiday(day_value):
+    """Use the portal's existing calendar rule: Sundays and 1st/3rd/5th Saturdays are holidays."""
+    day = day_value.date() if isinstance(day_value, (pd.Timestamp, datetime.datetime)) else day_value
+    weekday = day.weekday()
+    if weekday == 6:
+        return True
+    if weekday == 5:
+        saturday_number = (day.day - 1) // 7 + 1
+        return saturday_number in {1, 3, 5}
+    return False
+
+
+def _monthly_status_count_text(values):
+    """Summarise every raw workflow-status value, grouping harmless formatting variants."""
+    counts = {}
+    labels = {}
+    for value in values:
+        text = clean_reason_text(value)
+        if not text or text.strip().lower() in {"nan", "none", "null", "nat", "-", "n/a"}:
+            key = "__blank__"
+            label = "(Blank)"
+        else:
+            text = re.sub(r"\s+", " ", text).strip()
+            key = normalize_workflow_status(text) or "__blank__"
+            label = "(Blank)" if key == "__blank__" else text
+        counts[key] = counts.get(key, 0) + 1
+        labels.setdefault(key, label)
+
+    if not counts:
+        return "—"
+    ordered = sorted(counts, key=lambda key: (-counts[key], labels[key].casefold()))
+    return "\n".join(f"{labels[key]}: {counts[key]:,}" for key in ordered)
+
+
+def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=None):
+    """Build a CRM-mirror-only monthly report for one already-filtered agent.
+
+    The application rows provide counts and raw Quality/Welcome statuses. The
+    matching downstream rows provide raw Confirmation and Onboarding statuses.
+    Valid Sale Date + phone record keys are required; duplicate keys retain the
+    last CRM row, consistent with the main CRM loader. The report is independent
+    of the global date filter so it can show the full available CRM month history.
+    """
+    as_of = as_of or datetime.date.today()
+    as_of_date = as_of.date() if isinstance(as_of, datetime.datetime) else as_of
+
+    empty_result = pd.DataFrame(columns=[
+        "Month", "Present", "SPD", "Applications", "Quality Status",
+        "Welcome", "Committed", "Onboarding",
+    ])
+    if apps_frame is None or apps_frame.empty or "Source" not in apps_frame.columns:
+        return empty_result
+
+    # This report deliberately uses only rows whose source is the CRM mirror.
+    crm_apps = apps_frame[
+        apps_frame["Source"].fillna("").astype(str).str.strip().eq("CRM Mirror")
+    ].copy()
+    if crm_apps.empty:
+        return empty_result
+
+    if "Date_Parsed" not in crm_apps.columns:
+        crm_apps["Date_Parsed"] = parse_date_series(crm_apps.get("Sale Date", pd.Series(index=crm_apps.index, dtype=object)))
+    crm_apps["Date_Parsed"] = pd.to_datetime(crm_apps["Date_Parsed"], errors="coerce")
+    crm_apps = crm_apps[
+        crm_apps["Date_Parsed"].notna()
+        & (crm_apps["Date_Parsed"].dt.date <= as_of_date)
+    ].copy()
+    if crm_apps.empty:
+        return empty_result
+
+    if "_RecordKey" not in crm_apps.columns:
+        crm_apps = add_record_keys(crm_apps, "Standardized_Date", "CLI")
+    crm_apps["_RecordKey"] = crm_apps["_RecordKey"].fillna("").astype(str).str.strip()
+    crm_apps = crm_apps[crm_apps["_RecordKey"].ne("")].copy()
+    # Matching CRM rows are unique by Sale Date + phone. This is a defensive
+    # safeguard and follows the loader's keep-last duplicate policy.
+    crm_apps = crm_apps.drop_duplicates(subset=["_RecordKey"], keep="last")
+    if crm_apps.empty:
+        return empty_result
+
+    # Rename application-side Welcome status before attaching the portal-side
+    # Onboarding and Confirmation fields so that the two meanings never collide.
+    if "Quality Status" not in crm_apps.columns:
+        crm_apps["Quality Status"] = ""
+    if "Status" not in crm_apps.columns:
+        crm_apps["Status"] = ""
+    crm_apps = crm_apps.rename(columns={
+        "Quality Status": "_QualityStatus",
+        "Status": "_WelcomeStatus",
+    })
+    crm_apps = crm_apps[["_RecordKey", "Date_Parsed", "_QualityStatus", "_WelcomeStatus"]]
+
+    portal_statuses = pd.DataFrame(columns=["_RecordKey", "_OnboardingStatus", "_ConfirmationStatus"])
+    if portal_frame is not None and not portal_frame.empty and "Source" in portal_frame.columns:
+        crm_portal = portal_frame[
+            portal_frame["Source"].fillna("").astype(str).str.strip().eq("CRM Mirror")
+        ].copy()
+        if "_RecordKey" not in crm_portal.columns:
+            crm_portal = add_record_keys(crm_portal, "Sale Date", "Telephone No.")
+        crm_portal["_RecordKey"] = crm_portal["_RecordKey"].fillna("").astype(str).str.strip()
+        crm_portal = crm_portal[crm_portal["_RecordKey"].ne("")].copy()
+        if "Status" not in crm_portal.columns:
+            crm_portal["Status"] = ""
+        if "CallStatus" not in crm_portal.columns:
+            crm_portal["CallStatus"] = ""
+        portal_statuses = crm_portal[["_RecordKey", "Status", "CallStatus"]].rename(columns={
+            "Status": "_OnboardingStatus",
+            "CallStatus": "_ConfirmationStatus",
+        }).drop_duplicates(subset=["_RecordKey"], keep="last")
+
+    monthly_data = crm_apps.merge(
+        portal_statuses,
+        on="_RecordKey",
+        how="left",
+        validate="one_to_one",
+    )
+    monthly_data["_Month"] = monthly_data["Date_Parsed"].dt.to_period("M")
+
+    attendance = attendance_frame.copy() if attendance_frame is not None else pd.DataFrame()
+    if not attendance.empty:
+        if "Date_Parsed" not in attendance.columns:
+            attendance["Date_Parsed"] = parse_date_series(attendance.get("Date", pd.Series(index=attendance.index, dtype=object)))
+        attendance["Date_Parsed"] = pd.to_datetime(attendance["Date_Parsed"], errors="coerce")
+        if "Attendance_Code" not in attendance.columns:
+            attendance["Attendance_Code"] = attendance.get("Attendance", pd.Series("-", index=attendance.index)).apply(normalize_attendance_status)
+        attendance = attendance[attendance["Date_Parsed"].notna()].copy()
+        attendance["_AttendanceDate"] = attendance["Date_Parsed"].dt.date
+        attendance = attendance.drop_duplicates(subset=["_AttendanceDate"], keep="last")
+
+    attendance_units = {"P": 1.0, "HD": 0.5}
+    rows = []
+    months = sorted(monthly_data["_Month"].dropna().unique())
+    for month_period in months:
+        month_apps = monthly_data[monthly_data["_Month"] == month_period].copy()
+        month_start = max(month_period.start_time.date(), CRM_SOURCE_START.date())
+        month_end = min(month_period.end_time.date(), as_of_date)
+        if month_start > month_end:
+            continue
+
+        working_dates = [
+            month_start + datetime.timedelta(days=offset)
+            for offset in range((month_end - month_start).days + 1)
+            if not _monthly_table_is_holiday(month_start + datetime.timedelta(days=offset))
+        ]
+        working_date_set = set(working_dates)
+        present_units = 0.0
+        if not attendance.empty and working_date_set:
+            month_attendance = attendance[attendance["_AttendanceDate"].isin(working_date_set)]
+            present_units = sum(
+                attendance_units.get(str(code).strip().upper(), 0.0)
+                for code in month_attendance["Attendance_Code"].tolist()
+            )
+
+        application_count = int(len(month_apps))
+        status_count_fields = {
+            "Quality Status": "_QualityStatus",
+            "Welcome": "_WelcomeStatus",
+            "Committed": "_ConfirmationStatus",
+            "Onboarding": "_OnboardingStatus",
+        }
+        row = {
+            "Month": month_period.to_timestamp().strftime("%b-%Y"),
+            "Present": f"{present_units:g}/{len(working_dates)}",
+            "SPD": f"{application_count / present_units:.2f}" if present_units > 0 else "—",
+            "Applications": application_count,
+        }
+        for label, source_col in status_count_fields.items():
+            if source_col not in month_apps.columns:
+                row[label] = "—"
+            else:
+                row[label] = _monthly_status_count_text(month_apps[source_col])
+        rows.append(row)
+
+    if not rows:
+        return empty_result
+    return pd.DataFrame(rows, columns=empty_result.columns)
+
+
 def pick_existing(frame, candidates):
     return [c for c in candidates if c in frame.columns]
 
@@ -3129,6 +3307,42 @@ try:
                     .map(lambda x: "background-color: transparent" if x == 0 else "")
                 )
                 st.dataframe(styled_port, use_container_width=True, height=370)
+
+    # ------------------------------------------------------------------------
+    # MONTHLY CRM-ONLY SUMMARY
+    # ------------------------------------------------------------------------
+    st.html('<div style="height:6px"></div>')
+    render_section(
+        "Monthly CRM performance",
+        "▦",
+        "CRM mirror only · status counts show raw workflow values",
+    )
+    st.caption(
+        "This table is agent-specific and independent of the main date filter. "
+        "September starts at the CRM cutover (18 Sep 2026); the current month is month-to-date. "
+        "Present = attendance units (P=1, HD=0.5, Ab/UL=0) / scheduled working days; "
+        "SPD = CRM applications ÷ attendance units. Sundays and 1st/3rd/5th Saturdays are excluded."
+    )
+    monthly_crm_summary = build_crm_monthly_summary(ag1, ag2, ag_attendance, as_of=today_date)
+    if monthly_crm_summary.empty:
+        st.info("No CRM mirror applications are available for your account yet.")
+    else:
+        monthly_status_columns = ["Quality Status", "Welcome", "Committed", "Onboarding"]
+        monthly_style = monthly_crm_summary.style.set_properties(
+            subset=monthly_status_columns,
+            **{
+                "white-space": "pre-wrap",
+                "text-align": "left",
+                "vertical-align": "top",
+                "min-width": "170px",
+            },
+        )
+        st.dataframe(
+            monthly_style,
+            use_container_width=True,
+            hide_index=True,
+            height=min(560, max(150, 74 * len(monthly_crm_summary) + 44)),
+        )
 
     # ------------------------------------------------------------------------
     # RECENT APPLICATIONS LOG
