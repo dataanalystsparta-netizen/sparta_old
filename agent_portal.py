@@ -3511,13 +3511,12 @@ try:
 
         table_html = f"""
         <style>
-          html, body {{ margin:0; padding:0; background:transparent; overflow:visible; }}
-          body {{ font-family:Arial, sans-serif; color:#1E293B; }}
+          /* Scoped to this table: the dashboard page itself is never sized or overflow-adjusted. */
           .crm-monthly-wrap, .crm-monthly-wrap * {{ box-sizing:border-box; }}
-          /* No fixed height or max-height: the document must grow/shrink with visible rows. */
-          .crm-monthly-wrap {{ width:100%; max-width:100%; height:auto; max-height:none;
-            overflow-x:auto; overflow-y:visible; border:1px solid #D9E2F0; border-radius:10px;
-            background:#fff; font-family:Arial,sans-serif; color:#1E293B; scrollbar-width:thin; }}
+          .crm-monthly-wrap {{ display:block; width:100%; max-width:100%; height:auto; max-height:none;
+            margin:0; padding:0; overflow-x:auto; overflow-y:visible; border:1px solid #D9E2F0;
+            border-radius:10px; background:#fff; font-family:Arial,sans-serif; color:#1E293B;
+            scrollbar-width:thin; }}
           .crm-monthly-table {{ border-collapse:separate; border-spacing:0; width:max-content; min-width:100%; font-size:12px; }}
           .crm-monthly-table th, .crm-monthly-table td {{ padding:6px 8px; border-right:1px solid #E2E8F0;
             border-bottom:1px solid #E2E8F0; white-space:nowrap; }}
@@ -3546,7 +3545,7 @@ try:
           .crm-monthly-table .applications-cell {{ color:#102451; font-weight:850; }}
           .crm-monthly-table tbody tr:hover td {{ box-shadow:inset 0 0 0 9999px rgba(219,234,254,.18); }}
         </style>
-        <div class="crm-monthly-wrap" data-iframe-height>
+        <div class="crm-monthly-wrap">
           <table id="{table_id}" class="crm-monthly-table">
             <thead><tr>{''.join(header_row_one)}</tr><tr>{''.join(header_row_two)}</tr></thead>
             <tbody>{''.join(table_rows_html)}</tbody>
@@ -3570,46 +3569,56 @@ try:
                 button.title = expand ? 'Collapse daily breakdown' : 'Expand daily breakdown';
               }});
             }});
-            // Older component iframe fallback: request a new frame height after
-            // every expand/collapse. st.iframe below handles this automatically.
-            function reportFrameHeight() {{
-              const height = Math.max(
-                document.documentElement ? document.documentElement.scrollHeight : 0,
-                document.body ? document.body.scrollHeight : 0
-              );
-              window.parent.postMessage({{
-                isStreamlitMessage: true,
-                type: 'streamlit:setFrameHeight',
-                height: height
-              }}, '*');
-            }}
-            if (typeof ResizeObserver !== 'undefined') {{
-              new ResizeObserver(function() {{ window.requestAnimationFrame(reportFrameHeight); }}).observe(document.body);
-            }}
-            table.querySelectorAll('.expand-button').forEach(function(button) {{
-              button.addEventListener('click', function() {{ window.requestAnimationFrame(reportFrameHeight); }});
-            }});
-            window.addEventListener('load', reportFrameHeight);
-            window.requestAnimationFrame(reportFrameHeight);
+            // The table is rendered directly into Streamlit's page (not in an
+            // iframe). Hiding/showing rows therefore changes the page's natural
+            // document flow immediately, without leaving an old iframe height behind.
           }})();
         </script>
         """
-        # st.iframe's content-height mode measures the HTML's natural height and
-        # keeps that height synchronized as JavaScript reveals/hides daily rows.
-        # This means the table itself grows and contracts, so all sections below
-        # it are pushed down/up rather than being overlapped or clipped.
-        if hasattr(st, "iframe"):
-            st.iframe(
-                table_html,
-                width="stretch",
-                height="content",
-                alt="Monthly CRM performance table with expandable daily rows",
-            )
-        else:
-            # Compatibility for older Streamlit installs. Keep the table
-            # scrollable instead of allowing it to overlap later page sections.
-            fallback_height = min(700, max(220, 112 + (len(monthly_crm_summary) * 42)))
-            components.html(table_html, height=fallback_height, scrolling=True)
+        # Render directly into the Streamlit document, rather than an iframe.
+        # Native document flow automatically closes the space when rows are
+        # collapsed, so the Recent Applications Log moves up immediately.
+        # unsafe_allow_javascript is needed only for the table's local +/- controls.
+        try:
+            st.html(table_html, unsafe_allow_javascript=True)
+        except TypeError:
+            # Compatibility for Streamlit builds whose st.html has no JavaScript
+            # flag yet. Dynamically resize the frame itself on every toggle so it
+            # shrinks as well as grows (unlike a fixed-height components.html).
+            frame_resize_script = r"""
+              <script>
+                (function() {
+                  function fitMonthlyFrame() {
+                    var wrap = document.querySelector('.crm-monthly-wrap');
+                    if (!wrap || !window.frameElement) return;
+                    var height = Math.ceil(wrap.getBoundingClientRect().height + 4);
+                    window.frameElement.style.height = height + 'px';
+                    window.frameElement.setAttribute('height', String(height));
+                  }
+                  document.querySelectorAll('.expand-button').forEach(function(button) {
+                    button.addEventListener('click', function() {
+                      requestAnimationFrame(function() { requestAnimationFrame(fitMonthlyFrame); });
+                    });
+                  });
+                  if (typeof ResizeObserver !== 'undefined') {
+                    new ResizeObserver(function() { requestAnimationFrame(fitMonthlyFrame); })
+                      .observe(document.querySelector('.crm-monthly-wrap'));
+                  }
+                  window.addEventListener('load', fitMonthlyFrame);
+                  requestAnimationFrame(fitMonthlyFrame);
+                })();
+              </script>
+            """
+            legacy_table_html = table_html.replace('</script>', '</script>' + frame_resize_script, 1)
+            if hasattr(st, "iframe"):
+                st.iframe(
+                    legacy_table_html,
+                    width="stretch",
+                    height="content",
+                    alt="Monthly CRM performance table with expandable daily rows",
+                )
+            else:
+                components.html(legacy_table_html, height=260, scrolling=False)
 
     # ------------------------------------------------------------------------
     # RECENT APPLICATIONS LOG
