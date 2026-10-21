@@ -1404,6 +1404,12 @@ def normalize_api_records(api_df):
         return pd.DataFrame(), pd.DataFrame()
 
     api = canonicalize_inbound_columns(api_df.copy())
+    # Explicitly guarantee the CRM mirror's exact inbound fields are present
+    # and retained before any downstream mapping/joins.
+    for _inbound_name in ("Inbound Status", "Inbound Remarks"):
+        if _inbound_name not in api.columns:
+            api[_inbound_name] = ""
+        api[_inbound_name] = api[_inbound_name].fillna("").astype(str).map(str.strip)
     for col in API_REQUIRED_COLUMNS:
         if col not in api.columns:
             api[col] = ""
@@ -1483,22 +1489,62 @@ def normalize_api_records(api_df):
 
 
 def fetch_crm_mirror(client):
-    """Read the CRM Excel mirror from the dedicated Google worksheet."""
-    crm_ws = client.open_by_key(SPREADSHEET_ID).get_worksheet_by_id(CRM_MIRROR_WORKSHEET_GID)
-    values = crm_ws.get_all_records()
-    crm_df = pd.DataFrame(values)
-    if crm_df.empty:
-        return crm_df, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 0, "CRM mirror sheet is empty"
+    """Read the exact CRM mirror worksheet by its configured Google Sheets GID.
 
-    crm_df.columns = [str(c).replace("\ufeff", "").replace("\u00a0", " ").strip() for c in crm_df.columns]
+    Use get_all_values() rather than relying on gspread's record conversion so
+    the literal CRM header row (including Inbound Status and Inbound Remarks)
+    is preserved and mapped explicitly. This avoids those fields silently
+    disappearing if record conversion/header handling differs across versions.
+    """
+    fetched_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        crm_ws = spreadsheet.get_worksheet_by_id(CRM_MIRROR_WORKSHEET_GID)
+        raw_values = crm_ws.get_all_values()
+    except Exception as exc:
+        return pd.DataFrame(), fetched_at, 0, f"CRM mirror sheet unavailable: {exc}"
+
+    if not raw_values or not any(str(v).strip() for v in raw_values[0]):
+        return pd.DataFrame(), fetched_at, 0, "CRM mirror sheet is empty or has no header row"
+
+    headers = [
+        str(c).replace("\ufeff", "").replace("\u00a0", " ").strip()
+        for c in raw_values[0]
+    ]
+    # Remove only trailing empty header cells; keep the source column order intact.
+    while headers and not headers[-1]:
+        headers.pop()
+    body = []
+    for raw_row in raw_values[1:]:
+        row = list(raw_row[:len(headers)])
+        if len(row) < len(headers):
+            row.extend([""] * (len(headers) - len(row)))
+        body.append(row)
+    crm_df = pd.DataFrame(body, columns=headers)
+    if crm_df.empty:
+        return crm_df, fetched_at, 0, "CRM mirror sheet contains headers but no data rows"
+
+    # Preserve the exact two requested source fields first, then canonicalise
+    # aliases/spacing as a fallback for older variants of the mirror export.
+    for canonical in ("Inbound Status", "Inbound Remarks"):
+        exact_matches = [col for col in crm_df.columns if str(col).strip() == canonical]
+        if exact_matches:
+            crm_df[canonical] = crm_df[exact_matches[0]].fillna("").astype(str)
     crm_df = canonicalize_inbound_columns(crm_df)
+
+    # Make sure these exact CRM fields survive normalization even when every
+    # value is blank in the current data slice.
+    for canonical in ("Inbound Status", "Inbound Remarks"):
+        if canonical not in crm_df.columns:
+            crm_df[canonical] = ""
+        crm_df[canonical] = crm_df[canonical].fillna("").astype(str).map(str.strip)
+
     missing = [c for c in API_REQUIRED_COLUMNS if c not in crm_df.columns]
     if missing:
         return pd.DataFrame(), "CRM mirror invalid", 0, (
             "CRM mirror is missing required columns: " + ", ".join(missing)
         )
 
-    fetched_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return crm_df, fetched_at, len(crm_df), ""
 
 
@@ -3346,6 +3392,344 @@ try:
         st.html(f'<div class="insight-wrap">{flags_html}</div>')
 
     # ------------------------------------------------------------------------
+    # MONTHLY TRADITIONAL EXCEL (SPARTA / SPARTA2) SUMMARY
+    # ------------------------------------------------------------------------
+    # Keep this as a separate table from CRM so source-specific headers and
+    # classification rules never get fused. September intentionally appears
+    # in both tables: legacy covers through 17-Sep, CRM starts 18-Sep.
+    st.html('<div style="height:6px"></div>')
+    render_section(
+        "Monthly Excel performance",
+        "▦",
+        "Traditional Sparta / Sparta2 sheets · legacy records through 17-Sep-2026",
+    )
+    st.caption(
+        "This separate table uses only legacy Sparta/Sparta2 records through 17 September 2026. "
+        "Its status columns are created only from status fields actually available in the legacy data; "
+        "CRM-only fields such as Inbound Status and Inbound Remarks are deliberately excluded. "
+        "September also appears in the CRM table below for records from 18 September onward. "
+        "Attendance follows the existing working-day rule: Sundays and 1st/3rd Saturdays are excluded; "
+        "P=1, HD=0.5, Ab/UL=0. SPD = applications ÷ total attendance."
+    )
+
+    legacy_apps = ag1.copy() if isinstance(ag1, pd.DataFrame) else pd.DataFrame()
+    legacy_portal = ag2.copy() if isinstance(ag2, pd.DataFrame) else pd.DataFrame()
+    if not legacy_apps.empty and "Source" in legacy_apps.columns:
+        legacy_apps = legacy_apps[
+            legacy_apps["Source"].fillna("").astype(str).str.strip().eq("Google - Sparta")
+        ].copy()
+    else:
+        legacy_apps = pd.DataFrame()
+    if not legacy_portal.empty and "Source" in legacy_portal.columns:
+        legacy_portal = legacy_portal[
+            legacy_portal["Source"].fillna("").astype(str).str.strip().eq("Google - Sparta2")
+        ].copy()
+    else:
+        legacy_portal = pd.DataFrame()
+
+    if not legacy_apps.empty:
+        if "Date_Parsed" not in legacy_apps.columns:
+            legacy_apps["Date_Parsed"] = parse_date_series(
+                legacy_apps.get("Standardized_Date", pd.Series(index=legacy_apps.index, dtype=object))
+            )
+        legacy_apps["Date_Parsed"] = pd.to_datetime(legacy_apps["Date_Parsed"], errors="coerce")
+        legacy_apps = legacy_apps[
+            legacy_apps["Date_Parsed"].notna()
+            & (legacy_apps["Date_Parsed"].dt.date <= LEGACY_SOURCE_CUTOFF.date())
+            & (legacy_apps["Date_Parsed"].dt.date <= today_date)
+        ].copy()
+        if not legacy_apps.empty:
+            if "_RecordKey" not in legacy_apps.columns:
+                legacy_apps = add_record_keys(legacy_apps, "Standardized_Date", "CLI")
+            legacy_apps["_RecordKey"] = legacy_apps["_RecordKey"].fillna("").astype(str).str.strip()
+            legacy_apps = legacy_apps[
+                legacy_apps["_RecordKey"].ne("")
+            ].drop_duplicates(subset=["_RecordKey"], keep="last")
+
+    if not legacy_portal.empty:
+        if "Date_Parsed" not in legacy_portal.columns:
+            legacy_portal["Date_Parsed"] = parse_date_series(
+                legacy_portal.get("Sale Date", pd.Series(index=legacy_portal.index, dtype=object))
+            )
+        legacy_portal["Date_Parsed"] = pd.to_datetime(legacy_portal["Date_Parsed"], errors="coerce")
+        legacy_portal = legacy_portal[
+            legacy_portal["Date_Parsed"].notna()
+            & (legacy_portal["Date_Parsed"].dt.date <= LEGACY_SOURCE_CUTOFF.date())
+            & (legacy_portal["Date_Parsed"].dt.date <= today_date)
+        ].copy()
+        if not legacy_portal.empty:
+            if "_RecordKey" not in legacy_portal.columns:
+                legacy_portal = add_record_keys(legacy_portal, "Sale Date", "Telephone No.")
+            legacy_portal["_RecordKey"] = legacy_portal["_RecordKey"].fillna("").astype(str).str.strip()
+            legacy_portal = legacy_portal[
+                legacy_portal["_RecordKey"].ne("")
+            ].drop_duplicates(subset=["_RecordKey"], keep="last")
+
+    legacy_monthly = pd.DataFrame()
+    legacy_daily = pd.DataFrame()
+    legacy_status_specs = []
+    if not legacy_apps.empty:
+        # Determine the Welcome field from values actually present on legacy rows.
+        # The combined frame may contain CRM-only headers, so column existence
+        # alone is not enough to decide which traditional sheet field to use.
+        legacy_wc_col = None
+        for _candidate_wc in ("Status", "Welcome call Status"):
+            if _candidate_wc in legacy_apps.columns:
+                _nonblank_wc = legacy_apps[_candidate_wc].apply(clean_reason_text)
+                if _nonblank_wc.astype(str).str.strip().ne("").any():
+                    legacy_wc_col = _candidate_wc
+                    break
+        # Only use legacy sheet fields. Never add CRM-only Inbound columns here.
+        legacy_field_candidates = [
+            ("Quality", "Quality Status", legacy_apps),
+            ("Welcome Call", legacy_wc_col, legacy_apps),
+            ("Confirmation", "CallStatus_portal", legacy_portal),
+            ("Portal / Live", "Status_portal", legacy_portal),
+        ]
+        for group_name, field_name, source_frame in legacy_field_candidates:
+            source_field_name = field_name.removesuffix("_portal") if field_name else None
+            if source_field_name and not source_frame.empty and source_field_name in source_frame.columns:
+                raw_values = source_frame[source_field_name].apply(clean_reason_text)
+                distinct = []
+                seen = set()
+                for raw in raw_values:
+                    label = re.sub(r"\s+", " ", str(raw or "")).strip()
+                    key = normalize_workflow_status(label)
+                    if key and key not in seen:
+                        seen.add(key)
+                        distinct.append((key, label))
+                if distinct:
+                    legacy_status_specs.append((group_name, field_name, distinct))
+
+        # Join Sparta2 outcomes to Sparta applications using the same Sale Date
+        # + normalized phone key used by the portal log. Do not match by phone alone.
+        if not legacy_portal.empty:
+            portal_keep = ["_RecordKey"]
+            for _group, _field, _distinct in legacy_status_specs:
+                _source_field = _field.removesuffix("_portal")
+                if _source_field in legacy_portal.columns and _source_field not in portal_keep:
+                    portal_keep.append(_source_field)
+            portal_status_frame = legacy_portal[portal_keep].drop_duplicates("_RecordKey", keep="last").rename(
+                columns={"CallStatus": "CallStatus_portal", "Status": "Status_portal"}
+            )
+            legacy_work = legacy_apps.merge(
+                portal_status_frame, on="_RecordKey", how="left", suffixes=("", "_portal"),
+                validate="one_to_one",
+            )
+        else:
+            legacy_work = legacy_apps.copy()
+
+        legacy_work["_Month"] = legacy_work["Date_Parsed"].dt.to_period("M")
+        legacy_work["_SaleDay"] = legacy_work["Date_Parsed"].dt.date
+
+        # Attendance uses the selected agent's already-filtered attendance frame.
+        legacy_attendance = ag_attendance.copy() if isinstance(ag_attendance, pd.DataFrame) else pd.DataFrame()
+        if not legacy_attendance.empty:
+            if "Date_Parsed" not in legacy_attendance.columns:
+                legacy_attendance["Date_Parsed"] = parse_date_series(
+                    legacy_attendance.get("Date", pd.Series(index=legacy_attendance.index, dtype=object))
+                )
+            legacy_attendance["Date_Parsed"] = pd.to_datetime(legacy_attendance["Date_Parsed"], errors="coerce")
+            if "Attendance_Code" not in legacy_attendance.columns:
+                legacy_attendance["Attendance_Code"] = legacy_attendance.get(
+                    "Attendance", pd.Series("-", index=legacy_attendance.index)
+                ).apply(normalize_attendance_status)
+            legacy_attendance = legacy_attendance[legacy_attendance["Date_Parsed"].notna()].copy()
+            legacy_attendance["_AttendanceDate"] = legacy_attendance["Date_Parsed"].dt.date
+            legacy_attendance = legacy_attendance.drop_duplicates("_AttendanceDate", keep="last")
+        legacy_attendance_by_date = (
+            dict(zip(legacy_attendance["_AttendanceDate"], legacy_attendance["Attendance_Code"]))
+            if not legacy_attendance.empty else {}
+        )
+        legacy_attendance_units = {"P": 1.0, "HD": 0.5, "Ab": 0.0, "UL": 0.0}
+
+        legacy_month_rows, legacy_day_rows = [], []
+        for month_period in sorted(legacy_work["_Month"].dropna().unique()):
+            month_work = legacy_work[legacy_work["_Month"] == month_period]
+            month_start = month_period.start_time.date()
+            month_end = min(month_period.end_time.date(), LEGACY_SOURCE_CUTOFF.date(), today_date)
+            if month_start > month_end:
+                continue
+            all_dates = [month_start + datetime.timedelta(days=i)
+                         for i in range((month_end - month_start).days + 1)]
+            working_dates = [d for d in all_dates if not _monthly_table_is_holiday(d)]
+            attendance_total = sum(
+                legacy_attendance_units.get(str(legacy_attendance_by_date.get(d, "-")).strip(), 0.0)
+                for d in working_dates
+            )
+
+            def _legacy_status_counts(frame):
+                result = {}
+                for group_name, field_name, distinct in legacy_status_specs:
+                    actual_field = field_name
+                    if actual_field not in frame.columns and f"{actual_field}_portal" in frame.columns:
+                        actual_field = f"{actual_field}_portal"
+                    if actual_field not in frame.columns:
+                        continue
+                    keys = frame[actual_field].apply(lambda v: normalize_workflow_status(clean_reason_text(v)))
+                    for status_key, label in distinct:
+                        result[f"{group_name} · {label}"] = int((keys == status_key).sum())
+                return result
+
+            app_count = int(len(month_work))
+            month_row = {
+                "Month": month_period.to_timestamp().strftime("%b-%Y"),
+                "Total Attendance": f"{attendance_total:g}",
+                "SPD": f"{app_count / attendance_total:.2f}" if attendance_total > 0 else "—",
+                "Applications": app_count,
+            }
+            month_row.update(_legacy_status_counts(month_work))
+            legacy_month_rows.append(month_row)
+
+            for sale_day in all_dates:
+                day_work = month_work[month_work["_SaleDay"] == sale_day]
+                day_attendance = str(legacy_attendance_by_date.get(sale_day, "-")).strip()
+                day_units = legacy_attendance_units.get(day_attendance, 0.0)
+                day_count = int(len(day_work))
+                day_row = {
+                    "Date": sale_day.strftime("%a, %d %b"),
+                    "_MonthKey": month_period.strftime("%Y-%m"),
+                    "Attendance": day_attendance if day_attendance in {"P", "HD", "Ab", "UL"} else "-",
+                    "SPD": f"{day_count / day_units:.2f}" if day_units > 0 else "—",
+                    "Applications": day_count,
+                }
+                day_row.update(_legacy_status_counts(day_work))
+                legacy_day_rows.append(day_row)
+
+        legacy_dynamic_columns = [
+            f"{group_name} · {label}"
+            for group_name, _field, distinct in legacy_status_specs
+            for _key, label in distinct
+        ]
+        legacy_monthly = pd.DataFrame(legacy_month_rows)
+        legacy_daily = pd.DataFrame(legacy_day_rows)
+        if not legacy_monthly.empty:
+            for col in legacy_dynamic_columns:
+                if col not in legacy_monthly.columns:
+                    legacy_monthly[col] = 0
+                legacy_monthly[col] = pd.to_numeric(legacy_monthly[col], errors="coerce").fillna(0).astype(int)
+            legacy_monthly = legacy_monthly.reindex(
+                columns=["Month", "Total Attendance", "SPD", "Applications"] + legacy_dynamic_columns
+            )
+        if not legacy_daily.empty:
+            for col in legacy_dynamic_columns:
+                if col not in legacy_daily.columns:
+                    legacy_daily[col] = 0
+                legacy_daily[col] = pd.to_numeric(legacy_daily[col], errors="coerce").fillna(0).astype(int)
+            legacy_daily = legacy_daily.reindex(
+                columns=["Date", "_MonthKey", "Attendance", "SPD", "Applications"] + legacy_dynamic_columns
+            )
+
+    if legacy_monthly.empty:
+        st.info("No traditional Sparta / Sparta2 applications are available for your account through 17-Sep-2026.")
+    else:
+        legacy_table_id = "excel-monthly-performance-table"
+        legacy_groups = []
+        for group_name, _field, distinct in legacy_status_specs:
+            if any(f"{group_name} · {label}" in legacy_monthly.columns for _key, label in distinct):
+                legacy_groups.append(group_name)
+        legacy_group_colours = {
+            "Monthly Summary": "#102451", "Quality": "#1D4ED8",
+            "Welcome Call": "#0F766E", "Confirmation": "#6D28D9", "Portal / Live": "#92400E",
+        }
+        legacy_display_pairs = [("Monthly Summary", x) for x in ["Month", "Total Attendance", "SPD", "Applications"]]
+        for col in legacy_monthly.columns:
+            if " · " in col:
+                group_name, label = col.split(" · ", 1)
+                legacy_display_pairs.append((group_name, label))
+        legacy_header_top = [
+            '<th class="legacy-expand-head" rowspan="2"></th>',
+            '<th class="legacy-group-header" colspan="4">Monthly Summary</th>'
+        ]
+        for group_name in legacy_groups:
+            count = sum(1 for group, _label in legacy_display_pairs if group == group_name)
+            if count:
+                legacy_header_top.append(
+                    f'<th class="legacy-group-header" colspan="{count}" '
+                    f'style="background:{legacy_group_colours.get(group_name, "#475569")}">{escape(group_name)}</th>'
+                )
+        legacy_header_bottom = [
+            f'<th class="legacy-sub-header">{escape(label)}</th>'
+            for _group, label in legacy_display_pairs
+        ]
+        legacy_rows_html = []
+        for _, row in legacy_monthly.iterrows():
+            month_label = str(row["Month"])
+            parsed = pd.to_datetime(month_label, format="%b-%Y", errors="coerce")
+            month_key = parsed.strftime("%Y-%m") if pd.notna(parsed) else re.sub(r"[^A-Za-z0-9_-]", "", month_label)
+            group_id = f"excel-month-{month_key}"
+            legacy_rows_html.append(
+                f'<tr class="legacy-month-row"><td class="legacy-expand-cell"><button type="button" '
+                f'class="legacy-expand-button" data-group="{escape(group_id)}" aria-expanded="false" title="Expand daily breakdown">+</button></td>'
+                f'<td class="legacy-month-cell">{escape(month_label)}</td>'
+                f'<td class="legacy-number">{escape(str(row["Total Attendance"]))}</td>'
+                f'<td class="legacy-number">{escape(str(row["SPD"]))}</td>'
+                f'<td class="legacy-number legacy-apps-number">{int(row["Applications"]):,}</td>'
+            )
+            for col in legacy_dynamic_columns:
+                count = int(row.get(col, 0) or 0)
+                legacy_rows_html.append(
+                    f'<td class="legacy-status-number">{"—" if count == 0 else f"{count:,}"}</td>'
+                )
+            legacy_rows_html.append('</tr>')
+            month_daily = legacy_daily[legacy_daily["_MonthKey"].astype(str).eq(month_key)] if not legacy_daily.empty else pd.DataFrame()
+            for _, day in month_daily.iterrows():
+                legacy_rows_html.append(
+                    f'<tr class="legacy-daily-row" data-parent="{escape(group_id)}"><td class="legacy-expand-cell"></td>'
+                    f'<td class="legacy-date-cell">↳ {escape(str(day["Date"]))}</td>'
+                    f'<td class="legacy-number">{escape(str(day["Attendance"]))}</td>'
+                    f'<td class="legacy-number">{escape(str(day["SPD"]))}</td>'
+                    f'<td class="legacy-number">{int(day["Applications"]):,}</td>'
+                )
+                for col in legacy_dynamic_columns:
+                    count = int(day.get(col, 0) or 0)
+                    legacy_rows_html.append(
+                        f'<td class="legacy-status-number">{"—" if count == 0 else f"{count:,}"}</td>'
+                    )
+                legacy_rows_html.append('</tr>')
+        legacy_html = f"""
+        <style>
+          .legacy-monthly-wrap,.legacy-monthly-wrap * {{box-sizing:border-box;}}
+          .legacy-monthly-wrap {{width:100%;max-width:100%;overflow-x:auto;overflow-y:visible;border:1px solid #D9E2F0;border-radius:10px;background:#fff;font-family:Arial,sans-serif;color:#1E293B;}}
+          .legacy-monthly-table {{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;font-size:12px;}}
+          .legacy-monthly-table th,.legacy-monthly-table td {{padding:6px 8px;border-right:1px solid #E2E8F0;border-bottom:1px solid #E2E8F0;white-space:nowrap;}}
+          .legacy-monthly-table thead th {{position:sticky;z-index:5;text-align:center;}}
+          .legacy-group-header {{top:0;background:#102451;color:#fff;font-size:11px;font-weight:850;padding:8px 7px!important;}}
+          .legacy-expand-head {{min-width:34px;width:34px;background:#102451;}}
+          .legacy-sub-header {{top:31px;background:#EAF0F8;color:#26364F;font-size:10px;font-weight:800;}}
+          .legacy-expand-cell {{width:34px;min-width:34px;text-align:center;padding:3px 4px;background:#F8FAFC;}}
+          .legacy-expand-button {{width:23px;height:23px;padding:0;border:1px solid #CBD5E1;border-radius:6px;background:#fff;color:#334155;font-size:16px;line-height:20px;font-weight:800;cursor:pointer;}}
+          .legacy-month-row td {{background:#F1F5FF;font-weight:750;}}
+          .legacy-month-cell {{color:#102451;}}
+          .legacy-daily-row {{display:none;}}
+          .legacy-daily-row.shown {{display:table-row;}}
+          .legacy-daily-row td {{font-size:11px;}}
+          .legacy-date-cell {{background:#F8FAFC;color:#475569;padding-left:12px;}}
+          .legacy-number,.legacy-status-number {{text-align:center;font-variant-numeric:tabular-nums;}}
+          .legacy-apps-number {{color:#102451;font-weight:850;}}
+          .legacy-status-number {{background:#F8FAFC;font-weight:700;}}
+          .legacy-monthly-table tbody tr:hover td {{box-shadow:inset 0 0 0 9999px rgba(219,234,254,.18);}}
+        </style>
+        <div class="legacy-monthly-wrap"><table id="{legacy_table_id}" class="legacy-monthly-table">
+        <thead><tr>{''.join(legacy_header_top)}</tr><tr>{''.join(legacy_header_bottom)}</tr></thead>
+        <tbody>{''.join(legacy_rows_html)}</tbody></table></div>
+        <script>(function(){{const table=document.getElementById("{legacy_table_id}");if(!table)return;
+        table.querySelectorAll('.legacy-expand-button').forEach(function(button){{button.addEventListener('click',function(){{
+        const id=button.getAttribute('data-group');const rows=Array.from(table.tBodies[0].querySelectorAll('tr.legacy-daily-row[data-parent="'+id+'"]'));
+        const expand=button.getAttribute('aria-expanded')!=='true';rows.forEach(function(row){{row.classList.toggle('shown',expand);}});
+        button.setAttribute('aria-expanded',expand?'true':'false');button.textContent=expand?'−':'+';button.title=expand?'Collapse daily breakdown':'Expand daily breakdown';
+        }});}});}})();</script>
+        """
+        try:
+            st.html(legacy_html, unsafe_allow_javascript=True)
+        except TypeError:
+            legacy_html_fallback = legacy_html.replace('</script>', '</script>', 1)
+            if hasattr(st, "iframe"):
+                st.iframe(legacy_html_fallback, width="stretch", height="content", alt="Traditional Excel monthly performance with expandable daily rows")
+            else:
+                components.html(legacy_html_fallback, height=260, scrolling=False)
+
+    # ------------------------------------------------------------------------
     # MONTHLY CRM-ONLY SUMMARY
     # ------------------------------------------------------------------------
     st.html('<div style="height:6px"></div>')
@@ -4000,10 +4384,14 @@ try:
 
         # Final display guarantee: keep both requested CRM inbound columns in the
         # filtered table even if the current selection contains legacy-only rows.
-        # The CRM header canonicalizer above maps the source values into these names.
+        # These are sourced from the exact headers in the CRM worksheet and passed
+        # through normalize_api_records -> ag1 -> merged_log -> recent_log.
         for _required_inbound_col in ("Inbound Status", "Inbound Remarks"):
             if _required_inbound_col not in recent_log.columns:
                 recent_log[_required_inbound_col] = ""
+            recent_log[_required_inbound_col] = (
+                recent_log[_required_inbound_col].fillna("").astype(str).map(str.strip)
+            )
 
         # Always sort after applying the filters so the newest matching records remain first.
         recent_log = recent_log.sort_values(by="Date_Parsed", ascending=False)
