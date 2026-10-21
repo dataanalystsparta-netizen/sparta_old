@@ -3432,13 +3432,11 @@ try:
             return parsed_month.strftime("%Y-%m")
 
         # Match the internal row expander design used by the Executive Dashboard's
-        # Monthly KPI Breakdown: each month has a small +/- control in the first
-        # column and its daily rows live directly below that month, hidden by
-        # default. The table owns a compact scrollable viewport, so expanding
-        # rows never overlaps Recent Applications Log or reserves a large blank gap.
+        # Monthly KPI Breakdown. The iframe must follow its content height: when
+        # every month is collapsed it shows only the monthly summary rows; when a
+        # month is expanded the daily rows increase the iframe height naturally,
+        # pushing Recent Applications Log down; collapsing removes that height.
         table_id = "crm-monthly-performance-table"
-        table_height = min(700, max(220, 112 + (len(monthly_crm_summary) * 42)))
-        viewport_height = max(200, table_height - 8)
 
         table_rows_html = []
         for _, month_row in monthly_crm_summary.iterrows():
@@ -3513,12 +3511,13 @@ try:
 
         table_html = f"""
         <style>
-          html, body {{ margin:0; padding:0; background:transparent; overflow:hidden; }}
+          html, body {{ margin:0; padding:0; background:transparent; overflow:visible; }}
           body {{ font-family:Arial, sans-serif; color:#1E293B; }}
           .crm-monthly-wrap, .crm-monthly-wrap * {{ box-sizing:border-box; }}
-          .crm-monthly-wrap {{ width:100%; height:{viewport_height}px; max-height:{viewport_height}px;
-            overflow:auto; border:1px solid #D9E2F0; border-radius:10px; background:#fff;
-            font-family:Arial,sans-serif; color:#1E293B; scrollbar-width:thin; }}
+          /* No fixed height or max-height: the document must grow/shrink with visible rows. */
+          .crm-monthly-wrap {{ width:100%; max-width:100%; height:auto; max-height:none;
+            overflow-x:auto; overflow-y:visible; border:1px solid #D9E2F0; border-radius:10px;
+            background:#fff; font-family:Arial,sans-serif; color:#1E293B; scrollbar-width:thin; }}
           .crm-monthly-table {{ border-collapse:separate; border-spacing:0; width:max-content; min-width:100%; font-size:12px; }}
           .crm-monthly-table th, .crm-monthly-table td {{ padding:6px 8px; border-right:1px solid #E2E8F0;
             border-bottom:1px solid #E2E8F0; white-space:nowrap; }}
@@ -3547,7 +3546,7 @@ try:
           .crm-monthly-table .applications-cell {{ color:#102451; font-weight:850; }}
           .crm-monthly-table tbody tr:hover td {{ box-shadow:inset 0 0 0 9999px rgba(219,234,254,.18); }}
         </style>
-        <div class="crm-monthly-wrap">
+        <div class="crm-monthly-wrap" data-iframe-height>
           <table id="{table_id}" class="crm-monthly-table">
             <thead><tr>{''.join(header_row_one)}</tr><tr>{''.join(header_row_two)}</tr></thead>
             <tbody>{''.join(table_rows_html)}</tbody>
@@ -3571,14 +3570,46 @@ try:
                 button.title = expand ? 'Collapse daily breakdown' : 'Expand daily breakdown';
               }});
             }});
+            // Older component iframe fallback: request a new frame height after
+            // every expand/collapse. st.iframe below handles this automatically.
+            function reportFrameHeight() {{
+              const height = Math.max(
+                document.documentElement ? document.documentElement.scrollHeight : 0,
+                document.body ? document.body.scrollHeight : 0
+              );
+              window.parent.postMessage({{
+                isStreamlitMessage: true,
+                type: 'streamlit:setFrameHeight',
+                height: height
+              }}, '*');
+            }}
+            if (typeof ResizeObserver !== 'undefined') {{
+              new ResizeObserver(function() {{ window.requestAnimationFrame(reportFrameHeight); }}).observe(document.body);
+            }}
+            table.querySelectorAll('.expand-button').forEach(function(button) {{
+              button.addEventListener('click', function() {{ window.requestAnimationFrame(reportFrameHeight); }});
+            }});
+            window.addEventListener('load', reportFrameHeight);
+            window.requestAnimationFrame(reportFrameHeight);
           }})();
         </script>
         """
-        # This matches the reference Monthly KPI Breakdown design: row-level
-        # expand/collapse happens inside one scrollable HTML table component.
-        # Its viewport height stays bounded, so opened daily rows scroll within
-        # the table and cannot overlay or push into the Recent Applications Log.
-        components.html(table_html, height=table_height, scrolling=False)
+        # st.iframe's content-height mode measures the HTML's natural height and
+        # keeps that height synchronized as JavaScript reveals/hides daily rows.
+        # This means the table itself grows and contracts, so all sections below
+        # it are pushed down/up rather than being overlapped or clipped.
+        if hasattr(st, "iframe"):
+            st.iframe(
+                table_html,
+                width="stretch",
+                height="content",
+                alt="Monthly CRM performance table with expandable daily rows",
+            )
+        else:
+            # Compatibility for older Streamlit installs. Keep the table
+            # scrollable instead of allowing it to overlap later page sections.
+            fallback_height = min(700, max(220, 112 + (len(monthly_crm_summary) * 42)))
+            components.html(table_html, height=fallback_height, scrolling=True)
 
     # ------------------------------------------------------------------------
     # RECENT APPLICATIONS LOG
