@@ -1345,7 +1345,7 @@ def normalize_api_records(api_df):
 
     # Optional CRM fields displayed in Recent Applications Log. Keep them
     # optional so older CRM mirror exports without these columns still load.
-    for col in ("Verifier Name", "Agent Remarks"):
+    for col in ("Verifier Name", "Agent Remarks", "Inbound Status", "Inbound Remarks"):
         if col not in api.columns:
             api[col] = ""
 
@@ -1380,6 +1380,8 @@ def normalize_api_records(api_df):
     app["Customer Name"] = api["Customer Name"]
     app["Verifier Name"] = api["Verifier Name"].apply(clean_reason_text)
     app["Agent Remarks"] = api["Agent Remarks"].apply(clean_reason_text)
+    app["Inbound Status"] = api["Inbound Status"].apply(clean_reason_text)
+    app["Inbound Remarks"] = api["Inbound Remarks"].apply(clean_reason_text)
     app["CLI"] = api["Phone Number"]
     app["Quality Status"] = quality
     app["Quality Remarks"] = quality_remarks
@@ -2248,6 +2250,7 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
     base_columns = ["Month", "Total Attendance", "SPD", "Applications"]
     daily_base_columns = ["Date", "Attendance", "SPD", "Applications"]
     status_specs = [
+        ("Inbound", "_InboundStatus"),
         ("Quality", "_QualityStatus"),
         ("Welcome", "_WelcomeStatus"),
         ("Committed", "_ConfirmationStatus"),
@@ -2286,14 +2289,17 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
     if crm_apps.empty:
         return empty_monthly, empty_daily
 
-    for col in ("Quality Status", "Status"):
+    for col in ("Inbound Status", "Quality Status", "Status"):
         if col not in crm_apps.columns:
             crm_apps[col] = ""
     crm_apps = crm_apps.rename(columns={
+        "Inbound Status": "_InboundStatus",
         "Quality Status": "_QualityStatus",
         "Status": "_WelcomeStatus",
     })
-    crm_apps = crm_apps[["_RecordKey", "Date_Parsed", "_QualityStatus", "_WelcomeStatus"]]
+    crm_apps = crm_apps[[
+        "_RecordKey", "Date_Parsed", "_InboundStatus", "_QualityStatus", "_WelcomeStatus"
+    ]]
 
     portal_statuses = pd.DataFrame(
         columns=["_RecordKey", "_OnboardingStatus", "_ConfirmationStatus"]
@@ -2322,6 +2328,17 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
     )
     monthly_data["_Month"] = monthly_data["Date_Parsed"].dt.to_period("M")
     monthly_data["_SaleDay"] = monthly_data["Date_Parsed"].dt.date
+
+    # Inbound is the highest-priority workflow classification for the monthly
+    # CRM performance table. If Inbound Status is populated, count that record
+    # only under Inbound and suppress all other stage status counts for it.
+    monthly_data["_InboundStatus"] = monthly_data["_InboundStatus"].fillna("").astype(str).str.strip()
+    has_inbound_status = monthly_data["_InboundStatus"].apply(normalize_workflow_status).ne("")
+    for suppressed_status_col in (
+        "_QualityStatus", "_WelcomeStatus", "_ConfirmationStatus", "_OnboardingStatus"
+    ):
+        if suppressed_status_col in monthly_data.columns:
+            monthly_data.loc[has_inbound_status, suppressed_status_col] = ""
 
     status_labels = {}
     for group_name, source_col in status_specs:
@@ -3274,6 +3291,7 @@ try:
     st.caption(
         "This table is agent-specific and independent of the main date filter. "
         "September starts at the CRM cutover (18 Sep 2026); the current month is month-to-date. "
+        "If Inbound Status is populated, that record is counted only under Inbound and excluded from other stage status counts. "
         "Monthly Total Attendance = summed attendance units on scheduled working days (P=1, HD=0.5, Ab/UL=0). "
         "Expanded daily rows show the attendance code (P, Ab, HD or UL). SPD = CRM applications ÷ total attendance. "
         "Sundays and 1st/3rd Saturdays are excluded from monthly attendance totals."
@@ -3287,11 +3305,12 @@ try:
         # Compact two-level headers: workflow groups on the first row and
         # individual status names on the second row. Native Streamlit controls
         # above the table toggle each month's daily rows without iframe overlap.
-        workflow_groups = ["Quality", "Welcome", "Committed", "Onboarding"]
+        workflow_groups = ["Inbound", "Quality", "Welcome", "Committed", "Onboarding"]
 
         def compact_status_header(group_name, label):
             text = str(label).strip()
             prefixes = {
+                "Inbound": r"^Inbound[-\s]+",
                 "Quality": r"^QA[-\s]+",
                 "Welcome": r"^(?:Welcome|WC)[-\s]+",
                 "Committed": r"^(?:Confirmation|Committed)[-\s]+",
@@ -3314,6 +3333,7 @@ try:
 
         header_colours = {
             "Monthly Summary": "#102451",
+            "Inbound": "#475569",
             "Quality": "#1D4ED8",
             "Welcome": "#0F766E",
             "Committed": "#6D28D9",
@@ -3707,6 +3727,8 @@ try:
             ("Basic Info.", "Agent Remarks"),
             ("Quality Audit", "Quality Status"),
             ("Quality Audit", "Quality Remarks"),
+            ("Inbound", "Inbound Status"),
+            ("Inbound", "Inbound Remarks"),
             ("Welcome Call", "Status"),
             ("Welcome Call", "Welcome call Remarks"),
             ("Live Status", "LetterStatus"),
@@ -3782,7 +3804,7 @@ try:
         # This must be defined before the filtering logic below.
         log_search = st.text_input(
             "Search applications",
-            placeholder="Search customer, phone, quality remark, WC remark, cancellation reason…",
+            placeholder="Search customer, phone, quality/inbound remarks, WC remark, cancellation reason…",
             key="log_search",
         )
 
@@ -3883,7 +3905,7 @@ try:
                 recent_log,
                 [
                     "Customer Name", "Verifier Name", "Agent Remarks", "CLI",
-                    "Quality Status", "Quality Remarks", "Status",
+                    "Quality Status", "Quality Remarks", "Inbound Status", "Inbound Remarks", "Status",
                     "Welcome call Remarks", "LetterStatus",
                     "Provisioning Status", "Provisioning Remarks", "CallStatus",
                     "Portal Status", "Classification Review",
@@ -4006,6 +4028,15 @@ try:
                 if not v:
                     return ""
 
+                # ------------------------------ INBOUND ---------------------
+                if kind == "inbound":
+                    if any(x in v for x in ["cancel", "cancelled", "canceled", "reject", "rejected", "sop"]):
+                        return f"background-color:{BG_RED};color:{DARK_RED};font-weight:800;"
+                    if any(x in v for x in ["approved", "approve", "complete", "completed", "done", "pass"]):
+                        return f"background-color:{BG_GREEN};color:{DARK_GREEN};font-weight:800;"
+                    if any(x in v for x in ["pending", "followup", "follow-up", "follow up", "rework", "in progress"]):
+                        return f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
+
                 # ----------------------------- QUALITY ----------------------
                 if kind == "quality":
                     # Explicit CRM / legacy values requested:
@@ -4113,6 +4144,7 @@ try:
                 return ""
 
             q_style = status_style(get_val("Quality Status"), "quality")
+            inbound_style = status_style(get_val("Inbound Status"), "inbound")
             wc_style = status_style(get_val("Status"), "welcome")
             letter_style = status_style(get_val("LetterStatus"), "letter")
             prov_style = status_style(get_val("Provisioning Status"), "provisioning")
@@ -4135,6 +4167,8 @@ try:
                 style_by_col = {
                     "Quality Status": q_style,
                     "Quality Remarks": q_style,
+                    "Inbound Status": inbound_style,
+                    "Inbound Remarks": inbound_style,
                     "Status": wc_style,
                     "Welcome call Remarks": wc_style,
                     "LetterStatus": letter_style,
@@ -4153,6 +4187,7 @@ try:
                 if col in [
                     "Customer Name",
                     "Quality Remarks",
+                    "Inbound Remarks",
                     "Welcome call Remarks",
                     "Provisioning Remarks",
                     "Cancellation Reason",
