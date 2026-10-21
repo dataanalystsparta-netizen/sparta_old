@@ -1333,12 +1333,77 @@ def fetch_api_excel():
     return pd.DataFrame(), "API unavailable", 0, last_error or "Unknown API error"
 
 
+def _crm_header_token(value):
+    """Normalize a CRM worksheet header for case/spacing/punctuation tolerant matching."""
+    value = str(value or "").replace("\ufeff", "").replace("\u00a0", " ").strip().lower()
+    return re.sub(r"[^a-z0-9]+", "", value)
+
+
+def canonicalize_inbound_columns(frame):
+    """Guarantee canonical Inbound Status/Remarks columns from CRM mirror headers.
+
+    Google Sheets headers sometimes vary in capitalization, whitespace, punctuation,
+    or use common equivalents such as Inbound Comments. Match those headers before
+    constructing portal rows so the fields cannot silently disappear from the log.
+    When more than one matching source column exists, prefer the first nonblank value.
+    """
+    if frame is None:
+        return pd.DataFrame(columns=["Inbound Status", "Inbound Remarks"])
+    result = frame.copy()
+    result.columns = [
+        str(col).replace("\\ufeff", "").replace("\ufeff", "").replace("\u00a0", " ").strip()
+        for col in result.columns
+    ]
+
+    aliases = {
+        "Inbound Status": {
+            "inboundstatus", "inboundstage", "inboundcallstatus", "currentinboundstatus"
+        },
+        "Inbound Remarks": {
+            "inboundremarks", "inboundremark", "inboundcomments", "inboundcomment",
+            "inboundstatusremarks", "inboundstageremarks", "inboundcallremarks"
+        },
+    }
+    for canonical, alias_tokens in aliases.items():
+        positions = [
+            idx for idx, column in enumerate(result.columns)
+            if _crm_header_token(column) in alias_tokens
+        ]
+        if not positions:
+            result[canonical] = ""
+            continue
+
+        merged_values = pd.Series("", index=result.index, dtype=object)
+        for idx in positions:
+            candidate = result.iloc[:, idx]
+            if isinstance(candidate, pd.DataFrame):
+                # This should only occur for duplicate source headers; coalesce each
+                # duplicate series from left to right rather than dropping values.
+                for sub_idx in range(candidate.shape[1]):
+                    values = candidate.iloc[:, sub_idx]
+                    values_text = values.fillna("").astype(str).str.strip()
+                    usable = ~values_text.str.lower().isin({"", "nan", "none", "null", "nat"})
+                    merged_values = merged_values.where(~usable, values)
+            else:
+                values_text = candidate.fillna("").astype(str).str.strip()
+                usable = ~values_text.str.lower().isin({"", "nan", "none", "null", "nat"})
+                merged_values = merged_values.where(~usable, candidate)
+
+        # Remove matched source columns by position and then put back one canonical
+        # field, avoiding duplicate labels that make pandas return a DataFrame.
+        keep_positions = [idx for idx in range(result.shape[1]) if idx not in positions]
+        result = result.iloc[:, keep_positions].copy()
+        result[canonical] = merged_values
+
+    return result
+
+
 def normalize_api_records(api_df):
     """Convert the consolidated API export into the old portal's two logical datasets."""
     if api_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    api = api_df.copy()
+    api = canonicalize_inbound_columns(api_df.copy())
     for col in API_REQUIRED_COLUMNS:
         if col not in api.columns:
             api[col] = ""
@@ -1425,7 +1490,8 @@ def fetch_crm_mirror(client):
     if crm_df.empty:
         return crm_df, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 0, "CRM mirror sheet is empty"
 
-    crm_df.columns = [str(c).replace("\ufeff", "").strip() for c in crm_df.columns]
+    crm_df.columns = [str(c).replace("\ufeff", "").replace("\u00a0", " ").strip() for c in crm_df.columns]
+    crm_df = canonicalize_inbound_columns(crm_df)
     missing = [c for c in API_REQUIRED_COLUMNS if c not in crm_df.columns]
     if missing:
         return pd.DataFrame(), "CRM mirror invalid", 0, (
@@ -3671,6 +3737,12 @@ try:
         )
 
         ag1_log_base = ag1.copy()
+        # Explicitly preserve CRM inbound fields through the record-level log merge.
+        # Legacy rows have no inbound data, so they receive blank values and display "-".
+        for _inbound_col in ("Inbound Status", "Inbound Remarks"):
+            if _inbound_col not in ag1_log_base.columns:
+                ag1_log_base[_inbound_col] = ""
+            ag1_log_base[_inbound_col] = ag1_log_base[_inbound_col].apply(clean_reason_text)
         ag1_log_base = add_record_keys(ag1_log_base, "Standardized_Date", "CLI")
         merged_log = ag1_log_base.merge(
             ag2_unique[
@@ -3693,6 +3765,12 @@ try:
             on="_RecordKey",
             how="left",
         )
+
+        # Guarantee the two requested columns exist in the visible log even if
+        # legacy-only data is being viewed or an older record lacks these fields.
+        for _inbound_col in ("Inbound Status", "Inbound Remarks"):
+            if _inbound_col not in merged_log.columns:
+                merged_log[_inbound_col] = ""
 
         # Show WC Pending in the log when the raw WC value maps to Others but
         # the quality stage is still QA-Pending or Rework.
@@ -3919,6 +3997,13 @@ try:
                         log_search.strip(), case=False, regex=False, na=False
                     )
                 ]
+
+        # Final display guarantee: keep both requested CRM inbound columns in the
+        # filtered table even if the current selection contains legacy-only rows.
+        # The CRM header canonicalizer above maps the source values into these names.
+        for _required_inbound_col in ("Inbound Status", "Inbound Remarks"):
+            if _required_inbound_col not in recent_log.columns:
+                recent_log[_required_inbound_col] = ""
 
         # Always sort after applying the filters so the newest matching records remain first.
         recent_log = recent_log.sort_values(by="Date_Parsed", ascending=False)
