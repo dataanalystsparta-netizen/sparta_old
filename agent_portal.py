@@ -3589,12 +3589,24 @@ try:
             & (legacy_apps["Date_Parsed"].dt.date <= today_date)
         ].copy()
         if not legacy_apps.empty:
-            if "_RecordKey" not in legacy_apps.columns:
-                legacy_apps = add_record_keys(legacy_apps, "Standardized_Date", "CLI")
+            # IMPORTANT: df1 is concatenated with CRM rows before reaching this
+            # table. Therefore the combined frame may already contain _RecordKey,
+            # but legacy rows can have that field blank. Always rebuild the key
+            # from the legacy sheet's own date + phone columns.
+            legacy_apps = add_record_keys(legacy_apps, "Standardized_Date", "CLI")
             legacy_apps["_RecordKey"] = legacy_apps["_RecordKey"].fillna("").astype(str).str.strip()
-            legacy_apps = legacy_apps[
-                legacy_apps["_RecordKey"].ne("")
-            ].drop_duplicates(subset=["_RecordKey"], keep="last")
+
+            # Deduplicate only rows that have the agreed Sale Date + phone key.
+            # A dated application with a missing phone must still count as an
+            # application; it simply cannot be joined to a Sparta2 outcome row.
+            _legacy_has_key = legacy_apps["_RecordKey"].ne("")
+            _legacy_keyed = legacy_apps.loc[_legacy_has_key].drop_duplicates(
+                subset=["_RecordKey"], keep="last"
+            )
+            _legacy_unkeyed = legacy_apps.loc[~_legacy_has_key]
+            legacy_apps = pd.concat(
+                [_legacy_keyed, _legacy_unkeyed], axis=0
+            ).sort_index(kind="stable")
 
     if not legacy_portal.empty:
         if "Date_Parsed" not in legacy_portal.columns:
@@ -3613,8 +3625,9 @@ try:
             & (legacy_portal["Date_Parsed"].dt.date <= today_date)
         ].copy()
         if not legacy_portal.empty:
-            if "_RecordKey" not in legacy_portal.columns:
-                legacy_portal = add_record_keys(legacy_portal, "Sale Date", "Telephone No.")
+            # As above, do not trust an existing combined-frame _RecordKey for
+            # legacy rows: regenerate from the original Sparta2 Sale Date + phone.
+            legacy_portal = add_record_keys(legacy_portal, "Sale Date", "Telephone No.")
             legacy_portal["_RecordKey"] = legacy_portal["_RecordKey"].fillna("").astype(str).str.strip()
             legacy_portal = legacy_portal[
                 legacy_portal["_RecordKey"].ne("")
