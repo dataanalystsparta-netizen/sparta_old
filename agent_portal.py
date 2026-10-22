@@ -1610,6 +1610,65 @@ def fetch_attendance_sheet(client):
     return df.reset_index(drop=True), ""
 
 
+def _legacy_header_key(value):
+    """Normalize a legacy worksheet header for tolerant column matching."""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").replace("\ufeff", "").replace("\u00a0", " ").casefold())
+
+
+def normalize_legacy_sheet_columns(frame, sheet_name):
+    """Resolve known legacy header variants without changing source status columns.
+
+    The two historical tabs have had minor header variations over time.  The
+    downstream app requires a small set of canonical date/advisor/phone fields
+    before it applies the legacy cutoff; if one of those headers differs by a
+    space, underscore, or alias, the prior loader would otherwise silently
+    discard every row as undated or unattributed.
+    """
+    if not isinstance(frame, pd.DataFrame):
+        return pd.DataFrame()
+    result = frame.copy()
+    if result.empty:
+        return result
+
+    if str(sheet_name).strip().casefold() == "sparta":
+        specs = {
+            "Standardized_Date": ["Standardized_Date", "Standardized Date", "Sale Date", "Application Date", "App Date", "Date"],
+            "Advisor": ["Advisor", "Agent", "Agent Name", "Sales Agent", "Created Username", "Created By", "Username", "User Name"],
+            "CLI": ["CLI", "Telephone No.", "Telephone Number", "Phone Number", "Phone", "Mobile", "Mobile Number", "Customer Phone", "Contact Number"],
+        }
+    else:
+        specs = {
+            "Sale Date": ["Sale Date", "SaleDate", "Standardized_Date", "Standardized Date", "Application Date", "App Date", "Date"],
+            "Agent": ["Agent", "Advisor", "Agent Name", "Sales Agent", "Created Username", "Created By", "Username", "User Name"],
+            "Telephone No.": ["Telephone No.", "Telephone Number", "Phone Number", "Phone", "CLI", "Mobile", "Mobile Number", "Customer Phone", "Contact Number"],
+        }
+
+    # Choose an exact known alias with the most nonblank values. Prefer the
+    # canonical header on ties so normal worksheets are left untouched.
+    columns = list(result.columns)
+    for canonical, aliases in specs.items():
+        alias_keys = {_legacy_header_key(alias) for alias in aliases}
+        candidates = [col for col in columns if _legacy_header_key(col) in alias_keys]
+        if not candidates:
+            continue
+        def nonblank_count(col):
+            values = result[col]
+            return int(values.map(lambda v: bool(str(v).strip()) and str(v).strip().casefold() not in {"nan", "none", "null", "nat"}).sum())
+        candidates.sort(key=lambda col: (nonblank_count(col), _legacy_header_key(col) == _legacy_header_key(canonical)), reverse=True)
+        selected = candidates[0]
+        if canonical not in result.columns:
+            result[canonical] = result[selected]
+        elif selected != canonical:
+            current_count = nonblank_count(canonical)
+            selected_count = nonblank_count(selected)
+            # Repair a blank placeholder canonical column if a populated alias
+            # exists, but never overwrite a canonical field with less data.
+            if selected_count > current_count:
+                blank_mask = result[canonical].isna() | result[canonical].astype(str).str.strip().eq("")
+                result.loc[blank_mask, canonical] = result.loc[blank_mask, selected]
+    return result
+
+
 def worksheet_to_dataframe_by_gid(spreadsheet, worksheet_gid, source_label):
     """Read a worksheet by its exact GID while preserving its literal headers.
 
@@ -1693,6 +1752,7 @@ def fetch_data():
     # the legacy headers include blank/Unnamed columns. Preserve actual header
     # labels so the Excel summary only uses fields present in this source.
     df1 = worksheet_to_dataframe_by_gid(ss, SPARTA_WORKSHEET_GID, "Sparta")
+    df1 = normalize_legacy_sheet_columns(df1, "Sparta")
     if df1.empty:
         df1 = pd.DataFrame(columns=["Standardized_Date", "Advisor", "Quality Status", "CLI", "Customer Name"])
     if "Standardized_Date" not in df1.columns:
@@ -1715,6 +1775,7 @@ def fetch_data():
     # LEGACY SPARTA2 — inclusive through 17-Sep-2026 only
     # -----------------------------------------------------------------------
     df2_raw = worksheet_to_dataframe_by_gid(ss, SPARTA2_WORKSHEET_GID, "Sparta2")
+    df2_raw = normalize_legacy_sheet_columns(df2_raw, "Sparta2")
     if df2_raw.empty:
         df2_raw = pd.DataFrame(columns=["Sale Date", "Agent", "Status", "Telephone No."])
     if "Sale Date" not in df2_raw.columns:
@@ -3498,8 +3559,18 @@ try:
         frame = frame[frame["_LegacyAdvisorKey"].eq(target_key)].copy()
         return frame.drop(columns=["_LegacyAdvisorKey"], errors="ignore")
 
-    legacy_apps = _legacy_source_for_agent(df1, "Google - Sparta")
-    legacy_portal = _legacy_source_for_agent(df2_raw, "Google - Sparta2")
+    # The fetch cache can contain frames created before a header variant was
+    # normalized, so normalize once more at the table boundary as a safeguard.
+    _monthly_legacy_sparta = normalize_legacy_sheet_columns(df1, "Sparta")
+    _monthly_legacy_sparta2 = normalize_legacy_sheet_columns(df2_raw, "Sparta2")
+    legacy_apps = _legacy_source_for_agent(_monthly_legacy_sparta, "Google - Sparta")
+    legacy_portal = _legacy_source_for_agent(_monthly_legacy_sparta2, "Google - Sparta2")
+    _legacy_rows_available = 0
+    if "Source" in _monthly_legacy_sparta.columns:
+        _legacy_rows_available += int(_monthly_legacy_sparta["Source"].fillna("").astype(str).str.strip().eq("Google - Sparta").sum())
+    if "Source" in _monthly_legacy_sparta2.columns:
+        _legacy_rows_available += int(_monthly_legacy_sparta2["Source"].fillna("").astype(str).str.strip().eq("Google - Sparta2").sum())
+    _legacy_agent_rows = len(legacy_apps) + len(legacy_portal)
 
     if not legacy_apps.empty:
         if "Date_Parsed" not in legacy_apps.columns:
@@ -3714,6 +3785,7 @@ try:
     # Even if this agent has no traditional application rows, show the shared
     # cutover month as a zero-sales legacy row. This makes September visible in
     # both reports and keeps the legacy attendance window limited to 17 Sep.
+    legacy_used_zero_fallback = False
     if legacy_monthly.empty and CRM_SOURCE_START.to_period("M") == LEGACY_SOURCE_CUTOFF.to_period("M"):
         overlap_period = LEGACY_SOURCE_CUTOFF.to_period("M")
         overlap_start = overlap_period.start_time.date()
@@ -3766,9 +3838,25 @@ try:
             legacy_daily = pd.DataFrame(fallback_days)
             legacy_dynamic_columns = []
             legacy_status_specs = []
+            legacy_used_zero_fallback = True
+
+    if legacy_used_zero_fallback:
+        st.caption(
+            f"Legacy source diagnostic · traditional rows available after the 17-Sep cutoff: {_legacy_rows_available:,} · "
+            f"rows matched to this account: {_legacy_agent_rows:,}. "
+            "A zero-sales September row is being shown because no eligible Sparta application rows matched this account. "
+            "If traditional rows are available but matches are zero, check advisor names in the legacy sheets against the portal login."
+        )
 
     if legacy_monthly.empty:
         st.info("No traditional Sparta / Sparta2 applications are available for your account through 17-Sep-2026.")
+        # Actionable diagnostic: shows whether the issue is worksheet loading,
+        # date filtering, or the selected account mapping without exposing rows.
+        st.caption(
+            f"Legacy source diagnostic · rows available after the date cutoff: {_legacy_rows_available:,} · "
+            f"rows matched to this account: {_legacy_agent_rows:,}. "
+            "If source rows are zero, check the worksheet date headers/values; if source rows are present but matches are zero, check the legacy advisor names against the portal login."
+        )
     else:
         legacy_table_id = "excel-monthly-performance-table"
         legacy_groups = []
