@@ -2427,16 +2427,16 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
     ]
     empty_monthly = pd.DataFrame(columns=base_columns)
     empty_daily = pd.DataFrame(columns=daily_base_columns)
-    if apps_frame is None or "Source" not in apps_frame.columns:
+    if apps_frame is None or apps_frame.empty or "Source" not in apps_frame.columns:
         return empty_monthly, empty_daily
 
     # This report deliberately uses only rows whose source is the CRM mirror.
     crm_apps = apps_frame[
         apps_frame["Source"].fillna("").astype(str).str.strip().eq("CRM Mirror")
     ].copy()
-    # Do not return just because this agent has no CRM row yet. When the
-    # source cutover happens mid-month, that overlap month should still appear
-    # in both independent tables, with zero applications where appropriate.
+    if crm_apps.empty:
+        return empty_monthly, empty_daily
+
     if "Date_Parsed" not in crm_apps.columns:
         crm_apps["Date_Parsed"] = parse_date_series(
             crm_apps.get("Sale Date", pd.Series(index=crm_apps.index, dtype=object))
@@ -2447,11 +2447,17 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
         & (crm_apps["Date_Parsed"].dt.date >= CRM_SOURCE_START.date())
         & (crm_apps["Date_Parsed"].dt.date <= as_of_date)
     ].copy()
+    if crm_apps.empty:
+        return empty_monthly, empty_daily
+
     if "_RecordKey" not in crm_apps.columns:
         crm_apps = add_record_keys(crm_apps, "Standardized_Date", "CLI")
     crm_apps["_RecordKey"] = crm_apps["_RecordKey"].fillna("").astype(str).str.strip()
     crm_apps = crm_apps[crm_apps["_RecordKey"].ne("")].copy()
     crm_apps = crm_apps.drop_duplicates(subset=["_RecordKey"], keep="last")
+    if crm_apps.empty:
+        return empty_monthly, empty_daily
+
     for col in ("Inbound Status", "Quality Status", "Status"):
         if col not in crm_apps.columns:
             crm_apps[col] = ""
@@ -2562,14 +2568,7 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
 
     rows = []
     daily_rows = []
-    month_set = set(monthly_data["_Month"].dropna().tolist())
-    # The cutover is within September 2026, so September is intentionally
-    # visible in both tables: Excel through the 17th and CRM from the 18th.
-    if CRM_SOURCE_START.to_period("M") == LEGACY_SOURCE_CUTOFF.to_period("M"):
-        overlap_month = LEGACY_SOURCE_CUTOFF.to_period("M")
-        if overlap_month.start_time.date() <= as_of_date:
-            month_set.add(overlap_month)
-    months = sorted(month_set)
+    months = sorted(monthly_data["_Month"].dropna().unique())
     for month_period in months:
         month_apps = monthly_data[monthly_data["_Month"] == month_period].copy()
         month_start = max(month_period.start_time.date(), CRM_SOURCE_START.date())
@@ -2642,6 +2641,7 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
             frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0).astype(int)
         frame["Applications"] = pd.to_numeric(frame["Applications"], errors="coerce").fillna(0).astype(int)
     return monthly_result, daily_result
+
 
 def pick_existing(frame, candidates):
     return [c for c in candidates if c in frame.columns]
@@ -4245,6 +4245,18 @@ try:
 
     if not ag1.empty:
         ag2_clean = ag2.copy()
+        # These downstream columns are optional in the legacy Sparta2 sheet and
+        # may be absent entirely when the CRM mirror has no eligible rows. Add
+        # blank defaults before selecting columns for the merge so the log never
+        # crashes and all application rows remain visible.
+        for _optional_log_col in (
+            "Telephone No.", "LetterStatus", "Provisioning Status",
+            "Provisioning Remarks", "CallStatus", "Comments",
+            "Voice of Customer", "Cancellation Reason", "Status",
+            "Committed Date", "Source",
+        ):
+            if _optional_log_col not in ag2_clean.columns:
+                ag2_clean[_optional_log_col] = ""
         ag2_clean["Telephone No."] = ag2_clean["Telephone No."].astype(str).str.strip()
         ag2_clean = ag2_clean.rename(columns={
             "Status": "Portal Status",
@@ -4266,6 +4278,15 @@ try:
             .sort_values("Date_Parsed")
             .drop_duplicates("_RecordKey", keep="last")
         )
+        for _merge_col in (
+            "_RecordKey", "Telephone No.", "LetterStatus",
+            "Provisioning Status", "Provisioning Remarks", "CallStatus",
+            "Comments", "Voice of Customer", "Cancellation Reason",
+            "Portal Status", "_Internal_Downstream_Category",
+            "Classification Review", "Live Date",
+        ):
+            if _merge_col not in ag2_unique.columns:
+                ag2_unique[_merge_col] = ""
 
         ag1_log_base = ag1.copy()
         # Explicitly preserve CRM inbound fields through the record-level log merge.
