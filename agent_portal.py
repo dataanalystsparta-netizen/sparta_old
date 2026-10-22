@@ -868,6 +868,10 @@ CRM_MIRROR_SHEET_URL = st.secrets.get(
     "https://docs.google.com/spreadsheets/d/1R1nXJHnmsHQhisEDronG-DMo5tWeI3Ysh8TyQmKQ2fQ/edit?gid=1647226826#gid=1647226826",
 )
 CRM_MIRROR_WORKSHEET_GID = int(st.secrets.get("CRM_MIRROR_WORKSHEET_GID", "1647226826"))
+# Explicit worksheet IDs supplied for the traditional source tabs. Use GIDs
+# instead of worksheet titles so the portal always reads the intended tabs.
+SPARTA_WORKSHEET_GID = int(st.secrets.get("SPARTA_WORKSHEET_GID", "1598890500"))
+SPARTA2_WORKSHEET_GID = int(st.secrets.get("SPARTA2_WORKSHEET_GID", "1601740359"))
 ATTENDANCE_WORKSHEET_GID = int(st.secrets.get("ATTENDANCE_WORKSHEET_GID", "1036958145"))
 ATTENDANCE_SHEET_URL = st.secrets.get(
     "ATTENDANCE_SHEET_URL",
@@ -1606,6 +1610,56 @@ def fetch_attendance_sheet(client):
     return df.reset_index(drop=True), ""
 
 
+def worksheet_to_dataframe_by_gid(spreadsheet, worksheet_gid, source_label):
+    """Read a worksheet by its exact GID while preserving its literal headers.
+
+    get_all_records() can be fragile when legacy workbook tabs contain empty
+    header cells or repeated `Unnamed:` columns. This reader keeps all actual
+    source columns, assigns a stable placeholder only to genuinely blank
+    header cells, and ensures duplicate labels do not overwrite one another.
+    """
+    worksheet = spreadsheet.get_worksheet_by_id(int(worksheet_gid))
+    raw_values = worksheet.get_all_values()
+    if not raw_values:
+        return pd.DataFrame()
+
+    raw_headers = list(raw_values[0])
+    body = list(raw_values[1:])
+    width = max([len(raw_headers)] + [len(row) for row in body]) if body else len(raw_headers)
+    if width == 0:
+        return pd.DataFrame()
+    raw_headers.extend([""] * (width - len(raw_headers)))
+
+    headers = []
+    used = set()
+    for index, raw_header in enumerate(raw_headers):
+        header = str(raw_header or "").replace("\ufeff", "").replace("\u00a0", " ").strip()
+        if not header:
+            # Use a private placeholder for an actually blank cell so a real
+            # source header such as the literal text "Unnamed: 47" is preserved.
+            header = f"__blank_header_{index}"
+        candidate = header
+        suffix = 2
+        while candidate in used:
+            candidate = f"{header}__{suffix}"
+            suffix += 1
+        used.add(candidate)
+        headers.append(candidate)
+
+    normalized_rows = []
+    for row in body:
+        values = list(row[:width])
+        if len(values) < width:
+            values.extend([""] * (width - len(values)))
+        if not any(str(value).strip() for value in values):
+            continue
+        normalized_rows.append(values)
+
+    frame = pd.DataFrame(normalized_rows, columns=headers)
+    # Avoid treating the label as an added data column; it is useful in errors.
+    return frame
+
+
 @st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
 def fetch_data():
     """Load legacy history through 17-Sep-2026 and newer records from CRM mirror.
@@ -1635,7 +1689,10 @@ def fetch_data():
     # -----------------------------------------------------------------------
     # LEGACY SPARTA — inclusive through 17-Sep-2026 only
     # -----------------------------------------------------------------------
-    df1 = pd.DataFrame(ss.worksheet("Sparta").get_all_records())
+    # The worksheet IDs are explicit because the workbook has several tabs and
+    # the legacy headers include blank/Unnamed columns. Preserve actual header
+    # labels so the Excel summary only uses fields present in this source.
+    df1 = worksheet_to_dataframe_by_gid(ss, SPARTA_WORKSHEET_GID, "Sparta")
     if df1.empty:
         df1 = pd.DataFrame(columns=["Standardized_Date", "Advisor", "Quality Status", "CLI", "Customer Name"])
     if "Standardized_Date" not in df1.columns:
@@ -1657,7 +1714,7 @@ def fetch_data():
     # -----------------------------------------------------------------------
     # LEGACY SPARTA2 — inclusive through 17-Sep-2026 only
     # -----------------------------------------------------------------------
-    df2_raw = pd.DataFrame(ss.worksheet("Sparta2").get_all_records())
+    df2_raw = worksheet_to_dataframe_by_gid(ss, SPARTA2_WORKSHEET_GID, "Sparta2")
     if df2_raw.empty:
         df2_raw = pd.DataFrame(columns=["Sale Date", "Agent", "Status", "Telephone No."])
     if "Sale Date" not in df2_raw.columns:
@@ -2370,16 +2427,16 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
     ]
     empty_monthly = pd.DataFrame(columns=base_columns)
     empty_daily = pd.DataFrame(columns=daily_base_columns)
-    if apps_frame is None or apps_frame.empty or "Source" not in apps_frame.columns:
+    if apps_frame is None or "Source" not in apps_frame.columns:
         return empty_monthly, empty_daily
 
     # This report deliberately uses only rows whose source is the CRM mirror.
     crm_apps = apps_frame[
         apps_frame["Source"].fillna("").astype(str).str.strip().eq("CRM Mirror")
     ].copy()
-    if crm_apps.empty:
-        return empty_monthly, empty_daily
-
+    # Do not return just because this agent has no CRM row yet. When the
+    # source cutover happens mid-month, that overlap month should still appear
+    # in both independent tables, with zero applications where appropriate.
     if "Date_Parsed" not in crm_apps.columns:
         crm_apps["Date_Parsed"] = parse_date_series(
             crm_apps.get("Sale Date", pd.Series(index=crm_apps.index, dtype=object))
@@ -2390,17 +2447,11 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
         & (crm_apps["Date_Parsed"].dt.date >= CRM_SOURCE_START.date())
         & (crm_apps["Date_Parsed"].dt.date <= as_of_date)
     ].copy()
-    if crm_apps.empty:
-        return empty_monthly, empty_daily
-
     if "_RecordKey" not in crm_apps.columns:
         crm_apps = add_record_keys(crm_apps, "Standardized_Date", "CLI")
     crm_apps["_RecordKey"] = crm_apps["_RecordKey"].fillna("").astype(str).str.strip()
     crm_apps = crm_apps[crm_apps["_RecordKey"].ne("")].copy()
     crm_apps = crm_apps.drop_duplicates(subset=["_RecordKey"], keep="last")
-    if crm_apps.empty:
-        return empty_monthly, empty_daily
-
     for col in ("Inbound Status", "Quality Status", "Status"):
         if col not in crm_apps.columns:
             crm_apps[col] = ""
@@ -2511,7 +2562,14 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
 
     rows = []
     daily_rows = []
-    months = sorted(monthly_data["_Month"].dropna().unique())
+    month_set = set(monthly_data["_Month"].dropna().tolist())
+    # The cutover is within September 2026, so September is intentionally
+    # visible in both tables: Excel through the 17th and CRM from the 18th.
+    if CRM_SOURCE_START.to_period("M") == LEGACY_SOURCE_CUTOFF.to_period("M"):
+        overlap_month = LEGACY_SOURCE_CUTOFF.to_period("M")
+        if overlap_month.start_time.date() <= as_of_date:
+            month_set.add(overlap_month)
+    months = sorted(month_set)
     for month_period in months:
         month_apps = monthly_data[monthly_data["_Month"] == month_period].copy()
         month_start = max(month_period.start_time.date(), CRM_SOURCE_START.date())
@@ -3404,35 +3462,56 @@ try:
         "Traditional Sparta / Sparta2 sheets · legacy records through 17-Sep-2026",
     )
     st.caption(
-        "This separate table uses only legacy Sparta/Sparta2 records through 17 September 2026. "
-        "Its status columns are created only from status fields actually available in the legacy data; "
+        "This separate table reads the traditional Sparta (gid 1598890500) and Sparta2 (gid 1601740359) worksheets directly, "
+        "using only legacy records through 17 September 2026. Its status columns are created only from status fields actually available in those legacy sheets; "
         "CRM-only fields such as Inbound Status and Inbound Remarks are deliberately excluded. "
         "September also appears in the CRM table below for records from 18 September onward. "
         "Attendance follows the existing working-day rule: Sundays and 1st/3rd Saturdays are excluded; "
         "P=1, HD=0.5, Ab/UL=0. SPD = applications ÷ total attendance."
     )
 
-    legacy_apps = ag1.copy() if isinstance(ag1, pd.DataFrame) else pd.DataFrame()
-    legacy_portal = ag2.copy() if isinstance(ag2, pd.DataFrame) else pd.DataFrame()
-    if not legacy_apps.empty and "Source" in legacy_apps.columns:
-        legacy_apps = legacy_apps[
-            legacy_apps["Source"].fillna("").astype(str).str.strip().eq("Google - Sparta")
+    # Build this table from the complete loaded frames rather than the already
+    # filtered KPI/log frames (ag1/ag2). The source and agent filters are applied
+    # explicitly here so a prior transformation in the main portal cannot make
+    # the legacy table appear empty for every login.
+    def _legacy_source_for_agent(source_frame, source_name):
+        if not isinstance(source_frame, pd.DataFrame) or source_frame.empty:
+            return pd.DataFrame()
+        frame = source_frame.copy()
+        if "Source" not in frame.columns:
+            return pd.DataFrame()
+        frame = frame[
+            frame["Source"].fillna("").astype(str).str.strip().eq(source_name)
         ].copy()
-    else:
-        legacy_apps = pd.DataFrame()
-    if not legacy_portal.empty and "Source" in legacy_portal.columns:
-        legacy_portal = legacy_portal[
-            legacy_portal["Source"].fillna("").astype(str).str.strip().eq("Google - Sparta2")
-        ].copy()
-    else:
-        legacy_portal = pd.DataFrame()
+        if frame.empty:
+            return frame
+
+        # Canonicalize usernames as well as spacing/case. This preserves the
+        # per-agent access boundary while supporting the same aliases used by
+        # the rest of the portal.
+        if "Advisor" not in frame.columns:
+            frame["Advisor"] = ""
+        frame["_LegacyAdvisorKey"] = frame["Advisor"].apply(
+            lambda value: re.sub(r"[^a-z0-9]", "", canonicalize_advisor(value).lower())
+        )
+        target_key = re.sub(r"[^a-z0-9]", "", canonicalize_advisor(agent).lower())
+        frame = frame[frame["_LegacyAdvisorKey"].eq(target_key)].copy()
+        return frame.drop(columns=["_LegacyAdvisorKey"], errors="ignore")
+
+    legacy_apps = _legacy_source_for_agent(df1, "Google - Sparta")
+    legacy_portal = _legacy_source_for_agent(df2_raw, "Google - Sparta2")
 
     if not legacy_apps.empty:
         if "Date_Parsed" not in legacy_apps.columns:
-            legacy_apps["Date_Parsed"] = parse_date_series(
-                legacy_apps.get("Standardized_Date", pd.Series(index=legacy_apps.index, dtype=object))
-            )
+            legacy_apps["Date_Parsed"] = pd.NaT
         legacy_apps["Date_Parsed"] = pd.to_datetime(legacy_apps["Date_Parsed"], errors="coerce")
+        if legacy_apps["Date_Parsed"].isna().all():
+            for _date_col in ("Standardized_Date", "Sale Date", "Date"):
+                if _date_col in legacy_apps.columns:
+                    _parsed_dates = parse_date_series(legacy_apps[_date_col])
+                    if _parsed_dates.notna().any():
+                        legacy_apps["Date_Parsed"] = _parsed_dates
+                        break
         legacy_apps = legacy_apps[
             legacy_apps["Date_Parsed"].notna()
             & (legacy_apps["Date_Parsed"].dt.date <= LEGACY_SOURCE_CUTOFF.date())
@@ -3448,10 +3527,15 @@ try:
 
     if not legacy_portal.empty:
         if "Date_Parsed" not in legacy_portal.columns:
-            legacy_portal["Date_Parsed"] = parse_date_series(
-                legacy_portal.get("Sale Date", pd.Series(index=legacy_portal.index, dtype=object))
-            )
+            legacy_portal["Date_Parsed"] = pd.NaT
         legacy_portal["Date_Parsed"] = pd.to_datetime(legacy_portal["Date_Parsed"], errors="coerce")
+        if legacy_portal["Date_Parsed"].isna().all():
+            for _date_col in ("Sale Date", "Standardized_Date", "Date"):
+                if _date_col in legacy_portal.columns:
+                    _parsed_dates = parse_date_series(legacy_portal[_date_col])
+                    if _parsed_dates.notna().any():
+                        legacy_portal["Date_Parsed"] = _parsed_dates
+                        break
         legacy_portal = legacy_portal[
             legacy_portal["Date_Parsed"].notna()
             & (legacy_portal["Date_Parsed"].dt.date <= LEGACY_SOURCE_CUTOFF.date())
@@ -3544,7 +3628,14 @@ try:
         legacy_attendance_units = {"P": 1.0, "HD": 0.5, "Ab": 0.0, "UL": 0.0}
 
         legacy_month_rows, legacy_day_rows = [], []
-        for month_period in sorted(legacy_work["_Month"].dropna().unique()):
+        legacy_month_set = set(legacy_work["_Month"].dropna().tolist())
+        # Preserve September in the Excel table as the legacy side of the
+        # mid-month source split, even when this agent had no Sep 1–17 sale.
+        if CRM_SOURCE_START.to_period("M") == LEGACY_SOURCE_CUTOFF.to_period("M"):
+            overlap_period = LEGACY_SOURCE_CUTOFF.to_period("M")
+            if overlap_period.start_time.date() <= today_date:
+                legacy_month_set.add(overlap_period)
+        for month_period in sorted(legacy_month_set):
             month_work = legacy_work[legacy_work["_Month"] == month_period]
             month_start = month_period.start_time.date()
             month_end = min(month_period.end_time.date(), LEGACY_SOURCE_CUTOFF.date(), today_date)
@@ -3619,6 +3710,62 @@ try:
             legacy_daily = legacy_daily.reindex(
                 columns=["Date", "_MonthKey", "Attendance", "SPD", "Applications"] + legacy_dynamic_columns
             )
+
+    # Even if this agent has no traditional application rows, show the shared
+    # cutover month as a zero-sales legacy row. This makes September visible in
+    # both reports and keeps the legacy attendance window limited to 17 Sep.
+    if legacy_monthly.empty and CRM_SOURCE_START.to_period("M") == LEGACY_SOURCE_CUTOFF.to_period("M"):
+        overlap_period = LEGACY_SOURCE_CUTOFF.to_period("M")
+        overlap_start = overlap_period.start_time.date()
+        overlap_end = min(overlap_period.end_time.date(), LEGACY_SOURCE_CUTOFF.date(), today_date)
+        if overlap_start <= overlap_end:
+            fallback_attendance = ag_attendance.copy() if isinstance(ag_attendance, pd.DataFrame) else pd.DataFrame()
+            if not fallback_attendance.empty:
+                if "Date_Parsed" not in fallback_attendance.columns:
+                    fallback_attendance["Date_Parsed"] = parse_date_series(
+                        fallback_attendance.get("Date", pd.Series(index=fallback_attendance.index, dtype=object))
+                    )
+                fallback_attendance["Date_Parsed"] = pd.to_datetime(fallback_attendance["Date_Parsed"], errors="coerce")
+                if "Attendance_Code" not in fallback_attendance.columns:
+                    fallback_attendance["Attendance_Code"] = fallback_attendance.get(
+                        "Attendance", pd.Series("-", index=fallback_attendance.index)
+                    ).apply(normalize_attendance_status)
+                fallback_attendance = fallback_attendance[fallback_attendance["Date_Parsed"].notna()].copy()
+                fallback_attendance["_AttendanceDate"] = fallback_attendance["Date_Parsed"].dt.date
+                fallback_attendance = fallback_attendance.drop_duplicates("_AttendanceDate", keep="last")
+                fallback_attendance_by_date = dict(zip(
+                    fallback_attendance["_AttendanceDate"], fallback_attendance["Attendance_Code"]
+                ))
+            else:
+                fallback_attendance_by_date = {}
+            fallback_units = {"P": 1.0, "HD": 0.5, "Ab": 0.0, "UL": 0.0}
+            fallback_dates = [overlap_start + datetime.timedelta(days=i)
+                              for i in range((overlap_end - overlap_start).days + 1)]
+            fallback_working_dates = [d for d in fallback_dates if not _monthly_table_is_holiday(d)]
+            fallback_total = sum(
+                fallback_units.get(str(fallback_attendance_by_date.get(d, "-")).strip(), 0.0)
+                for d in fallback_working_dates
+            )
+            legacy_monthly = pd.DataFrame([{
+                "Month": overlap_period.to_timestamp().strftime("%b-%Y"),
+                "Total Attendance": f"{fallback_total:g}",
+                "SPD": "0.00" if fallback_total > 0 else "—",
+                "Applications": 0,
+            }])
+            fallback_days = []
+            for sale_day in fallback_dates:
+                attendance_code = str(fallback_attendance_by_date.get(sale_day, "-")).strip()
+                day_units = fallback_units.get(attendance_code, 0.0)
+                fallback_days.append({
+                    "Date": sale_day.strftime("%a, %d %b"),
+                    "_MonthKey": overlap_period.strftime("%Y-%m"),
+                    "Attendance": attendance_code if attendance_code in {"P", "HD", "Ab", "UL"} else "-",
+                    "SPD": "0.00" if day_units > 0 else "—",
+                    "Applications": 0,
+                })
+            legacy_daily = pd.DataFrame(fallback_days)
+            legacy_dynamic_columns = []
+            legacy_status_specs = []
 
     if legacy_monthly.empty:
         st.info("No traditional Sparta / Sparta2 applications are available for your account through 17-Sep-2026.")
