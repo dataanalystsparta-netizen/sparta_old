@@ -3900,6 +3900,97 @@ try:
             f'<th class="legacy-sub-header">{escape(label)}</th>'
             for _group, label in legacy_display_pairs
         ]
+
+        # Status-cell colours mirror the CRM table. Status columns are dynamic
+        # because only values genuinely present in Sparta/Sparta2 are displayed.
+        # Positive: green; pending/rework/SOP: amber; cancelled/rejected,
+        # duplicate and missed outcomes: red; unknown values: neutral grey.
+        _legacy_status_palettes = {
+            "yellow": ("#FFFBEB", "#F59E0B"),
+            "green": ("#ECFDF5", "#059669"),
+            "red": ("#FEF2F2", "#DC2626"),
+            "neutral": ("#F8FAFC", "#CBD5E1"),
+        }
+
+        def _legacy_status_family(column_name):
+            if " · " in str(column_name):
+                _group, _label = str(column_name).split(" · ", 1)
+            else:
+                _group, _label = "", str(column_name)
+            _label_clean = re.sub(r"[^a-z0-9]+", " ", _label.casefold()).strip()
+            _tokens = set(_label_clean.split())
+            _compact = _label_clean.replace(" ", "")
+            if (
+                _tokens.intersection({
+                    "cancel", "cancellation", "cancelled", "canceled",
+                    "reject", "rejected", "duplicate", "missed",
+                })
+                or _compact in {"tobecancelled", "tobecanceled", "inboundcancel"}
+                or "duplicate" in _compact
+                or "missed" in _compact
+            ):
+                return "red"
+            if (
+                _tokens.intersection({"pending", "rework"})
+                or "followup" in _compact
+                or "portpending" in _compact
+                or "reworkrequired" in _compact
+            ):
+                return "yellow"
+            if _tokens.intersection({"approved", "done", "satisfied", "live"}) or _compact in {
+                "rs/satisfied", "rp/satisfied", "rssatisfied", "rpsatisfied"
+            }:
+                return "green"
+            return "neutral"
+
+        def _legacy_blend_hex(low_hex, high_hex, ratio):
+            low_rgb = tuple(int(low_hex[i:i + 2], 16) for i in (1, 3, 5))
+            high_rgb = tuple(int(high_hex[i:i + 2], 16) for i in (1, 3, 5))
+            rgb = tuple(round(a + (b - a) * ratio) for a, b in zip(low_rgb, high_rgb))
+            return "#" + "".join(f"{component:02X}" for component in rgb)
+
+        _legacy_status_families = {
+            col: _legacy_status_family(col) for col in legacy_dynamic_columns
+        }
+        _legacy_status_max = {}
+        for _col, _family in _legacy_status_families.items():
+            _month_values = (
+                pd.to_numeric(legacy_monthly[_col], errors="coerce").fillna(0)
+                if _col in legacy_monthly.columns else pd.Series(dtype=float)
+            )
+            _day_values = (
+                pd.to_numeric(legacy_daily[_col], errors="coerce").fillna(0)
+                if _col in legacy_daily.columns else pd.Series(dtype=float)
+            )
+            _legacy_status_max[(_family, "month")] = max(
+                _legacy_status_max.get((_family, "month"), 0),
+                float(_month_values.max()) if not _month_values.empty else 0,
+            )
+            _legacy_status_max[(_family, "day")] = max(
+                _legacy_status_max.get((_family, "day"), 0),
+                float(_day_values.max()) if not _day_values.empty else 0,
+            )
+
+        def _legacy_status_cell_html(column_name, value, row_kind):
+            try:
+                count = int(value) if pd.notna(value) else 0
+            except (TypeError, ValueError):
+                count = 0
+            family = _legacy_status_families.get(column_name, "neutral")
+            low_hex, high_hex = _legacy_status_palettes[family]
+            maximum = _legacy_status_max.get((family, row_kind), 0)
+            # Keep zero cells subtly tinted to reveal the status category while
+            # reserving stronger colour for non-zero counts.
+            ratio = 0.0 if count <= 0 or maximum <= 0 else 0.16 + 0.84 * min(1.0, count / maximum)
+            background = _legacy_blend_hex(low_hex, high_hex, ratio)
+            foreground = "#FFFFFF" if family in {"green", "red"} and ratio >= 0.68 else "#334155"
+            display_value = "—" if count <= 0 else f"{count:,}"
+            return (
+                f'<td class="legacy-status-number {family}" '
+                f'style="background:{background};color:{foreground};font-weight:750;text-align:center;">'
+                f'{display_value}</td>'
+            )
+
         legacy_rows_html = []
         for _, row in legacy_monthly.iterrows():
             month_label = str(row["Month"])
@@ -3915,10 +4006,7 @@ try:
                 f'<td class="legacy-number legacy-apps-number">{int(row["Applications"]):,}</td>'
             )
             for col in legacy_dynamic_columns:
-                count = int(row.get(col, 0) or 0)
-                legacy_rows_html.append(
-                    f'<td class="legacy-status-number">{"—" if count == 0 else f"{count:,}"}</td>'
-                )
+                legacy_rows_html.append(_legacy_status_cell_html(col, row.get(col, 0), "month"))
             legacy_rows_html.append('</tr>')
             month_daily = legacy_daily[legacy_daily["_MonthKey"].astype(str).eq(month_key)] if not legacy_daily.empty else pd.DataFrame()
             for _, day in month_daily.iterrows():
@@ -3930,10 +4018,7 @@ try:
                     f'<td class="legacy-number">{int(day["Applications"]):,}</td>'
                 )
                 for col in legacy_dynamic_columns:
-                    count = int(day.get(col, 0) or 0)
-                    legacy_rows_html.append(
-                        f'<td class="legacy-status-number">{"—" if count == 0 else f"{count:,}"}</td>'
-                    )
+                    legacy_rows_html.append(_legacy_status_cell_html(col, day.get(col, 0), "day"))
                 legacy_rows_html.append('</tr>')
         legacy_html = f"""
         <style>
@@ -3955,7 +4040,7 @@ try:
           .legacy-date-cell {{background:#F8FAFC;color:#475569;padding-left:12px;}}
           .legacy-number,.legacy-status-number {{text-align:center;font-variant-numeric:tabular-nums;}}
           .legacy-apps-number {{color:#102451;font-weight:850;}}
-          .legacy-status-number {{background:#F8FAFC;font-weight:700;}}
+          .legacy-status-number {{font-weight:750;}}
           .legacy-monthly-table tbody tr:hover td {{box-shadow:inset 0 0 0 9999px rgba(219,234,254,.18);}}
         </style>
         <div class="legacy-monthly-wrap"><table id="{legacy_table_id}" class="legacy-monthly-table">
@@ -4039,20 +4124,38 @@ try:
         }
 
         def status_colour_family(group_name, short_label):
+            """Assign a consistent semantic colour to CRM and legacy status columns."""
             label = re.sub(r"[^a-z0-9]+", " ", str(short_label).casefold()).strip()
             tokens = set(label.split())
             compact = label.replace(" ", "")
-            if tokens.intersection({"reject", "rejected", "cancelled", "canceled"}) or compact in {
-                "tobecancelled", "tobecanceled"
-            }:
+
+            # Negative / terminal outcomes. Match singular as well as plural
+            # forms because the traditional sheets use labels such as "Cancel"
+            # and "Quality Reject", while CRM may use "Cancelled" / "Rejected".
+            if (
+                tokens.intersection({
+                    "cancel", "cancellation", "cancelled", "canceled",
+                    "reject", "rejected", "duplicate", "missed",
+                })
+                or compact in {"tobecancelled", "tobecanceled", "inboundcancel"}
+                or "duplicate" in compact
+                or "missed" in compact
+            ):
                 return "red"
+
+            # Waiting / work-in-progress / follow-up states.
             if (
                 tokens.intersection({"pending", "rework"})
                 or "followup" in compact
                 or "portpending" in compact
+                or "reworkrequired" in compact
             ):
                 return "yellow"
-            if "approved" in tokens or compact == "approved":
+
+            # Positive outcomes across both sources.
+            if tokens.intersection({"approved", "done", "satisfied", "live"}) or compact in {
+                "rs/satisfied", "rp/satisfied", "rssatisfied", "rpsatisfied"
+            }:
                 return "green"
             return "neutral"
 
