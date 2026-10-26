@@ -1939,8 +1939,8 @@ DOWNSTREAM_CATEGORY_ORDER = [
     "Live Cancelled",
     "Unclassified / Review",
 ]
-# Main Live Status cards and previous-period trend cards use exactly the same
-# mutually exclusive reporting categories.
+# Fixed reporting categories remain available to monthly tables and log filters.
+# Main Live Status KPI cards deliberately display raw source status values.
 LIVE_KPI_STATUS_ORDER = list(DOWNSTREAM_CATEGORY_ORDER)
 
 
@@ -2197,12 +2197,40 @@ def map_live_kpi_status(primary_status, call_status="", provisioning_status="", 
     })[0]
 
 
-def build_wc_done_live_kpi_rows(apps_frame, portal_frame, welcome_status_col):
-    """Return only downstream rows whose matching application is WC Done/Approved.
+def raw_status_counts(frame, status_col):
+    """Count populated status values exactly as shown in their source field.
 
-    Uses the same Sale Date + phone record key already used by the Recent
-    Applications Log. The source dataframes are copied, so the detailed log and
-    daily/monthly breakdown remain unchanged by this KPI-only eligibility rule.
+    Only whitespace is trimmed; source spelling/capitalisation and punctuation
+    are retained so the KPI labels mirror the CRM values rather than mapped
+    reporting categories. Blank/sentinel values are not rendered as statuses.
+    """
+    if frame is None or frame.empty or status_col not in frame.columns:
+        return {}
+
+    counts = {}
+    blank_values = {"", "nan", "none", "nat", "null", "-", "n/a"}
+    for value in frame[status_col].tolist():
+        try:
+            if pd.isna(value):
+                continue
+        except (TypeError, ValueError):
+            pass
+        label = re.sub(r"\s+", " ", str(value)).strip()
+        if label.casefold() in blank_values:
+            continue
+        counts[label] = counts.get(label, 0) + 1
+
+    return dict(sorted(counts.items(), key=lambda item: item[0].casefold()))
+
+
+def build_wc_done_live_kpi_rows(apps_frame, portal_frame, welcome_status_col):
+    """Return downstream rows whose matching application is WC Done/Approved.
+
+    Uses the same Sale Date + phone record key as the Recent Applications Log.
+    The KPI displays the raw primary Live/Onboarding status from the portal
+    (the CRM's ``Committed (Live) Status`` value) without reclassifying it or
+    falling back to Confirmation Status. Confirmation remains available in the
+    separate log and monthly CRM workflow table.
     """
     if (
         apps_frame is None or portal_frame is None
@@ -2245,13 +2273,10 @@ def build_wc_done_live_kpi_rows(apps_frame, portal_frame, welcome_status_col):
 
     portal = add_record_keys(portal, "Sale Date", "Telephone No.")
     portal = portal[portal["_RecordKey"].astype(str).isin(wc_done_keys)].copy()
-    # Classification is calculated once on the full downstream frame upstream.
-    # Reuse it here so eligibility remains a separate decision from category.
-    if "Downstream_Category" not in portal.columns:
-        portal = classify_downstream_frame(portal)
-    portal["Live_KPI_Status"] = portal["Downstream_Category"]
-    if "Downstream_Review_Flag" not in portal.columns:
-        portal["Downstream_Review_Flag"] = ""
+    # Count only the actual status stored in the CRM/Sparta2 primary status
+    # field. Do not substitute the Confirmation Status (CallStatus) when this
+    # field is blank, and do not replace the displayed value with a classifier.
+    portal["Live_KPI_Status"] = portal["Status"].fillna("").astype(str).str.strip()
     return portal
 
 
@@ -3001,6 +3026,10 @@ try:
     previous_live_kpi = build_wc_done_live_kpi_rows(
         previous_ag1, previous_ag2, wc_col
     )
+    # The inbound/live KPI panels use raw source labels, so their trend
+    # comparisons must be keyed by those same exact labels.
+    previous_inbound_status_counts = raw_status_counts(previous_ag1, "Inbound Status")
+    previous_live_status_counts = raw_status_counts(previous_live_kpi, "Live_KPI_Status")
 
     trend_previous_counts = {"Total Apps": len(previous_ag1)}
     for label, status in [
@@ -3017,14 +3046,6 @@ try:
             ("WC Others", "Others"),
         ]:
             trend_previous_counts[label] = int((previous_ag1["WC_Clean"] == status).sum())
-
-    for label in LIVE_KPI_STATUS_ORDER:
-        # These comparison counts use the same WC Done/Approved eligibility
-        # and CallStatus fallback as the current Live Status KPI cards.
-        key = f"Portal {label}"
-        trend_previous_counts[key] = int(
-            (previous_live_kpi["Live_KPI_Status"] == label).sum()
-        )
 
     # ------------------------------------------------------------------------
     # KPI ROW
@@ -3052,16 +3073,22 @@ try:
             ("WC Others", len(ag1_filtered[ag1_filtered["WC_Clean"] == "Others"]), total_apps),
         ]
 
-    # Live KPI denominator is the subset with a matching Welcome Done/Approved
-    # application row, not every downstream record in the selected period.
+    # Inbound KPI cards count populated CRM Inbound Status values exactly as
+    # displayed in the source. Counts are agent-specific and follow the main
+    # selected date range; only CRM records have these values populated.
+    inbound_status_counts = raw_status_counts(ag1_filtered, "Inbound Status")
+    group_inbound = [
+        (status_label, count, total_apps)
+        for status_label, count in inbound_status_counts.items()
+    ]
+
+    # Live Status cards count the raw primary status value from CRM/Sparta2,
+    # not the central classifier categories and not Confirmation Status fallback.
+    live_status_counts = raw_status_counts(live_kpi_filtered, "Live_KPI_Status")
     live_total_denominator = len(live_kpi_filtered)
     group_4 = [
-        (
-            status_label,
-            int((live_kpi_filtered["Live_KPI_Status"] == status_label).sum()),
-            live_total_denominator,
-        )
-        for status_label in LIVE_KPI_STATUS_ORDER
+        (status_label, count, live_total_denominator)
+        for status_label, count in live_status_counts.items()
     ]
 
     # ------------------------------------------------------------------------
@@ -3072,57 +3099,34 @@ try:
     with top_left:
         render_section("Performance snapshot", "✦", "Your selected date range at a glance")
 
-        # Four primary KPI panels in a clean 2 x 2 layout.
-        # Nested status values keep their individual trends inside each panel.
-        kpi_top_left, kpi_top_right = st.columns(2, gap="small")
-        with kpi_top_left:
+        # Top row: Overview, Inbound status counts, then Quality audit status.
+        # Raw inbound values are displayed as individual KPI cards between the
+        # existing Overview and Quality panels, as requested.
+        kpi_overview_col, kpi_inbound_col, kpi_quality_col = st.columns(
+            [1.0, 1.5, 2.5], gap="small"
+        )
+        with kpi_overview_col:
             with st.container(border=True):
                 st.markdown("**Overview**")
                 render_kpi(
                     group_1[0][0], group_1[0][1], group_1[0][2],
                     previous_count=trend_previous_counts.get("Total Apps"),
                 )
-        with kpi_top_right:
+        with kpi_inbound_col:
+            if group_inbound:
+                kpi_panel("Inbound status", group_inbound, previous_inbound_status_counts)
+            else:
+                with st.container(border=True):
+                    st.markdown("**Inbound status**")
+                    st.caption("No inbound statuses in the selected date range.")
+        with kpi_quality_col:
             kpi_panel("Quality audit status", group_2, trend_previous_counts)
 
         kpi_bottom_left, kpi_bottom_right = st.columns(2, gap="small")
         with kpi_bottom_left:
             kpi_panel("Welcome call status", group_3, trend_previous_counts)
         with kpi_bottom_right:
-            kpi_panel(
-                "Live status",
-                group_4,
-                {
-                    status_label: trend_previous_counts.get(f"Portal {status_label}", 0)
-                    for status_label in LIVE_KPI_STATUS_ORDER
-                },
-            )
-            # Preserve visibility of the old CallStatus fallback detail without
-            # treating confirmation-stage values as additional categories. These
-            # counts are a subset of the categories above and are not additive.
-            confirmation_detail_counts = {
-                "Confirmation Approved": 0,
-                "Confirmation Followup": 0,
-                "Confirmation Pending": 0,
-            }
-            for _, eligible_row in live_kpi_filtered.iterrows():
-                if normalize_workflow_status(eligible_row.get("Status", "")):
-                    continue
-                fallback_status = normalize_workflow_status(eligible_row.get("CallStatus", ""))
-                if fallback_status.startswith("confirmation approved") or fallback_status == "approved":
-                    confirmation_detail_counts["Confirmation Approved"] += 1
-                elif fallback_status.startswith(("confirmation followup", "confirmation follow up")) or fallback_status in {"followup", "follow up"}:
-                    confirmation_detail_counts["Confirmation Followup"] += 1
-                elif fallback_status.startswith("confirmation pending") or fallback_status in {"pending", "pnd"}:
-                    confirmation_detail_counts["Confirmation Pending"] += 1
-            confirmation_details = [
-                f"{label}: {count:,}"
-                for label, count in confirmation_detail_counts.items()
-                if count > 0
-            ]
-            if confirmation_details:
-                st.markdown("**Confirmation fallback detail**")
-                st.caption(" · ".join(confirmation_details))
+            kpi_panel("Live status", group_4, previous_live_status_counts)
 
         # Compact activity consistency. Period-to-period trends now live on
         # the main KPI cards, so repeated Performance Pulse comparison cards
@@ -4466,7 +4470,6 @@ try:
             "Status": "Portal Status",
             "Committed Date": "Live Date",
             "Downstream_Category": "_Internal_Downstream_Category",
-            "Downstream_Review_Flag": "Classification Review",
         })
 
         # Use the same agreed Sale Date + Phone primary key in the detailed
@@ -4486,8 +4489,7 @@ try:
             "_RecordKey", "Telephone No.", "LetterStatus",
             "Provisioning Status", "Provisioning Remarks", "CallStatus",
             "Comments", "Voice of Customer", "Cancellation Reason",
-            "Portal Status", "_Internal_Downstream_Category",
-            "Classification Review", "Live Date",
+            "Portal Status", "_Internal_Downstream_Category", "Live Date",
         ):
             if _merge_col not in ag2_unique.columns:
                 ag2_unique[_merge_col] = ""
@@ -4514,7 +4516,6 @@ try:
                     "Cancellation Reason",
                     "Portal Status",
                     "_Internal_Downstream_Category",
-                    "Classification Review",
                     "Live Date",
                 ]
             ],
@@ -4570,7 +4571,6 @@ try:
             ("Provisioning", "Provisioning Remarks"),
             ("Live Status", "CallStatus"),
             ("Live Status", "Portal Status"),
-            ("Live Status", "Classification Review"),
             ("Live Status", "Live Date"),
             ("Live Status", "Comments"),
             ("Live Status", "Voice of Customer"),
@@ -4742,7 +4742,7 @@ try:
                     "Quality Status", "Quality Remarks", "Inbound Status", "Inbound Remarks", "Status",
                     "Welcome call Remarks", "LetterStatus",
                     "Provisioning Status", "Provisioning Remarks", "CallStatus",
-                    "Portal Status", "Classification Review",
+                    "Portal Status",
                     "Comments", "Voice of Customer", "Cancellation Reason",
                 ],
             )
@@ -4995,12 +4995,6 @@ try:
             prov_style = status_style(get_val("Provisioning Status"), "provisioning")
             call_style = status_style(get_val("CallStatus"), "confirmation")
             portal_style = status_style(get_val("Portal Status"), "portal")
-            review_value = get_val("Classification Review")
-            review_style = (
-                f"background-color:{BG_AMBER};color:{DARK_AMBER};font-weight:800;"
-                if review_value and review_value not in {"-", "none", "nan", "nat", "null"}
-                else ""
-            )
 
             for i, col_tuple in enumerate(row.index):
                 col = col_tuple[1] if isinstance(col_tuple, tuple) and len(col_tuple) > 1 else str(col_tuple)
@@ -5022,7 +5016,6 @@ try:
                     "CallStatus": call_style,
                     "Comments": call_style,
                     "Portal Status": portal_style,
-                    "Classification Review": review_style,
                 }
                 current_style = style_by_col.get(col, "")
 
