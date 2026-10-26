@@ -1940,8 +1940,8 @@ DOWNSTREAM_CATEGORY_ORDER = [
     "Unclassified / Review",
 ]
 # Fixed reporting categories remain available to monthly tables and log filters.
-# Main Live Status KPI cards display raw source status values after the CRM
-# sequential eligibility gate. Legacy rows retain the historical WC Done rule.
+# Main Live Status KPI cards preserve their existing mixed-source behaviour.
+# The dedicated CRM Onboarding stage panel applies the strict sequential gates.
 LIVE_KPI_STATUS_ORDER = list(DOWNSTREAM_CATEGORY_ORDER)
 
 
@@ -2388,6 +2388,47 @@ def build_crm_stage_reconciliation(apps_frame, portal_frame):
         reconciled["_Eligible_Confirmation"] & reconciled["_CRM_ConfirmationPassed"]
     )
     return reconciled
+
+
+def crm_stage_status_counts(apps_frame, portal_frame, stage_name):
+    """Count raw CRM status values at a stage, after the previous-stage gates.
+
+    Counts are intentionally CRM-only and use the actual source status strings.
+    Inbound is excluded from this sales-stage process and never affects gates.
+    """
+    stage_map = {
+        "Provisioning": ("_CRM_ProvisioningStatus", "_Eligible_Provisioning"),
+        "Letter": ("_CRM_LetterStatus", "_Eligible_Letter"),
+        "Confirmation": ("_CRM_ConfirmationStatus", "_Eligible_Confirmation"),
+        "Onboarding": ("_CRM_OnboardingStatus", "_Eligible_Onboarding"),
+    }
+    if stage_name not in stage_map:
+        raise ValueError(f"Unknown CRM stage: {stage_name}")
+
+    status_column, eligible_column = stage_map[stage_name]
+    reconciled = build_crm_stage_reconciliation(apps_frame, portal_frame)
+    if reconciled.empty or status_column not in reconciled.columns:
+        return {}
+
+    if eligible_column not in reconciled.columns:
+        return {}
+
+    eligible = reconciled[eligible_column].fillna(False).astype(bool)
+    statuses = reconciled[status_column].fillna("").astype(str).str.strip()
+    blank_values = {"", "nan", "none", "nat", "null", "-", "n/a"}
+    populated = ~statuses.str.casefold().isin(blank_values)
+    count_frame = pd.DataFrame({"Stage Status": statuses.loc[eligible & populated]})
+    return raw_status_counts(count_frame, "Stage Status")
+
+
+def render_crm_stage_panel(title, kpis, previous_counts=None):
+    """Always render a stage panel, including a useful empty-state message."""
+    if kpis and any(item[1] > 0 for item in kpis):
+        kpi_panel(title, kpis, previous_counts)
+    else:
+        with st.container(border=True):
+            st.markdown(f"**{escape(title)}**")
+            st.caption("No eligible CRM stage statuses in the selected date range.")
 
 
 def crm_welcome_stage_eligible_apps(apps_frame):
@@ -3205,10 +3246,25 @@ try:
     previous_live_kpi = build_wc_done_live_kpi_rows(
         previous_ag1, previous_ag2, wc_col
     )
+    # Keep the existing Live KPI trend behaviour. The dedicated CRM Onboarding
+    # panel below adds stage-level detail without removing the original summary.
     # The inbound/live KPI panels use raw source labels, so their trend
     # comparisons must be keyed by those same exact labels.
     previous_inbound_status_counts = raw_status_counts(previous_ag1, "Inbound Status")
     previous_live_status_counts = raw_status_counts(previous_live_kpi, "Live_KPI_Status")
+
+    previous_provisioning_counts = crm_stage_status_counts(
+        previous_ag1, previous_ag2, "Provisioning"
+    )
+    previous_letter_counts = crm_stage_status_counts(
+        previous_ag1, previous_ag2, "Letter"
+    )
+    previous_confirmation_counts = crm_stage_status_counts(
+        previous_ag1, previous_ag2, "Confirmation"
+    )
+    previous_onboarding_counts = crm_stage_status_counts(
+        previous_ag1, previous_ag2, "Onboarding"
+    )
 
     trend_previous_counts = {"Total Apps": len(previous_ag1)}
     for label, status in [
@@ -3231,6 +3287,7 @@ try:
     # ------------------------------------------------------------------------
     total_apps = len(ag1_filtered)
     total_ag2 = len(ag2_filtered)
+    crm_total_apps = int(_crm_source_mask(ag1_filtered).sum())
 
     group_1 = [("Total Apps", total_apps, total_apps)]
     group_2 = [
@@ -3261,13 +3318,45 @@ try:
         for status_label, count in inbound_status_counts.items()
     ]
 
-    # Live Status cards count the raw primary status value from CRM/Sparta2,
-    # not the central classifier categories and not Confirmation Status fallback.
+    # Preserve the original Live Status KPI (legacy + CRM) as well as adding
+    # the dedicated CRM-only Onboarding stage panel below.
     live_status_counts = raw_status_counts(live_kpi_filtered, "Live_KPI_Status")
     live_total_denominator = len(live_kpi_filtered)
     group_4 = [
         (status_label, count, live_total_denominator)
         for status_label, count in live_status_counts.items()
+    ]
+
+    # Additional CRM-only stage panels. Each helper applies the exact sequence
+    # of preceding-stage approvals while retaining the source's displayed label.
+    provisioning_status_counts = crm_stage_status_counts(
+        ag1_filtered, ag2_filtered, "Provisioning"
+    )
+    letter_status_counts = crm_stage_status_counts(
+        ag1_filtered, ag2_filtered, "Letter"
+    )
+    confirmation_status_counts = crm_stage_status_counts(
+        ag1_filtered, ag2_filtered, "Confirmation"
+    )
+    onboarding_status_counts = crm_stage_status_counts(
+        ag1_filtered, ag2_filtered, "Onboarding"
+    )
+
+    group_provisioning = [
+        (status_label, count, crm_total_apps)
+        for status_label, count in provisioning_status_counts.items()
+    ]
+    group_letter = [
+        (status_label, count, crm_total_apps)
+        for status_label, count in letter_status_counts.items()
+    ]
+    group_confirmation = [
+        (status_label, count, crm_total_apps)
+        for status_label, count in confirmation_status_counts.items()
+    ]
+    group_onboarding = [
+        (status_label, count, crm_total_apps)
+        for status_label, count in onboarding_status_counts.items()
     ]
 
     # ------------------------------------------------------------------------
@@ -3301,10 +3390,30 @@ try:
         with kpi_quality_col:
             kpi_panel("Quality audit status", group_2, trend_previous_counts)
 
-        kpi_bottom_left, kpi_bottom_right = st.columns(2, gap="small")
-        with kpi_bottom_left:
+        # Keep the stage panels wide enough for the raw CRM status labels.
+        # Inbound remains independent of the six-stage sales flow.
+        kpi_stage_row_1 = st.columns(2, gap="small")
+        with kpi_stage_row_1[0]:
             kpi_panel("Welcome call status", group_3, trend_previous_counts)
-        with kpi_bottom_right:
+        with kpi_stage_row_1[1]:
+            render_crm_stage_panel(
+                "Provisioning status", group_provisioning, previous_provisioning_counts
+            )
+
+        kpi_stage_row_2 = st.columns(2, gap="small")
+        with kpi_stage_row_2[0]:
+            render_crm_stage_panel("Letter status", group_letter, previous_letter_counts)
+        with kpi_stage_row_2[1]:
+            render_crm_stage_panel(
+                "Confirmation status", group_confirmation, previous_confirmation_counts
+            )
+
+        kpi_stage_row_3 = st.columns(2, gap="small")
+        with kpi_stage_row_3[0]:
+            render_crm_stage_panel(
+                "Onboarding status", group_onboarding, previous_onboarding_counts
+            )
+        with kpi_stage_row_3[1]:
             kpi_panel("Live status", group_4, previous_live_status_counts)
 
         # Compact activity consistency. Period-to-period trends now live on
@@ -5252,8 +5361,48 @@ try:
             return styles
 
         styled_log = display_df_page.style.apply(style_log_row, axis=1)
+
+        # Explicit pixel widths prevent a single long comment/remark from
+        # auto-expanding the full log. Long cell text is clipped within its
+        # column; the full, untruncated values remain in CSV/Excel exports.
+        log_column_widths = {
+            "S.No.": 62,
+            "Sale Date": 96,
+            "Customer Name": 150,
+            "Verifier Name": 112,
+            "Agent Remarks": 165,
+            "Quality Status": 128,
+            "Quality Remarks": 165,
+            "Inbound Status": 128,
+            "Inbound Remarks": 155,
+            "Status": 118,
+            "Welcome call Remarks": 155,
+            "LetterStatus": 135,
+            "Provisioning Status": 158,
+            "Provisioning Remarks": 160,
+            "CallStatus": 140,
+            "Portal Status": 145,
+            "Live Date": 96,
+            "Comments": 165,
+            "Voice of Customer": 165,
+            "Cancellation Reason": 180,
+        }
+        recent_log_column_config = {}
+        for column_index, column_tuple in enumerate(valid_layout):
+            column_name = column_tuple[1]
+            column_width = log_column_widths.get(column_name, 140)
+            if column_name == "S.No.":
+                recent_log_column_config[column_index] = st.column_config.NumberColumn(
+                    width=column_width, format="%d"
+                )
+            else:
+                recent_log_column_config[column_index] = st.column_config.TextColumn(
+                    width=column_width
+                )
+
         st.dataframe(
             styled_log,
+            column_config=recent_log_column_config,
             use_container_width=True,
             hide_index=True,
             height=545,
