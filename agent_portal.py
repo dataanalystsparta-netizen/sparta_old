@@ -3262,9 +3262,9 @@ try:
 
     if wc_col and "WC_Clean" in previous_welcome_kpi.columns:
         for label, status in [
-            ("WC Done", "Done"), ("WC Pending", "Pending"),
-            ("WC Paperwork", "Paperwork"), ("WC Cancelled", "Cancelled"),
-            ("WC Others", "Others"),
+            ("WC Done", "Done"), ("WC Followup", "Follow up"),
+            ("WC Pending", "Pending"), ("WC Paperwork", "Paperwork"),
+            ("WC Cancelled", "Cancelled"), ("WC Others", "Others"),
         ]:
             trend_previous_counts[label] = int((previous_welcome_kpi["WC_Clean"] == status).sum())
 
@@ -3289,6 +3289,7 @@ try:
     if wc_col:
         group_3 = [
             ("WC Done", len(welcome_kpi_filtered[welcome_kpi_filtered["WC_Clean"] == "Done"]), total_apps),
+            ("WC Followup", len(welcome_kpi_filtered[welcome_kpi_filtered["WC_Clean"] == "Follow up"]), total_apps),
             ("WC Pending", len(welcome_kpi_filtered[welcome_kpi_filtered["WC_Clean"] == "Pending"]), total_apps),
             ("WC Paperwork", len(welcome_kpi_filtered[welcome_kpi_filtered["WC_Clean"] == "Paperwork"]), total_apps),
             ("WC Cancelled", len(welcome_kpi_filtered[welcome_kpi_filtered["WC_Clean"] == "Cancelled"]), total_apps),
