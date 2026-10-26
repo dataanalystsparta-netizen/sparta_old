@@ -3212,14 +3212,6 @@ try:
     # records preserve the portal's historical Welcome KPI behaviour.
     welcome_kpi_filtered = crm_welcome_stage_eligible_apps(ag1_filtered)
 
-    # Live Status KPI: CRM rows must pass every preceding stage before their
-    # primary Onboarding status can be counted. Legacy rows keep the existing
-    # Welcome Done/Approved eligibility rule. Display text is never taken from
-    # Confirmation Status.
-    live_kpi_filtered = build_wc_done_live_kpi_rows(
-        ag1_filtered, ag2_filtered, wc_col
-    )
-
     # The trend shown on each main KPI card compares the selected date range
     # with the immediately preceding period of the same number of days.
     period_days = (end_date - start_date).days + 1
@@ -3243,15 +3235,9 @@ try:
         )
     previous_welcome_kpi = crm_welcome_stage_eligible_apps(previous_ag1)
 
-    previous_live_kpi = build_wc_done_live_kpi_rows(
-        previous_ag1, previous_ag2, wc_col
-    )
-    # Keep the existing Live KPI trend behaviour. The dedicated CRM Onboarding
-    # panel below adds stage-level detail without removing the original summary.
-    # The inbound/live KPI panels use raw source labels, so their trend
-    # comparisons must be keyed by those same exact labels.
+    # Inbound uses raw source labels for its period comparison. There is no
+    # separate Live Status KPI panel; Onboarding is shown in the sales-stage row.
     previous_inbound_status_counts = raw_status_counts(previous_ag1, "Inbound Status")
-    previous_live_status_counts = raw_status_counts(previous_live_kpi, "Live_KPI_Status")
 
     previous_provisioning_counts = crm_stage_status_counts(
         previous_ag1, previous_ag2, "Provisioning"
@@ -3316,15 +3302,6 @@ try:
     group_inbound = [
         (status_label, count, total_apps)
         for status_label, count in inbound_status_counts.items()
-    ]
-
-    # Preserve the original Live Status KPI (legacy + CRM) as well as adding
-    # the dedicated CRM-only Onboarding stage panel below.
-    live_status_counts = raw_status_counts(live_kpi_filtered, "Live_KPI_Status")
-    live_total_denominator = len(live_kpi_filtered)
-    group_4 = [
-        (status_label, count, live_total_denominator)
-        for status_label, count in live_status_counts.items()
     ]
 
     # Additional CRM-only stage panels. Each helper applies the exact sequence
@@ -3400,21 +3377,20 @@ try:
                 "Provisioning status", group_provisioning, previous_provisioning_counts
             )
 
-        kpi_stage_row_2 = st.columns(2, gap="small")
+        # Keep Letter, Confirmation and Onboarding aligned in one three-column row.
+        # There is intentionally no separate Live Status KPI panel; Onboarding
+        # provides the CRM's final-stage status counts.
+        kpi_stage_row_2 = st.columns(3, gap="small")
         with kpi_stage_row_2[0]:
             render_crm_stage_panel("Letter status", group_letter, previous_letter_counts)
         with kpi_stage_row_2[1]:
             render_crm_stage_panel(
                 "Confirmation status", group_confirmation, previous_confirmation_counts
             )
-
-        kpi_stage_row_3 = st.columns(2, gap="small")
-        with kpi_stage_row_3[0]:
+        with kpi_stage_row_2[2]:
             render_crm_stage_panel(
                 "Onboarding status", group_onboarding, previous_onboarding_counts
             )
-        with kpi_stage_row_3[1]:
-            kpi_panel("Live status", group_4, previous_live_status_counts)
 
         # Compact activity consistency. Period-to-period trends now live on
         # the main KPI cards, so repeated Performance Pulse comparison cards
