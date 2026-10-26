@@ -1940,7 +1940,8 @@ DOWNSTREAM_CATEGORY_ORDER = [
     "Unclassified / Review",
 ]
 # Fixed reporting categories remain available to monthly tables and log filters.
-# Main Live Status KPI cards deliberately display raw source status values.
+# Main Live Status KPI cards display raw source status values after the CRM
+# sequential eligibility gate. Legacy rows retain the historical WC Done rule.
 LIVE_KPI_STATUS_ORDER = list(DOWNSTREAM_CATEGORY_ORDER)
 
 
@@ -2223,59 +2224,277 @@ def raw_status_counts(frame, status_col):
     return dict(sorted(counts.items(), key=lambda item: item[0].casefold()))
 
 
-def build_wc_done_live_kpi_rows(apps_frame, portal_frame, welcome_status_col):
-    """Return downstream rows whose matching application is WC Done/Approved.
+def _crm_source_mask(frame):
+    """True for rows sourced from the CRM mirror, never for legacy rows."""
+    if frame is None or frame.empty or "Source" not in frame.columns:
+        return pd.Series(False, index=frame.index if isinstance(frame, pd.DataFrame) else [])
+    return frame["Source"].fillna("").astype(str).str.strip().eq("CRM Mirror")
 
-    Uses the same Sale Date + phone record key as the Recent Applications Log.
-    The KPI displays the raw primary Live/Onboarding status from the portal
-    (the CRM's ``Committed (Live) Status`` value) without reclassifying it or
-    falling back to Confirmation Status. Confirmation remains available in the
-    separate log and monthly CRM workflow table.
+
+def _crm_status_series(frame, column):
+    """Return a clean string series for one optional CRM status field."""
+    if frame is None or frame.empty:
+        return pd.Series(dtype="object")
+    if column not in frame.columns:
+        return pd.Series("", index=frame.index, dtype="object")
+    return frame[column].fillna("").astype(str).str.strip()
+
+
+# Explicit successful-stage values from the supplied CRM export. The CRM does
+# not label Provisioning with the literal word "Approved"; the two completion
+# values below are the recognised outcomes that unlock the Letter stage.
+CRM_PROVISIONING_SUCCESS_STATUSES = {
+    "connectivity committed",
+    "connectivity order provisioned",
+}
+
+
+def build_crm_stage_reconciliation(apps_frame, portal_frame):
+    """Build CRM-only per-record stage values and sequential eligibility flags.
+
+    Workflow gates:
+      Quality -> Welcome -> Provisioning -> Letter -> Confirmation -> Onboarding.
+    A record can be counted at a stage only when it passed every prior stage.
+    The status at a stage can be pending/rejected/etc.; it does not need to be
+    approved to be counted *at that stage*. It must be approved to unlock the
+    following stage. Inbound is deliberately independent of these gates.
+
+    Keys are regenerated from each source's own sale date + phone, so stale or
+    blank `_RecordKey` values cannot break the app-to-portal join.
+    """
+    if apps_frame is None or apps_frame.empty or "Source" not in apps_frame.columns:
+        return pd.DataFrame()
+
+    apps = apps_frame.loc[_crm_source_mask(apps_frame)].copy()
+    if apps.empty:
+        return pd.DataFrame()
+
+    # Resolve the date/phone columns from the normalized CRM application view.
+    if "Date_Parsed" not in apps.columns:
+        source_date = apps.get("Sale Date", pd.Series(index=apps.index, dtype=object))
+        apps["Date_Parsed"] = parse_api_date_series(source_date)
+    app_date_col = next(
+        (col for col in ("Standardized_Date", "Date_Parsed", "Sale Date") if col in apps.columns),
+        None,
+    )
+    app_phone_col = next(
+        (col for col in ("CLI", "Phone Number", "Telephone No.") if col in apps.columns),
+        None,
+    )
+    if app_date_col is None:
+        apps["_CRMKeyDate"] = pd.NaT
+        app_date_col = "_CRMKeyDate"
+    if app_phone_col is None:
+        apps["_CRMKeyPhone"] = ""
+        app_phone_col = "_CRMKeyPhone"
+    apps = add_record_keys(apps, app_date_col, app_phone_col)
+    apps["_RecordKey"] = apps["_RecordKey"].fillna("").astype(str).str.strip()
+    apps = apps[apps["_RecordKey"].ne("")].copy()
+    apps = apps.drop_duplicates(subset=["_RecordKey"], keep="last")
+    if apps.empty:
+        return pd.DataFrame()
+
+    if portal_frame is None or portal_frame.empty or "Source" not in portal_frame.columns:
+        portal = pd.DataFrame()
+    else:
+        portal = portal_frame.loc[_crm_source_mask(portal_frame)].copy()
+
+    portal_fields = [
+        ("Provisioning Status", "_CRM_ProvisioningStatus"),
+        ("LetterStatus", "_CRM_LetterStatus"),
+        ("CallStatus", "_CRM_ConfirmationStatus"),
+        ("Status", "_CRM_OnboardingStatus"),
+    ]
+    if not portal.empty:
+        if "Date_Parsed" not in portal.columns:
+            portal["Date_Parsed"] = parse_api_date_series(
+                portal.get("Sale Date", pd.Series(index=portal.index, dtype=object))
+            )
+        portal_date_col = next(
+            (col for col in ("Date_Parsed", "Sale Date", "Standardized_Date") if col in portal.columns),
+            None,
+        )
+        portal_phone_col = next(
+            (col for col in ("Telephone No.", "Phone Number", "CLI") if col in portal.columns),
+            None,
+        )
+        if portal_date_col is None:
+            portal["_CRMKeyDate"] = pd.NaT
+            portal_date_col = "_CRMKeyDate"
+        if portal_phone_col is None:
+            portal["_CRMKeyPhone"] = ""
+            portal_phone_col = "_CRMKeyPhone"
+        portal = add_record_keys(portal, portal_date_col, portal_phone_col)
+        portal["_RecordKey"] = portal["_RecordKey"].fillna("").astype(str).str.strip()
+        portal = portal[portal["_RecordKey"].ne("")].copy()
+        portal = portal.drop_duplicates(subset=["_RecordKey"], keep="last")
+        keep = ["_RecordKey"]
+        for raw_col, _target_col in portal_fields:
+            if raw_col not in portal.columns:
+                portal[raw_col] = ""
+            keep.append(raw_col)
+        portal = portal[keep].rename(columns=dict(portal_fields))
+    else:
+        portal = pd.DataFrame(columns=["_RecordKey"] + [target for _raw, target in portal_fields])
+
+    app_status_fields = {
+        "Quality Status": "_CRM_QualityStatus",
+        "Status": "_CRM_WelcomeStatus",
+        "Inbound Status": "_CRM_InboundStatus",
+    }
+    for raw_col in app_status_fields:
+        if raw_col not in apps.columns:
+            apps[raw_col] = ""
+    app_keep = ["_RecordKey", "Date_Parsed"] + list(app_status_fields)
+    app_keep = list(dict.fromkeys(col for col in app_keep if col in apps.columns))
+    apps = apps[app_keep].rename(columns=app_status_fields)
+
+    reconciled = apps.merge(portal, on="_RecordKey", how="left", validate="one_to_one")
+    for col in (
+        "_CRM_QualityStatus", "_CRM_WelcomeStatus", "_CRM_InboundStatus",
+        "_CRM_ProvisioningStatus", "_CRM_LetterStatus",
+        "_CRM_ConfirmationStatus", "_CRM_OnboardingStatus",
+    ):
+        if col not in reconciled.columns:
+            reconciled[col] = ""
+        reconciled[col] = reconciled[col].fillna("").astype(str).str.strip()
+
+    quality_key = reconciled["_CRM_QualityStatus"].apply(normalize_workflow_status)
+    welcome_key = reconciled["_CRM_WelcomeStatus"].apply(normalize_workflow_status)
+    provisioning_key = reconciled["_CRM_ProvisioningStatus"].apply(normalize_workflow_status)
+    letter_key = reconciled["_CRM_LetterStatus"].apply(normalize_workflow_status)
+    confirmation_key = reconciled["_CRM_ConfirmationStatus"].apply(normalize_workflow_status)
+
+    # The supplied CRM schema uses these exact approved values. Do not infer
+    # approval from remarks, cancellation reasons, or later-stage statuses.
+    reconciled["_CRM_QualityPassed"] = quality_key.eq("qa approved")
+    reconciled["_CRM_WelcomePassed"] = welcome_key.eq("welcome approved")
+    reconciled["_CRM_ProvisioningPassed"] = provisioning_key.isin(CRM_PROVISIONING_SUCCESS_STATUSES)
+    reconciled["_CRM_LetterPassed"] = letter_key.eq("dispatch approved")
+    reconciled["_CRM_ConfirmationPassed"] = confirmation_key.eq("confirmation approved")
+
+    reconciled["_Eligible_Quality"] = True
+    reconciled["_Eligible_Welcome"] = reconciled["_CRM_QualityPassed"]
+    reconciled["_Eligible_Provisioning"] = (
+        reconciled["_Eligible_Welcome"] & reconciled["_CRM_WelcomePassed"]
+    )
+    reconciled["_Eligible_Letter"] = (
+        reconciled["_Eligible_Provisioning"] & reconciled["_CRM_ProvisioningPassed"]
+    )
+    reconciled["_Eligible_Confirmation"] = (
+        reconciled["_Eligible_Letter"] & reconciled["_CRM_LetterPassed"]
+    )
+    reconciled["_Eligible_Onboarding"] = (
+        reconciled["_Eligible_Confirmation"] & reconciled["_CRM_ConfirmationPassed"]
+    )
+    return reconciled
+
+
+def crm_welcome_stage_eligible_apps(apps_frame):
+    """Filter CRM application rows to those allowed to enter Welcome.
+
+    Legacy application rows are returned unchanged; this gate applies only to
+    CRM records. The Inbound Status column never affects eligibility.
+    """
+    if apps_frame is None or apps_frame.empty or "Source" not in apps_frame.columns:
+        return apps_frame.copy() if isinstance(apps_frame, pd.DataFrame) else pd.DataFrame()
+    result = apps_frame.copy()
+    is_crm = _crm_source_mask(result)
+    quality = _crm_status_series(result, "Quality Status").apply(normalize_workflow_status)
+    passed_quality = quality.eq("qa approved")
+    return result.loc[(~is_crm) | passed_quality].copy()
+
+
+def build_wc_done_live_kpi_rows(apps_frame, portal_frame, welcome_status_col):
+    """Return raw Live/Onboarding statuses for records eligible to enter Onboarding.
+
+    CRM rows must pass Quality, Welcome, Provisioning, Letter and Confirmation
+    in sequence. Legacy rows retain their existing Welcome Done/Approved rule.
+    Displayed status text always comes from the primary Live/Onboarding field;
+    Confirmation Status is never used as a fallback value.
     """
     if (
         apps_frame is None or portal_frame is None
         or apps_frame.empty or portal_frame.empty
-        or not welcome_status_col or welcome_status_col not in apps_frame.columns
     ):
-        empty = portal_frame.iloc[0:0].copy() if portal_frame is not None else pd.DataFrame()
+        empty = portal_frame.iloc[0:0].copy() if isinstance(portal_frame, pd.DataFrame) else pd.DataFrame()
         empty["Live_KPI_Status"] = pd.Series(dtype="object")
         return empty
 
-    apps_done = apps_frame[apps_frame[welcome_status_col].apply(map_wc) == "Done"].copy()
-    if apps_done.empty:
-        empty = portal_frame.iloc[0:0].copy()
-        empty["Live_KPI_Status"] = pd.Series(dtype="object")
-        return empty
+    apps = apps_frame.copy()
+    if "Source" not in apps.columns:
+        apps["Source"] = ""
+    is_crm_apps = _crm_source_mask(apps)
 
-    if "Standardized_Date" not in apps_done.columns:
-        apps_done["Standardized_Date"] = apps_done.get("Date_Parsed", pd.NaT)
-    if "CLI" not in apps_done.columns:
-        apps_done["CLI"] = ""
-    apps_done = add_record_keys(apps_done, "Standardized_Date", "CLI")
-    wc_done_keys = {
-        str(key) for key in apps_done["_RecordKey"].tolist()
-        if key and str(key).strip()
-    }
-    if not wc_done_keys:
-        empty = portal_frame.iloc[0:0].copy()
-        empty["Live_KPI_Status"] = pd.Series(dtype="object")
-        return empty
+    # Legacy KPI eligibility stays exactly as before: Welcome must be Done.
+    legacy_apps = apps.loc[~is_crm_apps].copy()
+    if welcome_status_col and welcome_status_col in legacy_apps.columns:
+        legacy_apps = legacy_apps[
+            legacy_apps[welcome_status_col].apply(map_wc).eq("Done")
+        ].copy()
+    else:
+        legacy_apps = legacy_apps.iloc[0:0].copy()
+    legacy_date_col = next(
+        (col for col in ("Standardized_Date", "Date_Parsed", "Sale Date") if col in legacy_apps.columns),
+        None,
+    )
+    legacy_phone_col = next(
+        (col for col in ("CLI", "Phone Number", "Telephone No.") if col in legacy_apps.columns),
+        None,
+    )
+    if legacy_date_col is not None and legacy_phone_col is not None and not legacy_apps.empty:
+        legacy_apps = add_record_keys(legacy_apps, legacy_date_col, legacy_phone_col)
+        legacy_keys = {
+            str(key).strip() for key in legacy_apps["_RecordKey"].tolist()
+            if str(key).strip()
+        }
+    else:
+        legacy_keys = set()
+
+    # CRM Onboarding eligibility is calculated by the exact sequential gate.
+    crm_reconciled = build_crm_stage_reconciliation(apps, portal_frame)
+    if not crm_reconciled.empty:
+        eligible_crm_keys = set(
+            crm_reconciled.loc[crm_reconciled["_Eligible_Onboarding"], "_RecordKey"]
+            .fillna("").astype(str).str.strip()
+        )
+        eligible_crm_keys.discard("")
+    else:
+        eligible_crm_keys = set()
 
     portal = portal_frame.copy()
-    if "Sale Date" not in portal.columns:
-        portal["Sale Date"] = portal.get("Date_Parsed", pd.NaT)
-    if "Telephone No." not in portal.columns:
-        portal["Telephone No."] = ""
+    if "Source" not in portal.columns:
+        portal["Source"] = ""
+    if "Date_Parsed" not in portal.columns:
+        portal["Date_Parsed"] = parse_api_date_series(
+            portal.get("Sale Date", pd.Series(index=portal.index, dtype=object))
+        )
+    portal_date_col = next(
+        (col for col in ("Date_Parsed", "Sale Date", "Standardized_Date") if col in portal.columns),
+        None,
+    )
+    portal_phone_col = next(
+        (col for col in ("Telephone No.", "Phone Number", "CLI") if col in portal.columns),
+        None,
+    )
+    if portal_date_col is None:
+        portal["_LiveKeyDate"] = pd.NaT
+        portal_date_col = "_LiveKeyDate"
+    if portal_phone_col is None:
+        portal["_LiveKeyPhone"] = ""
+        portal_phone_col = "_LiveKeyPhone"
+    portal = add_record_keys(portal, portal_date_col, portal_phone_col)
+    portal["_RecordKey"] = portal["_RecordKey"].fillna("").astype(str).str.strip()
+
+    is_crm_portal = _crm_source_mask(portal)
+    eligible = (
+        is_crm_portal & portal["_RecordKey"].isin(eligible_crm_keys)
+    ) | (
+        ~is_crm_portal & portal["_RecordKey"].isin(legacy_keys)
+    )
+    portal = portal.loc[eligible].copy()
     if "Status" not in portal.columns:
         portal["Status"] = ""
-    if "CallStatus" not in portal.columns:
-        portal["CallStatus"] = ""
-
-    portal = add_record_keys(portal, "Sale Date", "Telephone No.")
-    portal = portal[portal["_RecordKey"].astype(str).isin(wc_done_keys)].copy()
-    # Count only the actual status stored in the CRM/Sparta2 primary status
-    # field. Do not substitute the Confirmation Status (CallStatus) when this
-    # field is blank, and do not replace the displayed value with a classifier.
     portal["Live_KPI_Status"] = portal["Status"].fillna("").astype(str).str.strip()
     return portal
 
@@ -2493,11 +2712,11 @@ def _monthly_table_is_holiday(day_value):
 
 
 def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=None):
-    """Build monthly and daily CRM-only summaries for one already-filtered agent.
+    """Build monthly/daily CRM summaries with sequential stage eligibility.
 
-    Returns (monthly_summary, daily_summary). The daily summary includes every
-    date within each represented CRM month, including zero-sales working days,
-    so each month can be expanded in the interactive table.
+    Applications and attendance remain full CRM totals. Status columns count a
+    raw stage value only when the application was eligible to enter that stage.
+    Inbound is reported independently and never suppresses sales-stage counts.
     """
     as_of = as_of or datetime.date.today()
     as_of_date = as_of.date() if isinstance(as_of, datetime.datetime) else as_of
@@ -2505,106 +2724,67 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
     base_columns = ["Month", "Total Attendance", "SPD", "Applications"]
     daily_base_columns = ["Date", "Attendance", "SPD", "Applications"]
     status_specs = [
-        ("Inbound", "_InboundStatus"),
-        ("Quality", "_QualityStatus"),
-        ("Welcome", "_WelcomeStatus"),
-        ("Committed", "_ConfirmationStatus"),
-        ("Onboarding", "_OnboardingStatus"),
+        ("Inbound", "_CRM_InboundStatus", "_Count_Inbound"),
+        ("Quality", "_CRM_QualityStatus", "_Count_Quality"),
+        ("Welcome", "_CRM_WelcomeStatus", "_Count_Welcome"),
+        ("Provisioning", "_CRM_ProvisioningStatus", "_Count_Provisioning"),
+        ("Letter", "_CRM_LetterStatus", "_Count_Letter"),
+        ("Confirmation", "_CRM_ConfirmationStatus", "_Count_Confirmation"),
+        ("Onboarding", "_CRM_OnboardingStatus", "_Count_Onboarding"),
     ]
     empty_monthly = pd.DataFrame(columns=base_columns)
     empty_daily = pd.DataFrame(columns=daily_base_columns)
-    if apps_frame is None or apps_frame.empty or "Source" not in apps_frame.columns:
+
+    monthly_data = build_crm_stage_reconciliation(apps_frame, portal_frame)
+    if monthly_data.empty:
         return empty_monthly, empty_daily
 
-    # This report deliberately uses only rows whose source is the CRM mirror.
-    crm_apps = apps_frame[
-        apps_frame["Source"].fillna("").astype(str).str.strip().eq("CRM Mirror")
+    monthly_data["Date_Parsed"] = pd.to_datetime(monthly_data["Date_Parsed"], errors="coerce")
+    monthly_data = monthly_data[
+        monthly_data["Date_Parsed"].notna()
+        & (monthly_data["Date_Parsed"].dt.date >= CRM_SOURCE_START.date())
+        & (monthly_data["Date_Parsed"].dt.date <= as_of_date)
     ].copy()
-    if crm_apps.empty:
+    if monthly_data.empty:
         return empty_monthly, empty_daily
 
-    if "Date_Parsed" not in crm_apps.columns:
-        crm_apps["Date_Parsed"] = parse_date_series(
-            crm_apps.get("Sale Date", pd.Series(index=crm_apps.index, dtype=object))
-        )
-    crm_apps["Date_Parsed"] = pd.to_datetime(crm_apps["Date_Parsed"], errors="coerce")
-    crm_apps = crm_apps[
-        crm_apps["Date_Parsed"].notna()
-        & (crm_apps["Date_Parsed"].dt.date >= CRM_SOURCE_START.date())
-        & (crm_apps["Date_Parsed"].dt.date <= as_of_date)
-    ].copy()
-    if crm_apps.empty:
-        return empty_monthly, empty_daily
-
-    if "_RecordKey" not in crm_apps.columns:
-        crm_apps = add_record_keys(crm_apps, "Standardized_Date", "CLI")
-    crm_apps["_RecordKey"] = crm_apps["_RecordKey"].fillna("").astype(str).str.strip()
-    crm_apps = crm_apps[crm_apps["_RecordKey"].ne("")].copy()
-    crm_apps = crm_apps.drop_duplicates(subset=["_RecordKey"], keep="last")
-    if crm_apps.empty:
-        return empty_monthly, empty_daily
-
-    for col in ("Inbound Status", "Quality Status", "Status"):
-        if col not in crm_apps.columns:
-            crm_apps[col] = ""
-    crm_apps = crm_apps.rename(columns={
-        "Inbound Status": "_InboundStatus",
-        "Quality Status": "_QualityStatus",
-        "Status": "_WelcomeStatus",
-    })
-    crm_apps = crm_apps[[
-        "_RecordKey", "Date_Parsed", "_InboundStatus", "_QualityStatus", "_WelcomeStatus"
-    ]]
-
-    portal_statuses = pd.DataFrame(
-        columns=["_RecordKey", "_OnboardingStatus", "_ConfirmationStatus"]
-    )
-    if portal_frame is not None and not portal_frame.empty and "Source" in portal_frame.columns:
-        crm_portal = portal_frame[
-            portal_frame["Source"].fillna("").astype(str).str.strip().eq("CRM Mirror")
-        ].copy()
-        if "_RecordKey" not in crm_portal.columns:
-            crm_portal = add_record_keys(crm_portal, "Sale Date", "Telephone No.")
-        crm_portal["_RecordKey"] = crm_portal["_RecordKey"].fillna("").astype(str).str.strip()
-        crm_portal = crm_portal[crm_portal["_RecordKey"].ne("")].copy()
-        for col in ("Status", "CallStatus"):
-            if col not in crm_portal.columns:
-                crm_portal[col] = ""
-        portal_statuses = crm_portal[["_RecordKey", "Status", "CallStatus"]].rename(columns={
-            "Status": "_OnboardingStatus",
-            "CallStatus": "_ConfirmationStatus",
-        }).drop_duplicates(subset=["_RecordKey"], keep="last")
-
-    monthly_data = crm_apps.merge(
-        portal_statuses,
-        on="_RecordKey",
-        how="left",
-        validate="one_to_one",
-    )
+    monthly_data = monthly_data.drop_duplicates(subset=["_RecordKey"], keep="last").copy()
     monthly_data["_Month"] = monthly_data["Date_Parsed"].dt.to_period("M")
     monthly_data["_SaleDay"] = monthly_data["Date_Parsed"].dt.date
 
-    # Inbound is the highest-priority workflow classification for the monthly
-    # CRM performance table. If Inbound Status is populated, count that record
-    # only under Inbound and suppress all other stage status counts for it.
-    monthly_data["_InboundStatus"] = monthly_data["_InboundStatus"].fillna("").astype(str).str.strip()
-    has_inbound_status = monthly_data["_InboundStatus"].apply(normalize_workflow_status).ne("")
-    for suppressed_status_col in (
-        "_QualityStatus", "_WelcomeStatus", "_ConfirmationStatus", "_OnboardingStatus"
-    ):
-        if suppressed_status_col in monthly_data.columns:
-            monthly_data.loc[has_inbound_status, suppressed_status_col] = ""
+    # Start with the actual values recorded at each CRM stage. Apply gates only
+    # to the countable value for that stage; raw values remain available above
+    # for consistent column labels and the Recent Applications Log stays raw.
+    monthly_data["_Count_Inbound"] = monthly_data["_CRM_InboundStatus"]
+    monthly_data["_Count_Quality"] = monthly_data["_CRM_QualityStatus"]
+    monthly_data["_Count_Welcome"] = monthly_data["_CRM_WelcomeStatus"].where(
+        monthly_data["_Eligible_Welcome"], ""
+    )
+    monthly_data["_Count_Provisioning"] = monthly_data["_CRM_ProvisioningStatus"].where(
+        monthly_data["_Eligible_Provisioning"], ""
+    )
+    monthly_data["_Count_Letter"] = monthly_data["_CRM_LetterStatus"].where(
+        monthly_data["_Eligible_Letter"], ""
+    )
+    monthly_data["_Count_Confirmation"] = monthly_data["_CRM_ConfirmationStatus"].where(
+        monthly_data["_Eligible_Confirmation"], ""
+    )
+    monthly_data["_Count_Onboarding"] = monthly_data["_CRM_OnboardingStatus"].where(
+        monthly_data["_Eligible_Onboarding"], ""
+    )
 
+    # Header labels include values found in the source, even if all rows with a
+    # particular value are currently blocked by an earlier stage. Their counts
+    # will correctly remain zero until a record is eligible to reach that stage.
     status_labels = {}
-    for group_name, source_col in status_specs:
-        if source_col not in monthly_data.columns:
-            monthly_data[source_col] = ""
+    count_key_columns = {}
+    for group_name, label_source, count_source in status_specs:
         key_col = f"_StatusKey_{group_name}"
-        monthly_data[key_col] = monthly_data[source_col].apply(normalize_workflow_status)
+        count_key_columns[group_name] = key_col
+        monthly_data[key_col] = monthly_data[count_source].apply(normalize_workflow_status)
         labels_for_group = {}
-        for raw_value, normalized_key in zip(
-            monthly_data[source_col].tolist(), monthly_data[key_col].tolist()
-        ):
+        for raw_value in monthly_data[label_source].tolist():
+            normalized_key = normalize_workflow_status(raw_value)
             if not normalized_key:
                 continue
             label = re.sub(r"\s+", " ", clean_reason_text(raw_value)).strip()
@@ -2648,10 +2828,7 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
             attendance["Attendance_Code"].apply(monthly_attendance_code)
         ))
 
-    # Attendance units are counted only on scheduled working days. Leave and
-    # absence both contribute zero; a half-day contributes 0.5.
     attendance_units = {"P": 1.0, "HD": 0.5, "Ab": 0.0, "UL": 0.0}
-
     rows = []
     daily_rows = []
     months = sorted(monthly_data["_Month"].dropna().unique())
@@ -2679,21 +2856,18 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
             "SPD": f"{application_count / present_units:.2f}" if present_units > 0 else "—",
             "Applications": application_count,
         }
-        for group_name, _source_col in status_specs:
-            key_col = f"_StatusKey_{group_name}"
+        for group_name, _label_source, _count_source in status_specs:
+            key_col = count_key_columns[group_name]
             month_counts = month_apps[key_col].value_counts().to_dict()
             for normalized_key, display_label in status_labels[group_name].items():
                 row[f"{group_name} · {display_label}"] = int(month_counts.get(normalized_key, 0))
         rows.append(row)
 
-        # Daily rows are created for every date in the month window, including
-        # dates with no sales. Holiday dates remain visible but have no working
-        # day denominator; fifth Saturdays are working days under the revised rule.
+        # Daily rows show the same stage-gated counts as the month summary.
         for sale_day in all_dates:
             day_apps = month_apps[month_apps["_SaleDay"] == sale_day]
             day_is_holiday = _monthly_table_is_holiday(sale_day)
             day_present_units = attendance_units.get(attendance_by_date.get(sale_day, ""), 0.0)
-            day_working_denominator = 0 if day_is_holiday else 1
             app_count = int(len(day_apps))
             daily_row = {
                 "Date": sale_day.strftime("%a, %d %b"),
@@ -2702,8 +2876,8 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
                 "SPD": f"{app_count / day_present_units:.2f}" if day_present_units > 0 else "—",
                 "Applications": app_count,
             }
-            for group_name, _source_col in status_specs:
-                key_col = f"_StatusKey_{group_name}"
+            for group_name, _label_source, _count_source in status_specs:
+                key_col = count_key_columns[group_name]
                 day_counts = day_apps[key_col].value_counts().to_dict()
                 for normalized_key, display_label in status_labels[group_name].items():
                     daily_row[f"{group_name} · {display_label}"] = int(day_counts.get(normalized_key, 0))
@@ -2713,7 +2887,7 @@ def build_crm_monthly_summary(apps_frame, portal_frame, attendance_frame, as_of=
         return empty_monthly, empty_daily
 
     dynamic_columns = []
-    for group_name, _source_col in status_specs:
+    for group_name, _label_source, _count_source in status_specs:
         dynamic_columns.extend(
             f"{group_name} · {label}"
             for label in status_labels[group_name].values()
@@ -2993,10 +3167,14 @@ try:
             ), axis=1
         )
 
-    # The Live Status KPI counts only downstream records whose corresponding
-    # application is Welcome Done/Approved. Eligibility is separate from the
-    # central downstream classification; the broader frame remains intact for
-    # the log, insights, and daily/monthly breakdowns.
+    # CRM Welcome counts are restricted to records that passed Quality. Legacy
+    # records preserve the portal's historical Welcome KPI behaviour.
+    welcome_kpi_filtered = crm_welcome_stage_eligible_apps(ag1_filtered)
+
+    # Live Status KPI: CRM rows must pass every preceding stage before their
+    # primary Onboarding status can be counted. Legacy rows keep the existing
+    # Welcome Done/Approved eligibility rule. Display text is never taken from
+    # Confirmation Status.
     live_kpi_filtered = build_wc_done_live_kpi_rows(
         ag1_filtered, ag2_filtered, wc_col
     )
@@ -3022,6 +3200,7 @@ try:
                 row.get(wc_col, ""), row.get("Quality Status", "")
             ), axis=1
         )
+    previous_welcome_kpi = crm_welcome_stage_eligible_apps(previous_ag1)
 
     previous_live_kpi = build_wc_done_live_kpi_rows(
         previous_ag1, previous_ag2, wc_col
@@ -3039,13 +3218,13 @@ try:
     ]:
         trend_previous_counts[label] = int((previous_ag1["Q_Status"] == status).sum())
 
-    if wc_col and "WC_Clean" in previous_ag1.columns:
+    if wc_col and "WC_Clean" in previous_welcome_kpi.columns:
         for label, status in [
             ("WC Done", "Done"), ("WC Pending", "Pending"),
             ("WC Paperwork", "Paperwork"), ("WC Cancelled", "Cancelled"),
             ("WC Others", "Others"),
         ]:
-            trend_previous_counts[label] = int((previous_ag1["WC_Clean"] == status).sum())
+            trend_previous_counts[label] = int((previous_welcome_kpi["WC_Clean"] == status).sum())
 
     # ------------------------------------------------------------------------
     # KPI ROW
@@ -3066,11 +3245,11 @@ try:
     group_3 = []
     if wc_col:
         group_3 = [
-            ("WC Done", len(ag1_filtered[ag1_filtered["WC_Clean"] == "Done"]), total_apps),
-            ("WC Pending", len(ag1_filtered[ag1_filtered["WC_Clean"] == "Pending"]), total_apps),
-            ("WC Paperwork", len(ag1_filtered[ag1_filtered["WC_Clean"] == "Paperwork"]), total_apps),
-            ("WC Cancelled", len(ag1_filtered[ag1_filtered["WC_Clean"] == "Cancelled"]), total_apps),
-            ("WC Others", len(ag1_filtered[ag1_filtered["WC_Clean"] == "Others"]), total_apps),
+            ("WC Done", len(welcome_kpi_filtered[welcome_kpi_filtered["WC_Clean"] == "Done"]), total_apps),
+            ("WC Pending", len(welcome_kpi_filtered[welcome_kpi_filtered["WC_Clean"] == "Pending"]), total_apps),
+            ("WC Paperwork", len(welcome_kpi_filtered[welcome_kpi_filtered["WC_Clean"] == "Paperwork"]), total_apps),
+            ("WC Cancelled", len(welcome_kpi_filtered[welcome_kpi_filtered["WC_Clean"] == "Cancelled"]), total_apps),
+            ("WC Others", len(welcome_kpi_filtered[welcome_kpi_filtered["WC_Clean"] == "Others"]), total_apps),
         ]
 
     # Inbound KPI cards count populated CRM Inbound Status values exactly as
@@ -3492,16 +3671,41 @@ try:
             flags_html += '<div class="insight-card" style="border-color:#3B82F6"><p class="insight-title">Quality</p><p class="insight-phrase">Frequent Reworks</p><p class="insight-comment">Pay closer attention to quality guidelines, to avoid large number of Quality Reworks.</p></div>'
 
         if wc_col:
-            wc_done = len(ag1_filtered[ag1_filtered["WC_Clean"] == "Done"]) / total_apps
-            wc_can = len(ag1_filtered[ag1_filtered["WC_Clean"] == "Cancelled"]) / total_apps
+            wc_done = len(welcome_kpi_filtered[welcome_kpi_filtered["WC_Clean"] == "Done"]) / total_apps
+            wc_can = len(welcome_kpi_filtered[welcome_kpi_filtered["WC_Clean"] == "Cancelled"]) / total_apps
             if wc_done < 0.70:
                 flags_html += '<div class="insight-card" style="border-color:#F59E0B"><p class="insight-title">Welcome Call</p><p class="insight-phrase">Low Completion</p><p class="insight-comment">Address customer requirements closely to increase Welcome call approvals!</p></div>'
             if wc_can > 0.15:
                 flags_html += '<div class="insight-card" style="border-color:#EF4444"><p class="insight-title">Welcome Call</p><p class="insight-phrase">High WC Cancellation</p><p class="insight-comment">Address customer doubts in the sales call to avoid Welcome call cancellations!</p></div>'
 
     if total_ag2 > 0:
-        l_live = len(ag2_filtered[ag2_filtered["Downstream_Category"] == "Live"]) / total_ag2
-        l_can = len(ag2_filtered[ag2_filtered["Downstream_Category"].isin(["Committed Cancelled", "Live Cancelled"])]) / total_ag2
+        # For CRM-only rows, downstream Live insights must not treat a status as
+        # valid unless the full preceding workflow allows the application to
+        # reach Onboarding. Legacy rows retain their original classification.
+        insight_portal = ag2_filtered.copy()
+        crm_reconciled_for_insight = build_crm_stage_reconciliation(ag1_filtered, ag2_filtered)
+        if not crm_reconciled_for_insight.empty:
+            eligible_crm_onboarding_keys = set(
+                crm_reconciled_for_insight.loc[
+                    crm_reconciled_for_insight["_Eligible_Onboarding"], "_RecordKey"
+                ].fillna("").astype(str).str.strip()
+            )
+            eligible_crm_onboarding_keys.discard("")
+            insight_date_col = next(
+                (col for col in ("Date_Parsed", "Sale Date", "Standardized_Date") if col in insight_portal.columns),
+                None,
+            )
+            insight_phone_col = next(
+                (col for col in ("Telephone No.", "Phone Number", "CLI") if col in insight_portal.columns),
+                None,
+            )
+            if insight_date_col and insight_phone_col:
+                insight_portal = add_record_keys(insight_portal, insight_date_col, insight_phone_col)
+                insight_is_crm = _crm_source_mask(insight_portal)
+                blocked_crm = insight_is_crm & ~insight_portal["_RecordKey"].fillna("").astype(str).str.strip().isin(eligible_crm_onboarding_keys)
+                insight_portal.loc[blocked_crm, "Downstream_Category"] = "Unclassified / Review"
+        l_live = len(insight_portal[insight_portal["Downstream_Category"] == "Live"]) / total_ag2
+        l_can = len(insight_portal[insight_portal["Downstream_Category"].isin(["Committed Cancelled", "Live Cancelled"])]) / total_ag2
         if l_live > 0.20:
             flags_html += '<div class="insight-card" style="border-color:#10B981"><p class="insight-title">Live Stage</p><p class="insight-phrase">Strong Conversion</p><p class="insight-comment">Good live rate! Great overall quality of applications!</p></div>'
         elif l_live < 0.20:
@@ -4073,14 +4277,17 @@ try:
     render_section(
         "Monthly CRM performance",
         "▦",
-        "CRM mirror only · status counts show raw workflow values",
+        "CRM mirror only · raw status values counted after prior-stage approval gates",
     )
     st.caption(
         "This table is agent-specific and independent of the main date filter. "
         "September starts at the CRM cutover (18 Sep 2026); the current month is month-to-date. "
-        "If Inbound Status is populated, that record is counted only under Inbound and excluded from other stage status counts. "
+        "Inbound is an independent process: Inbound Status is counted separately and never suppresses sales-stage counts. "
+        "Sales-stage counts follow the approval gates: Quality → Welcome → Provisioning → Letter → Confirmation → Onboarding. "
+        "Welcome counts only after QA-Approved; Provisioning only after Welcome Approved; Letter only after a recognised successful Provisioning status "
+        "(Connectivity: Committed or Connectivity: Order Provisioned); Confirmation only after Dispatch Approved; and Onboarding only after Confirmation Approved. "
         "Monthly Total Attendance = summed attendance units on scheduled working days (P=1, HD=0.5, Ab/UL=0). "
-        "Expanded daily rows show the attendance code (P, Ab, HD or UL). SPD = CRM applications ÷ total attendance. "
+        "Expanded daily rows use the same gates. SPD = all CRM applications ÷ total attendance. "
         "Sundays and 1st/3rd Saturdays are excluded from monthly attendance totals."
     )
     monthly_crm_summary, daily_crm_summary = build_crm_monthly_summary(
@@ -4092,7 +4299,7 @@ try:
         # Compact two-level headers: workflow groups on the first row and
         # individual status names on the second row. Native Streamlit controls
         # above the table toggle each month's daily rows without iframe overlap.
-        workflow_groups = ["Inbound", "Quality", "Welcome", "Committed", "Onboarding"]
+        workflow_groups = ["Inbound", "Quality", "Welcome", "Provisioning", "Letter", "Confirmation", "Onboarding"]
 
         def compact_status_header(group_name, label):
             text = str(label).strip()
@@ -4100,7 +4307,9 @@ try:
                 "Inbound": r"^Inbound[-\s]+",
                 "Quality": r"^QA[-\s]+",
                 "Welcome": r"^(?:Welcome|WC)[-\s]+",
-                "Committed": r"^(?:Confirmation|Committed)[-\s]+",
+                "Provisioning": r"^Connectivity[:\s-]+",
+                "Letter": r"^Dispatch[-\s]+",
+                "Confirmation": r"^Confirmation[-\s]+",
                 "Onboarding": r"^Onboarding[-\s]+",
             }
             pattern = prefixes.get(group_name)
@@ -4123,7 +4332,9 @@ try:
             "Inbound": "#475569",
             "Quality": "#1D4ED8",
             "Welcome": "#0F766E",
-            "Committed": "#6D28D9",
+            "Provisioning": "#6D28D9",
+            "Letter": "#C2410C",
+            "Confirmation": "#BE185D",
             "Onboarding": "#92400E",
         }
 
@@ -4149,7 +4360,7 @@ try:
 
             # Waiting / work-in-progress / follow-up states.
             if (
-                tokens.intersection({"pending", "rework"})
+                tokens.intersection({"pending", "rework", "delayed", "delay", "extended", "hold"})
                 or "followup" in compact
                 or "portpending" in compact
                 or "reworkrequired" in compact
@@ -4157,9 +4368,13 @@ try:
                 return "yellow"
 
             # Positive outcomes across both sources.
-            if tokens.intersection({"approved", "done", "satisfied", "live"}) or compact in {
-                "rs/satisfied", "rp/satisfied", "rssatisfied", "rpsatisfied"
-            }:
+            if (
+                tokens.intersection({"approved", "done", "satisfied", "live"})
+                or compact in {
+                    "rs/satisfied", "rp/satisfied", "rssatisfied", "rpsatisfied",
+                    "committed", "orderprovisioned",
+                }
+            ):
                 return "green"
             return "neutral"
 
