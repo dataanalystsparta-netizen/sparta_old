@@ -3288,11 +3288,6 @@ with sparta_tv_tab:
                     st.markdown(f"**STEP {number} · {heading}**")
                     st.caption(copy)
 
-        st.info(
-            "Sample Sparta TV page: replace the examples with approved product information, "
-            "channel line-up, prices, terms and sales materials before quoting to customers."
-        )
-
 
 with channel_list_tab:
     st.markdown("## 📡 Channel List")
