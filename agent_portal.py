@@ -3143,7 +3143,7 @@ with hero_right:
 # The Sparta TV page is rendered first so dashboard st.stop()/errors cannot
 # prevent it from being available.
 # ----------------------------------------------------------------------------
-dashboard_tab, sparta_tv_tab = st.tabs(["📊 My Dashboard", "📺 Sparta TV"])
+dashboard_tab, sparta_tv_tab, channel_list_tab = st.tabs(["📊 My Dashboard", "📺 Sparta TV", "📡 Channel List"])
 
 with sparta_tv_tab:
         st.html(
@@ -3251,6 +3251,203 @@ with sparta_tv_tab:
             "Sample Sparta TV page: replace the examples with approved product information, "
             "channel line-up, prices, terms and sales materials before quoting to customers."
         )
+
+
+with channel_list_tab:
+    st.markdown("## 📡 Channel List")
+    st.caption(
+        "Browse the TV channels currently on offer. Search by channel name, "
+        "filter by channel attributes, sort the results or group the list."
+    )
+
+    # The workbook is kept in the same repository as the Streamlit app. Check
+    # both the script folder and the current working directory to support the
+    # common Streamlit Cloud repository layouts.
+    app_folder = os.path.dirname(os.path.abspath(__file__))
+    tv_file_candidates = [
+        os.path.join(app_folder, "tv.xlsx"),
+        os.path.join(os.getcwd(), "tv.xlsx"),
+    ]
+    tv_file_path = next(
+        (candidate for candidate in tv_file_candidates if os.path.isfile(candidate)),
+        tv_file_candidates[0],
+    )
+
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _load_sparta_tv_channels(file_path, file_modified):
+        """Load and validate the repository's tv.xlsx workbook."""
+        channel_frame = pd.read_excel(file_path, dtype=str, engine="openpyxl")
+        channel_frame.columns = [str(column).strip() for column in channel_frame.columns]
+
+        required_columns = ["Channel", "Quality", "Genre", "Owner"]
+        actual_by_normalized_name = {
+            str(column).strip().casefold(): column for column in channel_frame.columns
+        }
+        missing_columns = [
+            column for column in required_columns
+            if column.casefold() not in actual_by_normalized_name
+        ]
+        if missing_columns:
+            raise ValueError(
+                "The workbook is missing these required columns: "
+                + ", ".join(missing_columns)
+            )
+
+        rename_map = {
+            actual_by_normalized_name[column.casefold()]: column
+            for column in required_columns
+        }
+        channel_frame = channel_frame.rename(columns=rename_map)[required_columns].copy()
+
+        for column in required_columns:
+            channel_frame[column] = (
+                channel_frame[column]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .replace({"nan": "", "None": "", "NaT": ""})
+            )
+
+        # A row without a channel name is not a usable channel entry.
+        channel_frame = channel_frame[channel_frame["Channel"] != ""].reset_index(drop=True)
+        return channel_frame
+
+    if not os.path.isfile(tv_file_path):
+        st.error("I couldn't find **tv.xlsx** in the app repository.")
+        st.markdown(
+            "Place `tv.xlsx` in the same folder as the Streamlit app's main file "
+            "(or in the repository root), then commit and push it alongside the app."
+        )
+        st.caption(f"Checked: {', '.join(tv_file_candidates)}")
+    else:
+        try:
+            tv_file_mtime = os.path.getmtime(tv_file_path)
+            with st.spinner("Loading channel list…"):
+                channels_df = _load_sparta_tv_channels(tv_file_path, tv_file_mtime)
+
+            if channels_df.empty:
+                st.warning("The workbook loaded, but it does not contain any channel rows.")
+            else:
+                # Search, sorting and grouping controls.
+                search_col, group_col, sort_col, direction_col = st.columns(
+                    [2.15, 1.05, 1.05, 0.9], gap="medium"
+                )
+                with search_col:
+                    channel_search = st.text_input(
+                        "Search channel",
+                        placeholder="Type a channel name…",
+                        key="tv_channel_search",
+                    )
+                with group_col:
+                    group_by = st.selectbox(
+                        "Group by",
+                        ["None", "Genre", "Quality", "Owner"],
+                        index=0,
+                        key="tv_channel_group_by",
+                    )
+                with sort_col:
+                    sort_by = st.selectbox(
+                        "Sort by",
+                        ["Channel", "Genre", "Quality", "Owner"],
+                        index=0,
+                        key="tv_channel_sort_by",
+                    )
+                with direction_col:
+                    sort_direction = st.selectbox(
+                        "Order",
+                        ["A–Z", "Z–A"],
+                        index=0,
+                        key="tv_channel_sort_direction",
+                    )
+
+                filter_cols = st.columns(3, gap="medium")
+                filter_selections = {}
+                for col, field in zip(filter_cols, ["Genre", "Quality", "Owner"]):
+                    available_values = sorted(
+                        (
+                            value for value in channels_df[field].dropna().unique().tolist()
+                            if str(value).strip()
+                        ),
+                        key=lambda value: str(value).casefold(),
+                    )
+                    with col:
+                        filter_selections[field] = st.multiselect(
+                            f"Filter by {field.lower()}",
+                            options=available_values,
+                            default=available_values,
+                            key=f"tv_channel_filter_{field.lower()}",
+                        )
+
+                filtered_channels = channels_df.copy()
+                if channel_search.strip():
+                    filtered_channels = filtered_channels[
+                        filtered_channels["Channel"].str.contains(
+                            channel_search.strip(), case=False, regex=False, na=False
+                        )
+                    ]
+                for field, selected_values in filter_selections.items():
+                    filtered_channels = filtered_channels[
+                        filtered_channels[field].isin(selected_values)
+                    ]
+
+                filtered_channels = filtered_channels.sort_values(
+                    by=sort_by,
+                    ascending=(sort_direction == "A–Z"),
+                    key=lambda values: values.astype(str).str.casefold(),
+                    kind="mergesort",
+                ).reset_index(drop=True)
+
+                st.divider()
+                metric_cols = st.columns(4, gap="small")
+                metric_values = [
+                    ("CHANNELS SHOWN", f"{len(filtered_channels):,}"),
+                    ("GENRES", f"{filtered_channels['Genre'].replace('', pd.NA).nunique():,}"),
+                    ("QUALITIES", f"{filtered_channels['Quality'].replace('', pd.NA).nunique():,}"),
+                    ("OWNERS", f"{filtered_channels['Owner'].replace('', pd.NA).nunique():,}"),
+                ]
+                for metric_col, (label, value) in zip(metric_cols, metric_values):
+                    with metric_col:
+                        st.metric(label, value)
+
+                st.caption(
+                    f"Showing {len(filtered_channels):,} of {len(channels_df):,} channels · "
+                    "Click a column heading in the table to sort it further."
+                )
+
+                display_columns = ["Channel", "Quality", "Genre", "Owner"]
+                if filtered_channels.empty:
+                    st.info("No channels match the current search and filters.")
+                elif group_by == "None":
+                    st.dataframe(
+                        filtered_channels[display_columns],
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(680, max(180, 38 * len(filtered_channels) + 42)),
+                    )
+                else:
+                    grouped_channels = filtered_channels.groupby(
+                        group_by, dropna=False, sort=True
+                    )
+                    for group_value, group_frame in grouped_channels:
+                        group_label = str(group_value).strip() or "Not specified"
+                        with st.expander(
+                            f"{group_label}  ·  {len(group_frame):,} channels",
+                            expanded=False,
+                        ):
+                            st.dataframe(
+                                group_frame[display_columns],
+                                use_container_width=True,
+                                hide_index=True,
+                                height=min(520, max(120, 38 * len(group_frame) + 42)),
+                            )
+
+                st.caption("Source: tv.xlsx · The list refreshes automatically at least every 5 minutes.")
+        except Exception as exc:
+            st.error(f"Unable to load the channel list from tv.xlsx: {exc}")
+            st.info(
+                "Please check that the workbook is a valid .xlsx file and contains "
+                "the columns Channel, Quality, Genre and Owner."
+            )
 
 with dashboard_tab:
     if dashboard_load_error:
