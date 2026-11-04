@@ -3276,7 +3276,16 @@ with channel_list_tab:
     @st.cache_data(ttl=300, show_spinner=False)
     def _load_sparta_tv_channels(file_path, file_modified):
         """Load and validate the repository's tv.xlsx workbook."""
-        channel_frame = pd.read_excel(file_path, dtype=str, engine="openpyxl")
+        # IMPORTANT: pandas treats the literal text "NA" as a missing value by
+        # default. Some offered channels intentionally have Quality = "NA", so
+        # disable automatic NA-token parsing to preserve those rows and values.
+        channel_frame = pd.read_excel(
+            file_path,
+            dtype=str,
+            engine="openpyxl",
+            keep_default_na=False,
+            na_filter=False,
+        )
         channel_frame.columns = [str(column).strip() for column in channel_frame.columns]
 
         required_columns = ["Channel", "Quality", "Genre", "Owner"]
@@ -3308,7 +3317,12 @@ with channel_list_tab:
                 .replace({"nan": "", "None": "", "NaT": ""})
             )
 
+        # Treat blank Quality cells as "NA" for display/filtering. The literal
+        # "NA" text from Excel is preserved by keep_default_na=False above.
+        channel_frame.loc[channel_frame["Quality"].str.strip() == "", "Quality"] = "NA"
+
         # A row without a channel name is not a usable channel entry.
+        # Rows with Quality = "NA" are valid and must never be dropped.
         channel_frame = channel_frame[channel_frame["Channel"] != ""].reset_index(drop=True)
         return channel_frame
 
