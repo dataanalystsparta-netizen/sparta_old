@@ -3182,6 +3182,33 @@ with sparta_tv_tab:
                 <div class="sparta-tv-pill">YOUR ENTERTAINMENT. YOUR WAY.</div>
             </div>
 
+            <style>
+            .sparta-tv-kpi-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin:18px 0 22px;}
+            .sparta-tv-kpi{min-height:148px;padding:22px 22px 18px;border-radius:18px;background:linear-gradient(145deg,#0B1736,#164B78);
+                border:1px solid rgba(125,211,252,.35);box-shadow:0 12px 28px rgba(15,23,42,.12);color:#fff;}
+            .sparta-tv-kpi-label{font-size:.72rem;letter-spacing:1.1px;text-transform:uppercase;font-weight:850;color:#A5E7FF;margin-bottom:13px;}
+            .sparta-tv-kpi-value{font-size:2.25rem;line-height:1.05;font-weight:950;letter-spacing:-1px;color:#fff;}
+            .sparta-tv-kpi-detail{font-size:.82rem;line-height:1.45;color:#D5E9FA;margin-top:9px;}
+            @media(max-width:850px){.sparta-tv-kpi-row{grid-template-columns:1fr;}.sparta-tv-kpi{min-height:unset;}}
+            </style>
+            <div class="sparta-tv-kpi-row">
+                <div class="sparta-tv-kpi">
+                    <div class="sparta-tv-kpi-label">One-off equipment charge</div>
+                    <div class="sparta-tv-kpi-value">£99</div>
+                    <div class="sparta-tv-kpi-detail">PLEIO puck, remote and game controller</div>
+                </div>
+                <div class="sparta-tv-kpi">
+                    <div class="sparta-tv-kpi-label">Monthly cost · VAT included</div>
+                    <div class="sparta-tv-kpi-value">£17.99 <span style="font-size:1rem;font-weight:700;letter-spacing:0;">/ month</span></div>
+                    <div class="sparta-tv-kpi-detail">£14.99 + VAT</div>
+                </div>
+                <div class="sparta-tv-kpi">
+                    <div class="sparta-tv-kpi-label">Contract &amp; channel line-up</div>
+                    <div class="sparta-tv-kpi-value">24 months</div>
+                    <div class="sparta-tv-kpi-detail">200+ channels</div>
+                </div>
+            </div>
+
             <h3 style="margin:4px 0 5px;color:#0F172A;">Bring more entertainment home</h3>
             <p style="color:#64748B;font-size:.82rem;line-height:1.5;margin:0;">Sample visuals and placeholder descriptions for the Sparta TV sales page. Replace these with approved package information when available.</p>
 
@@ -3215,6 +3242,20 @@ with sparta_tv_tab:
             </div>
             """
         )
+
+        # Product image is stored beside the Streamlit app in the repository.
+        _sparta_tv_script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+        _sparta_tv_box_candidates = [
+            os.path.join(_sparta_tv_script_dir, "box.jpg"),
+            os.path.join(os.getcwd(), "box.jpg"),
+            os.path.join(os.getcwd(), "assets", "box.jpg"),
+        ]
+        _sparta_tv_box_path = next((p for p in _sparta_tv_box_candidates if os.path.isfile(p)), None)
+        st.markdown("### Your Sparta TV box")
+        if _sparta_tv_box_path:
+            st.image(_sparta_tv_box_path, caption="PLEIO TV box", use_column_width=True)
+        else:
+            st.warning("box.jpg was not found. Please make sure it is committed to the same repository folder as the Streamlit app (or an assets/ folder).")
 
         st.markdown("### Sample package overview")
         st.caption("These are examples only. Package names, channels, features, prices and eligibility are placeholders.")
