@@ -3082,6 +3082,9 @@ with st.sidebar:
 # ----------------------------------------------------------------------------
 # DATA LOAD
 # ----------------------------------------------------------------------------
+# Create navigation before any data loading so both tabs are always available.
+dashboard_tab, sparta_tv_tab = st.tabs(["📊 My Dashboard", "📺 Sparta TV"])
+
 try:
     df1, df2_raw, attendance_df, last_sync, connection_status = fetch_data()
     # Agent login remains the control point: each agent only sees their own data.
@@ -3103,7 +3106,6 @@ try:
     # ------------------------------------------------------------------------
     # DASHBOARD TABS
     # ------------------------------------------------------------------------
-    dashboard_tab, sparta_tv_tab = st.tabs(["📊 My Dashboard", "📺 Sparta TV"])
     with dashboard_tab:
         # ------------------------------------------------------------------------
         # HERO
@@ -5476,118 +5478,118 @@ try:
             '<div class="footer-note">Sparta Agent Portal • Legacy records through 17-Sep-2026 remain sourced from Sparta/Sparta2; records from 18-Sep-2026 onward are sourced from the CRM mirror.</div>',
         )
 
-    with sparta_tv_tab:
-        st.html(
-            """
-            <div style="position:relative;overflow:hidden;padding:30px 32px;border-radius:22px;
-                        background:radial-gradient(circle at 84% 20%,rgba(6,182,212,.28),transparent 27%),
-                                   radial-gradient(circle at 0% 100%,rgba(59,130,246,.35),transparent 34%),
-                                   linear-gradient(130deg,#07132D 0%,#102B5D 58%,#15527C 100%);
-                        box-shadow:0 18px 40px rgba(15,23,42,.14);border:1px solid rgba(255,255,255,.10);">
-                <div style="font-size:.68rem;letter-spacing:2px;font-weight:900;color:#8DDCFF;text-transform:uppercase;">
-                    Sparta Telecom presents
-                </div>
-                <div style="font-size:2.25rem;line-height:1.05;font-weight:950;letter-spacing:-1.2px;color:#FFFFFF;margin-top:8px;">
-                    SPARTA TV
-                </div>
-                <div style="font-size:1rem;line-height:1.55;color:#D6E8FF;max-width:720px;margin-top:10px;">
-                    More to watch. More to enjoy. A TV package to suit the way every household loves entertainment.
-                </div>
-                <div style="display:inline-block;margin-top:18px;padding:8px 13px;border-radius:999px;
-                            background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.20);
-                            color:#FFFFFF;font-size:.72rem;font-weight:800;letter-spacing:.5px;">
-                    YOUR ENTERTAINMENT. YOUR WAY.
-                </div>
-            </div>
-            """
-        )
-
-        st.write("")
-        st.markdown("### Bring more entertainment home")
-        st.write(
-            "Discover a sample of the ways Sparta TV can be presented to customers. "
-            "Use this page as a quick visual guide during a conversation, then match the customer "
-            "to the currently approved package and offer."
-        )
-
-        image_cols = st.columns(3, gap="medium")
-        tv_images = [
-            (
-                "https://iptvstream.co.za/images/blog/iptv-on-smart-tv.png",
-                "A connected TV experience",
-                "Talk about the customer's preferred way to watch and the devices they use."
-            ),
-            (
-                "https://s1.staticld.com/2025/01/29/1920/1080/fit/smart-tv-50-pulgadas-tcl-50pf650.jpg",
-                "Live sport and big moments",
-                "Explore whether live sport and event viewing are important to the household."
-            ),
-            (
-                "https://www.entertainmentnews.com/news/images/2026-06-14-june-12-2026-amazon-prime-and-netflix-drop-a-slate-of-high-profile-films-and-series.webp",
-                "Films, shows and streaming",
-                "Ask what the customer and their family enjoy watching throughout the week."
-            ),
-        ]
-        for col, (image_url, caption, description) in zip(image_cols, tv_images):
-            with col:
-                st.image(image_url, caption=caption, use_container_width=True)
-                st.markdown(f"<div style='font-size:.84rem;color:#526176;line-height:1.5'>{description}</div>", unsafe_allow_html=True)
-
-        st.write("")
-        st.markdown("### Sample package overview")
-        st.caption("These are layout examples only. Package names, channels, features, prices and eligibility are placeholders until the approved Sparta TV offer is added.")
-
-        package_cols = st.columns(3, gap="medium")
-        package_samples = [
-            {
-                "eyebrow": "01 · STARTER",
-                "name": "Essential TV",
-                "copy": "A simple starting point for customers looking for everyday television entertainment.",
-                "details": "Approved channel list · Monthly price · Contract terms"
-            },
-            {
-                "eyebrow": "02 · POPULAR CHOICE",
-                "name": "Entertainment Plus",
-                "copy": "A sample option for households looking for a wider mix of entertainment.",
-                "details": "Approved channel list · Monthly price · Contract terms"
-            },
-            {
-                "eyebrow": "03 · COMPLETE",
-                "name": "Ultimate TV",
-                "copy": "A sample premium option for customers who want the broadest available experience.",
-                "details": "Approved channel list · Monthly price · Contract terms"
-            },
-        ]
-        for col, package in zip(package_cols, package_samples):
-            with col:
-                with st.container(border=True):
-                    st.caption(package["eyebrow"])
-                    st.markdown(f"#### {package['name']}")
-                    st.write(package["copy"])
-                    st.divider()
-                    st.caption("DETAILS TO ADD")
-                    st.write(package["details"])
-
-        st.write("")
-        st.markdown("### A simple way to introduce Sparta TV")
-        guide_cols = st.columns(3, gap="medium")
-        guide_steps = [
-            ("1", "Understand their viewing", "Ask what they watch most: live TV, sport, films, entertainment or family content."),
-            ("2", "Recommend the right option", "Use the approved package information to explain what is included and why it may suit them."),
-            ("3", "Confirm before submitting", "Check the current price, availability, contract, installation and any additional requirements."),
-        ]
-        for col, (number, heading, copy) in zip(guide_cols, guide_steps):
-            with col:
-                with st.container(border=True):
-                    st.markdown(f"<div style='font-size:.72rem;font-weight:900;letter-spacing:1px;color:#2563EB'>STEP {number}</div>", unsafe_allow_html=True)
-                    st.markdown(f"**{heading}**")
-                    st.caption(copy)
-
-        st.info(
-            "Sample page for development: replace the sample package descriptions and images with "
-            "Sparta TV's approved product information, channel line-up, prices, terms and sales materials. "
-            "Do not quote unconfirmed prices or inclusions to customers."
-        )
-
 except Exception as e:
     st.error(f"Error: {e}")
+with sparta_tv_tab:
+    st.html(
+        """
+        <div style="position:relative;overflow:hidden;padding:30px 32px;border-radius:22px;
+                    background:radial-gradient(circle at 84% 20%,rgba(6,182,212,.28),transparent 27%),
+                               radial-gradient(circle at 0% 100%,rgba(59,130,246,.35),transparent 34%),
+                               linear-gradient(130deg,#07132D 0%,#102B5D 58%,#15527C 100%);
+                    box-shadow:0 18px 40px rgba(15,23,42,.14);border:1px solid rgba(255,255,255,.10);">
+            <div style="font-size:.68rem;letter-spacing:2px;font-weight:900;color:#8DDCFF;text-transform:uppercase;">
+                Sparta Telecom presents
+            </div>
+            <div style="font-size:2.25rem;line-height:1.05;font-weight:950;letter-spacing:-1.2px;color:#FFFFFF;margin-top:8px;">
+                SPARTA TV
+            </div>
+            <div style="font-size:1rem;line-height:1.55;color:#D6E8FF;max-width:720px;margin-top:10px;">
+                More to watch. More to enjoy. A TV package to suit the way every household loves entertainment.
+            </div>
+            <div style="display:inline-block;margin-top:18px;padding:8px 13px;border-radius:999px;
+                        background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.20);
+                        color:#FFFFFF;font-size:.72rem;font-weight:800;letter-spacing:.5px;">
+                YOUR ENTERTAINMENT. YOUR WAY.
+            </div>
+        </div>
+        """
+    )
+
+    st.write("")
+    st.markdown("### Bring more entertainment home")
+    st.write(
+        "Discover a sample of the ways Sparta TV can be presented to customers. "
+        "Use this page as a quick visual guide during a conversation, then match the customer "
+        "to the currently approved package and offer."
+    )
+
+    image_cols = st.columns(3, gap="medium")
+    tv_images = [
+        (
+            "https://iptvstream.co.za/images/blog/iptv-on-smart-tv.png",
+            "A connected TV experience",
+            "Talk about the customer's preferred way to watch and the devices they use."
+        ),
+        (
+            "https://s1.staticld.com/2025/01/29/1920/1080/fit/smart-tv-50-pulgadas-tcl-50pf650.jpg",
+            "Live sport and big moments",
+            "Explore whether live sport and event viewing are important to the household."
+        ),
+        (
+            "https://www.entertainmentnews.com/news/images/2026-06-14-june-12-2026-amazon-prime-and-netflix-drop-a-slate-of-high-profile-films-and-series.webp",
+            "Films, shows and streaming",
+            "Ask what the customer and their family enjoy watching throughout the week."
+        ),
+    ]
+    for col, (image_url, caption, description) in zip(image_cols, tv_images):
+        with col:
+            st.image(image_url, caption=caption, use_container_width=True)
+            st.markdown(f"<div style='font-size:.84rem;color:#526176;line-height:1.5'>{description}</div>", unsafe_allow_html=True)
+
+    st.write("")
+    st.markdown("### Sample package overview")
+    st.caption("These are layout examples only. Package names, channels, features, prices and eligibility are placeholders until the approved Sparta TV offer is added.")
+
+    package_cols = st.columns(3, gap="medium")
+    package_samples = [
+        {
+            "eyebrow": "01 · STARTER",
+            "name": "Essential TV",
+            "copy": "A simple starting point for customers looking for everyday television entertainment.",
+            "details": "Approved channel list · Monthly price · Contract terms"
+        },
+        {
+            "eyebrow": "02 · POPULAR CHOICE",
+            "name": "Entertainment Plus",
+            "copy": "A sample option for households looking for a wider mix of entertainment.",
+            "details": "Approved channel list · Monthly price · Contract terms"
+        },
+        {
+            "eyebrow": "03 · COMPLETE",
+            "name": "Ultimate TV",
+            "copy": "A sample premium option for customers who want the broadest available experience.",
+            "details": "Approved channel list · Monthly price · Contract terms"
+        },
+    ]
+    for col, package in zip(package_cols, package_samples):
+        with col:
+            with st.container(border=True):
+                st.caption(package["eyebrow"])
+                st.markdown(f"#### {package['name']}")
+                st.write(package["copy"])
+                st.divider()
+                st.caption("DETAILS TO ADD")
+                st.write(package["details"])
+
+    st.write("")
+    st.markdown("### A simple way to introduce Sparta TV")
+    guide_cols = st.columns(3, gap="medium")
+    guide_steps = [
+        ("1", "Understand their viewing", "Ask what they watch most: live TV, sport, films, entertainment or family content."),
+        ("2", "Recommend the right option", "Use the approved package information to explain what is included and why it may suit them."),
+        ("3", "Confirm before submitting", "Check the current price, availability, contract, installation and any additional requirements."),
+    ]
+    for col, (number, heading, copy) in zip(guide_cols, guide_steps):
+        with col:
+            with st.container(border=True):
+                st.markdown(f"<div style='font-size:.72rem;font-weight:900;letter-spacing:1px;color:#2563EB'>STEP {number}</div>", unsafe_allow_html=True)
+                st.markdown(f"**{heading}**")
+                st.caption(copy)
+
+    st.info(
+        "Sample page for development: replace the sample package descriptions and images with "
+        "Sparta TV's approved product information, channel line-up, prices, terms and sales materials. "
+        "Do not quote unconfirmed prices or inclusions to customers."
+    )
+
