@@ -3079,6 +3079,17 @@ with st.sidebar:
         "</div>"
     )
 
+# DEPLOYMENT DIAGNOSTIC: This exact banner proves this updated file is running.
+st.html(
+    """
+    <div style="margin:4px 0 10px;padding:8px 13px;border:1px solid #93C5FD;
+                border-radius:9px;background:#EFF6FF;color:#1E40AF;
+                font-size:11px;font-weight:800;letter-spacing:.6px;">
+        UPDATED PORTAL FILE LOADED · SPARTA TV ENABLED · BUILD STV-20261104-01
+    </div>
+    """
+)
+
 # ----------------------------------------------------------------------------
 # PORTAL NAVIGATION — REAL STREAMLIT TABS
 # Both tabs are created before dashboard data is fetched. The Sparta TV tab
