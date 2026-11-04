@@ -3085,6 +3085,131 @@ with st.sidebar:
 # Create navigation before any data loading so both tabs are always available.
 dashboard_tab, sparta_tv_tab = st.tabs(["📊 My Dashboard", "📺 Sparta TV"])
 
+# Render Sparta TV immediately after creating the tabs. Keep this section
+# independent from dashboard data loading, date filters and dashboard errors.
+with sparta_tv_tab:
+    st.html(
+        """
+        <style>
+        .tv-hero {
+            position:relative; overflow:hidden; padding:30px 32px; border-radius:22px;
+            background:radial-gradient(circle at 84% 20%,rgba(6,182,212,.28),transparent 27%),
+                       radial-gradient(circle at 0% 100%,rgba(59,130,246,.35),transparent 34%),
+                       linear-gradient(130deg,#07132D 0%,#102B5D 58%,#15527C 100%);
+            box-shadow:0 18px 40px rgba(15,23,42,.14);
+            border:1px solid rgba(255,255,255,.10); margin-bottom:18px;
+        }
+        .tv-hero-kicker {font-size:.68rem;letter-spacing:2px;font-weight:900;color:#8DDCFF;text-transform:uppercase;}
+        .tv-hero-title {font-size:2.25rem;line-height:1.05;font-weight:950;letter-spacing:-1.2px;color:#FFFFFF;margin-top:8px;}
+        .tv-hero-copy {font-size:1rem;line-height:1.55;color:#D6E8FF;max-width:720px;margin-top:10px;}
+        .tv-hero-pill {display:inline-block;margin-top:18px;padding:8px 13px;border-radius:999px;
+            background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.20);
+            color:#FFFFFF;font-size:.72rem;font-weight:800;letter-spacing:.5px;}
+        .tv-image-grid {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:14px 0 22px;}
+        .tv-image-card {overflow:hidden;border:1px solid #E2E8F0;border-radius:16px;background:#FFFFFF;
+            box-shadow:0 7px 20px rgba(15,23,42,.045);}
+        .tv-image-art {height:160px;display:flex;align-items:center;justify-content:center;
+            background:linear-gradient(135deg,#0B1736,#15527C);}
+        .tv-image-art svg {width:100%;height:100%;display:block;}
+        .tv-image-caption {padding:12px 14px 14px;}
+        .tv-image-caption strong {display:block;color:#0F172A;font-size:.9rem;margin-bottom:4px;}
+        .tv-image-caption span {display:block;color:#64748B;font-size:.74rem;line-height:1.45;}
+        .tv-package-grid {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:12px;}
+        .tv-package {padding:16px;border:1px solid #E2E8F0;border-radius:15px;background:#FFFFFF;
+            box-shadow:0 7px 20px rgba(15,23,42,.04);}
+        .tv-package-tag {font-size:.62rem;letter-spacing:.8px;font-weight:900;color:#2563EB;text-transform:uppercase;}
+        .tv-package h3 {font-size:1.02rem;color:#0F172A;margin:7px 0 8px;}
+        .tv-package p {font-size:.77rem;color:#64748B;line-height:1.5;min-height:48px;margin:0 0 12px;}
+        .tv-package-detail {border-top:1px solid #E8EEF5;padding-top:10px;color:#475569;font-size:.7rem;line-height:1.5;}
+        .tv-guide-grid {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:12px;}
+        .tv-guide {padding:14px;border:1px solid #E2E8F0;border-radius:14px;background:#FFFFFF;}
+        .tv-guide-step {font-size:.66rem;font-weight:900;letter-spacing:1px;color:#2563EB;margin-bottom:7px;}
+        .tv-guide strong {display:block;color:#0F172A;font-size:.82rem;margin-bottom:5px;}
+        .tv-guide span {display:block;color:#64748B;font-size:.73rem;line-height:1.45;}
+        .tv-note {margin-top:16px;padding:13px 15px;border:1px solid #BFDBFE;border-radius:13px;
+            background:#EFF6FF;color:#1E3A8A;font-size:.76rem;line-height:1.5;}
+        @media(max-width:850px){.tv-image-grid,.tv-package-grid,.tv-guide-grid{grid-template-columns:1fr;}.tv-hero-title{font-size:1.8rem;}}
+        </style>
+
+        <div class="tv-hero">
+            <div class="tv-hero-kicker">Sparta Telecom presents</div>
+            <div class="tv-hero-title">SPARTA TV</div>
+            <div class="tv-hero-copy">More to watch. More to enjoy. A TV package to suit the way every household loves entertainment.</div>
+            <div class="tv-hero-pill">YOUR ENTERTAINMENT. YOUR WAY.</div>
+        </div>
+
+        <h3 style="margin:4px 0 5px;color:#0F172A;">Bring more entertainment home</h3>
+        <p style="color:#64748B;font-size:.82rem;line-height:1.5;margin:0;">Use these sample visuals to start a conversation about what the customer enjoys watching. Match every recommendation to the approved Sparta TV offer.</p>
+
+        <div class="tv-image-grid">
+            <div class="tv-image-card">
+                <div class="tv-image-art">
+                    <svg viewBox="0 0 420 190" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Smart television illustration">
+                        <defs><linearGradient id="tvscreen1" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#42D3F5"/><stop offset="1" stop-color="#3154D8"/></linearGradient></defs>
+                        <circle cx="350" cy="35" r="72" fill="#FFFFFF" opacity=".06"/><rect x="70" y="25" width="280" height="132" rx="12" fill="#0A1023" stroke="#C4E8FF" stroke-width="3"/><rect x="80" y="35" width="260" height="112" rx="6" fill="url(#tvscreen1)"/><path d="M95 126 L155 72 L195 111 L240 62 L325 130 Z" fill="#D9FBFF" opacity=".72"/><circle cx="270" cy="68" r="17" fill="#FFF4C2"/><path d="M178 157 L164 176 M242 157 L256 176 M160 177 H260" stroke="#C4E8FF" stroke-width="5" stroke-linecap="round"/>
+                    </svg>
+                </div>
+                <div class="tv-image-caption"><strong>Connected TV experience</strong><span>Ask which screens and devices the household uses to watch television.</span></div>
+            </div>
+            <div class="tv-image-card">
+                <div class="tv-image-art">
+                    <svg viewBox="0 0 420 190" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Live sports illustration">
+                        <circle cx="210" cy="95" r="105" fill="#FFFFFF" opacity=".05"/><rect x="45" y="28" width="330" height="134" rx="12" fill="#102C4D" stroke="#8BE5FF" stroke-width="2"/><path d="M210 30 V160 M45 95 H375" stroke="#B9F6D8" stroke-width="2" opacity=".8"/><circle cx="210" cy="95" r="34" fill="none" stroke="#B9F6D8" stroke-width="2"/><rect x="45" y="65" width="42" height="60" fill="none" stroke="#B9F6D8" stroke-width="2"/><rect x="333" y="65" width="42" height="60" fill="none" stroke="#B9F6D8" stroke-width="2"/><path d="M190 84 L213 70 L231 89 L220 116 L194 112 Z" fill="#FFFFFF" stroke="#DCEBFF" stroke-width="2"/><path d="M153 60 L169 48 M265 135 L282 148" stroke="#FFD166" stroke-width="6" stroke-linecap="round"/>
+                    </svg>
+                </div>
+                <div class="tv-image-caption"><strong>Live sport and big moments</strong><span>Explore whether sport, live events and shared viewing matter to the customer.</span></div>
+            </div>
+            <div class="tv-image-card">
+                <div class="tv-image-art">
+                    <svg viewBox="0 0 420 190" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Films and entertainment illustration">
+                        <defs><linearGradient id="tvfilm1" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#F472B6"/><stop offset=".55" stop-color="#7C3AED"/><stop offset="1" stop-color="#2563EB"/></linearGradient></defs>
+                        <rect x="65" y="24" width="290" height="142" rx="13" fill="#0A1023" stroke="#D9C7FF" stroke-width="3"/><rect x="76" y="35" width="268" height="120" rx="7" fill="url(#tvfilm1)"/><circle cx="210" cy="83" r="29" fill="#FFFFFF" opacity=".2"/><path d="M201 65 L230 83 L201 101 Z" fill="#FFFFFF"/><path d="M94 126 C135 90 160 145 193 113 S250 101 279 126 S318 139 330 112" fill="none" stroke="#FFD6EA" stroke-width="5" stroke-linecap="round"/><path d="M175 166 L165 180 M245 166 L255 180 M160 180 H260" stroke="#D9C7FF" stroke-width="5" stroke-linecap="round"/>
+                    </svg>
+                </div>
+                <div class="tv-image-caption"><strong>Films, shows and entertainment</strong><span>Find out what the customer and their family enjoy watching during the week.</span></div>
+            </div>
+        </div>
+        """
+    )
+
+    st.markdown("### Sample package overview")
+    st.caption("These are layout examples only. Package names, channels, features, prices and eligibility are placeholders until the approved Sparta TV offer is added.")
+    package_cols = st.columns(3, gap="medium")
+    package_samples = [
+        ("01 · STARTER", "Essential TV", "A simple starting point for customers looking for everyday television entertainment."),
+        ("02 · POPULAR CHOICE", "Entertainment Plus", "A sample option for households looking for a wider mix of entertainment."),
+        ("03 · COMPLETE", "Ultimate TV", "A sample premium option for customers who want the broadest available experience."),
+    ]
+    for col, (eyebrow, name, copy) in zip(package_cols, package_samples):
+        with col:
+            with st.container(border=True):
+                st.caption(eyebrow)
+                st.markdown(f"#### {name}")
+                st.write(copy)
+                st.divider()
+                st.caption("DETAILS TO ADD")
+                st.write("Approved channel list · Monthly price · Contract terms")
+
+    st.markdown("### A simple way to introduce Sparta TV")
+    guide_cols = st.columns(3, gap="medium")
+    guide_steps = [
+        ("1", "Understand their viewing", "Ask what they watch most: live TV, sport, films, entertainment or family content."),
+        ("2", "Recommend the right option", "Use approved package information to explain what is included and why it may suit them."),
+        ("3", "Confirm before submitting", "Check the current price, availability, contract, installation and any additional requirements."),
+    ]
+    for col, (number, heading, copy) in zip(guide_cols, guide_steps):
+        with col:
+            with st.container(border=True):
+                st.markdown(f"**STEP {number} · {heading}**")
+                st.caption(copy)
+
+    st.info(
+        "Sample page for development: replace the sample package descriptions and illustrations with "
+        "Sparta TV's approved product information, channel line-up, prices, terms and sales materials. "
+        "Do not quote unconfirmed prices or inclusions to customers."
+    )
+
+
 try:
     df1, df2_raw, attendance_df, last_sync, connection_status = fetch_data()
     # Agent login remains the control point: each agent only sees their own data.
@@ -5480,116 +5605,3 @@ try:
 
 except Exception as e:
     st.error(f"Error: {e}")
-with sparta_tv_tab:
-    st.html(
-        """
-        <div style="position:relative;overflow:hidden;padding:30px 32px;border-radius:22px;
-                    background:radial-gradient(circle at 84% 20%,rgba(6,182,212,.28),transparent 27%),
-                               radial-gradient(circle at 0% 100%,rgba(59,130,246,.35),transparent 34%),
-                               linear-gradient(130deg,#07132D 0%,#102B5D 58%,#15527C 100%);
-                    box-shadow:0 18px 40px rgba(15,23,42,.14);border:1px solid rgba(255,255,255,.10);">
-            <div style="font-size:.68rem;letter-spacing:2px;font-weight:900;color:#8DDCFF;text-transform:uppercase;">
-                Sparta Telecom presents
-            </div>
-            <div style="font-size:2.25rem;line-height:1.05;font-weight:950;letter-spacing:-1.2px;color:#FFFFFF;margin-top:8px;">
-                SPARTA TV
-            </div>
-            <div style="font-size:1rem;line-height:1.55;color:#D6E8FF;max-width:720px;margin-top:10px;">
-                More to watch. More to enjoy. A TV package to suit the way every household loves entertainment.
-            </div>
-            <div style="display:inline-block;margin-top:18px;padding:8px 13px;border-radius:999px;
-                        background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.20);
-                        color:#FFFFFF;font-size:.72rem;font-weight:800;letter-spacing:.5px;">
-                YOUR ENTERTAINMENT. YOUR WAY.
-            </div>
-        </div>
-        """
-    )
-
-    st.write("")
-    st.markdown("### Bring more entertainment home")
-    st.write(
-        "Discover a sample of the ways Sparta TV can be presented to customers. "
-        "Use this page as a quick visual guide during a conversation, then match the customer "
-        "to the currently approved package and offer."
-    )
-
-    image_cols = st.columns(3, gap="medium")
-    tv_images = [
-        (
-            "https://iptvstream.co.za/images/blog/iptv-on-smart-tv.png",
-            "A connected TV experience",
-            "Talk about the customer's preferred way to watch and the devices they use."
-        ),
-        (
-            "https://s1.staticld.com/2025/01/29/1920/1080/fit/smart-tv-50-pulgadas-tcl-50pf650.jpg",
-            "Live sport and big moments",
-            "Explore whether live sport and event viewing are important to the household."
-        ),
-        (
-            "https://www.entertainmentnews.com/news/images/2026-06-14-june-12-2026-amazon-prime-and-netflix-drop-a-slate-of-high-profile-films-and-series.webp",
-            "Films, shows and streaming",
-            "Ask what the customer and their family enjoy watching throughout the week."
-        ),
-    ]
-    for col, (image_url, caption, description) in zip(image_cols, tv_images):
-        with col:
-            st.image(image_url, caption=caption, use_container_width=True)
-            st.markdown(f"<div style='font-size:.84rem;color:#526176;line-height:1.5'>{description}</div>", unsafe_allow_html=True)
-
-    st.write("")
-    st.markdown("### Sample package overview")
-    st.caption("These are layout examples only. Package names, channels, features, prices and eligibility are placeholders until the approved Sparta TV offer is added.")
-
-    package_cols = st.columns(3, gap="medium")
-    package_samples = [
-        {
-            "eyebrow": "01 · STARTER",
-            "name": "Essential TV",
-            "copy": "A simple starting point for customers looking for everyday television entertainment.",
-            "details": "Approved channel list · Monthly price · Contract terms"
-        },
-        {
-            "eyebrow": "02 · POPULAR CHOICE",
-            "name": "Entertainment Plus",
-            "copy": "A sample option for households looking for a wider mix of entertainment.",
-            "details": "Approved channel list · Monthly price · Contract terms"
-        },
-        {
-            "eyebrow": "03 · COMPLETE",
-            "name": "Ultimate TV",
-            "copy": "A sample premium option for customers who want the broadest available experience.",
-            "details": "Approved channel list · Monthly price · Contract terms"
-        },
-    ]
-    for col, package in zip(package_cols, package_samples):
-        with col:
-            with st.container(border=True):
-                st.caption(package["eyebrow"])
-                st.markdown(f"#### {package['name']}")
-                st.write(package["copy"])
-                st.divider()
-                st.caption("DETAILS TO ADD")
-                st.write(package["details"])
-
-    st.write("")
-    st.markdown("### A simple way to introduce Sparta TV")
-    guide_cols = st.columns(3, gap="medium")
-    guide_steps = [
-        ("1", "Understand their viewing", "Ask what they watch most: live TV, sport, films, entertainment or family content."),
-        ("2", "Recommend the right option", "Use the approved package information to explain what is included and why it may suit them."),
-        ("3", "Confirm before submitting", "Check the current price, availability, contract, installation and any additional requirements."),
-    ]
-    for col, (number, heading, copy) in zip(guide_cols, guide_steps):
-        with col:
-            with st.container(border=True):
-                st.markdown(f"<div style='font-size:.72rem;font-weight:900;letter-spacing:1px;color:#2563EB'>STEP {number}</div>", unsafe_allow_html=True)
-                st.markdown(f"**{heading}**")
-                st.caption(copy)
-
-    st.info(
-        "Sample page for development: replace the sample package descriptions and images with "
-        "Sparta TV's approved product information, channel line-up, prices, terms and sales materials. "
-        "Do not quote unconfirmed prices or inclusions to customers."
-    )
-
