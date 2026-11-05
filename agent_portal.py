@@ -3209,8 +3209,8 @@ with sparta_tv_tab:
                 </div>
             </div>
 
-            <h3 style="margin:4px 0 5px;color:#0F172A;">Bring more entertainment home</h3>
-            <p style="color:#64748B;font-size:.82rem;line-height:1.5;margin:0;">Sample visuals and placeholder descriptions for the Sparta TV sales page. Replace these with approved package information when available.</p>
+            <h3 style="margin:4px 0 5px;color:#0F172A;">-</h3>
+            <p style="color:#64748B;font-size:.82rem;line-height:1.5;margin:0;">-</p>
 
             <div class="sparta-tv-grid">
                 <div class="sparta-tv-image-card">
