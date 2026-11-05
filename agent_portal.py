@@ -3209,8 +3209,8 @@ with sparta_tv_tab:
                 </div>
             </div>
 
-            <h3 style="margin:4px 0 5px;color:#0F172A;">-</h3>
-            <p style="color:#64748B;font-size:.82rem;line-height:1.5;margin:0;">-</p>
+            <h3 style="margin:4px 0 5px;color:#0F172A;">Bring more entertainment home</h3>
+            <p style="color:#64748B;font-size:.82rem;line-height:1.5;margin:0;">Sample visuals and placeholder descriptions for the Sparta TV sales page. Replace these with approved package information when available.</p>
 
             <div class="sparta-tv-grid">
                 <div class="sparta-tv-image-card">
@@ -3257,6 +3257,26 @@ with sparta_tv_tab:
         else:
             st.warning("box.jpg was not found. Please make sure it is committed to the same repository folder as the Streamlit app (or an assets/ folder).")
 
+        # Product demonstration video stored alongside the Streamlit app.
+        # Streamlit serves the local MP4 directly; no external hosting is needed.
+        _sparta_tv_video_candidates = [
+            os.path.join(_sparta_tv_script_dir, "demo.mp4"),
+            os.path.join(os.getcwd(), "demo.mp4"),
+            os.path.join(os.getcwd(), "assets", "demo.mp4"),
+        ]
+        _sparta_tv_video_path = next(
+            (p for p in _sparta_tv_video_candidates if os.path.isfile(p)), None
+        )
+        st.markdown("### 🎬 Sparta TV – Product Demo")
+        st.caption("Watch the demonstration to see the Sparta TV experience and equipment.")
+        if _sparta_tv_video_path:
+            st.video(_sparta_tv_video_path)
+        else:
+            st.warning(
+                "demo.mp4 was not found. Make sure it is committed to the same "
+                "GitHub repository folder as the Streamlit app (or inside assets/)."
+            )
+
         st.markdown("### Sample package overview")
         st.caption("These are examples only. Package names, channels, features, prices and eligibility are placeholders.")
         package_cols = st.columns(3, gap="medium")
@@ -3287,6 +3307,11 @@ with sparta_tv_tab:
                 with st.container(border=True):
                     st.markdown(f"**STEP {number} · {heading}**")
                     st.caption(copy)
+
+        st.info(
+            "Sample Sparta TV page: replace the examples with approved product information, "
+            "channel line-up, prices, terms and sales materials before quoting to customers."
+        )
 
 
 with channel_list_tab:
