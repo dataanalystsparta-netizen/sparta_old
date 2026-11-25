@@ -3095,11 +3095,17 @@ def _classify_legacy_monthly_application(row):
     if welcome_category == "Cancelled":
         return _monthly_outcome_detail("Cancelled", "Welcome Status", welcome_raw)
 
-    # If Welcome is complete but no later status exists, fold the old
-    # "Awaiting downstream" slice into Pending so the requested four-column
-    # summary still accounts for every application.
+    # Legacy Welcome Done means the application has reached the Committed stage.
+    # Its outcome must therefore come from the matched Sparta2 record above
+    # (Status / CallStatus / Provisioning / LetterStatus). Never infer Pending
+    # merely from Welcome Done. If no Sparta2 outcome exists, keep it visible as
+    # Awaiting Sparta2 rather than inflating the Pending count.
     if welcome_category == "Done":
-        return _monthly_outcome_detail("Pending", "Welcome Status", welcome_raw)
+        return _monthly_outcome_detail(
+            "Awaiting Sparta2",
+            "Sparta2 Committed Stage",
+            "Welcome Done — no matching committed-stage outcome in Sparta2",
+        )
 
     if portal_raw:
         return _monthly_outcome_detail("Pending", "Portal Status", portal_raw)
@@ -3113,7 +3119,7 @@ def _classify_legacy_monthly_application(row):
         if _monthly_status_has_cancel(letter_raw):
             return _monthly_outcome_detail("Cancelled", "LetterStatus", letter_raw)
         return _monthly_outcome_detail("Pending", "LetterStatus", letter_raw)
-    if welcome_raw:
+    if welcome_raw and welcome_category != "Done":
         return _monthly_outcome_detail("Pending", "Welcome Status", welcome_raw)
     if quality_category == "Approved" and not welcome_raw:
         return _monthly_outcome_detail("Pending", "Welcome Status", "(blank)")
@@ -3316,8 +3322,13 @@ def build_agent_portal_combined_monthly_outcomes(apps_frame, portal_frame, agent
     result = pd.DataFrame(result_rows)
     result["Date_Parsed"] = pd.to_datetime(result["Date_Parsed"], errors="coerce")
     result = result[result["Date_Parsed"].notna()].copy()
+    # Awaiting Sparta2 is intentionally not rolled into Pending. It represents
+    # legacy Welcome Done applications for which no committed-stage outcome was
+    # found in Sparta2, so the summary's three outcome counts can be lower than
+    # Applications until the matching committed-stage record is available.
     result["Outcome"] = result["Outcome"].where(
-        result["Outcome"].isin(["Pending", "Cancelled", "Live"]), "Pending"
+        result["Outcome"].isin(["Pending", "Cancelled", "Live", "Awaiting Sparta2"]),
+        "Pending",
     )
     return result.reset_index(drop=True)
 
@@ -3397,7 +3408,11 @@ def render_agent_portal_combined_monthly_table_html(classified, table_id, colour
     bucket_order = {name: index for index, name in enumerate(
         ["Inbound", "Quality", "Welcome", "Provisioning", "Confirmation", "Onboarding"]
     )}
-    outcome_classes = {"Pending": "pending", "Cancelled": "cancelled", "Live": "live"}
+    outcome_classes = {
+        "Pending": "pending", "Cancelled": "cancelled", "Live": "live",
+        "Awaiting Sparta2": "awaiting",
+    }
+    detail_outcome_names = outcome_names + ["Awaiting Sparta2"]
 
     def short_stage_hint(stage, bucket):
         if bucket not in {"Confirmation", "Onboarding"}:
@@ -3417,8 +3432,8 @@ def render_agent_portal_combined_monthly_table_html(classified, table_id, colour
             return '<div class="breakdown-empty-panel">No category or status details available.</div>'
         values = metrics(group)
         sections = []
-        for outcome in outcome_names:
-            outcome_count = int(values.get(outcome, 0))
+        for outcome in detail_outcome_names:
+            outcome_count = int((group["Outcome"] == outcome).sum()) if outcome == "Awaiting Sparta2" else int(values.get(outcome, 0))
             if outcome_count <= 0:
                 continue
             subset = group[group["Outcome"] == outcome]
@@ -3550,6 +3565,7 @@ def render_agent_portal_combined_monthly_table_html(classified, table_id, colour
       .breakdown-outcome.pending .breakdown-outcome-heading {{ background:#fff7d6;color:#8a6500; }}
       .breakdown-outcome.cancelled .breakdown-outcome-heading {{ background:#fee2e2;color:#b91c1c; }}
       .breakdown-outcome.live .breakdown-outcome-heading {{ background:#dcfce7;color:#166534; }}
+      .breakdown-outcome.awaiting .breakdown-outcome-heading {{ background:#eef2f7;color:#475569; }}
       .breakdown-outcome-subtitle {{ padding:5px 11px 0;color:#94a3b8;font-size:9px; }}
       .breakdown-category-list {{ display:flex;flex-direction:column;gap:7px;padding:8px; }}
       .breakdown-category-card {{ min-width:0;border:1px solid #edf1f5;border-radius:8px;background:#fbfcfe;overflow:hidden; }}
