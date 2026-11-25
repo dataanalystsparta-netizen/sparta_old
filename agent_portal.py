@@ -2996,6 +2996,683 @@ def summary_for_period(base_apps, base_portal, start_date, end_date, welcome_col
     }
 
 
+
+# ---------------------------------------------------------------------------
+# COMBINED MONTHLY PERFORMANCE — concise outcome view + executive-style drilldown
+# ---------------------------------------------------------------------------
+def _monthly_display_text(value, fallback=""):
+    """Return a safe, trimmed source status without changing its wording."""
+    try:
+        if pd.isna(value):
+            value = ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value or "").strip()
+    if text.casefold() in {"nan", "none", "null", "nat"}:
+        text = ""
+    return text or fallback
+
+
+def _monthly_status_has_cancel(value):
+    """Status-only cancellation matcher for CRM stages that are sequentially gated."""
+    text = normalize_workflow_status(value)
+    return bool(text and re.search(r"\b(cancel|cancelled|canceled|reject|rejected|rejection)\b", text))
+
+
+def _monthly_bucket_for_stage(stage_name):
+    text = str(stage_name or "").casefold()
+    if "inbound" in text:
+        return "Inbound"
+    if "quality" in text or text.startswith("qa"):
+        return "Quality"
+    if "welcome" in text:
+        return "Welcome"
+    if "provision" in text:
+        return "Provisioning"
+    if "letter" in text or "dispatch" in text or "confirmation" in text or "callstatus" in text:
+        return "Confirmation"
+    return "Onboarding"
+
+
+def _monthly_outcome_detail(outcome, stage, status):
+    return {
+        "Outcome": outcome,
+        "Bucket": _monthly_bucket_for_stage(stage),
+        "Stage": str(stage or "Application Status"),
+        "Status": _monthly_display_text(status, "(blank)"),
+    }
+
+
+def _classify_legacy_monthly_application(row):
+    """Use the portal's existing mutually-exclusive legacy downstream classifier."""
+    quality_raw = _monthly_display_text(row.get("Quality Status", ""))
+    welcome_raw = _monthly_display_text(row.get("Status", row.get("Welcome call Status", "")))
+    portal_raw = _monthly_display_text(row.get("_LegacyPortalStatus", ""))
+    confirmation_raw = _monthly_display_text(row.get("_LegacyConfirmationStatus", ""))
+    provisioning_raw = _monthly_display_text(row.get("_LegacyProvisioningStatus", ""))
+    letter_raw = _monthly_display_text(row.get("_LegacyLetterStatus", ""))
+
+    downstream_category = _monthly_display_text(row.get("_LegacyDownstreamCategory", ""))
+    if not downstream_category:
+        downstream_category = classify_downstream_record({
+            "Status": portal_raw,
+            "CallStatus": confirmation_raw,
+            "Provisioning Status": provisioning_raw,
+            "LetterStatus": letter_raw,
+        })[0]
+
+    # A definitive downstream outcome takes precedence over earlier QA/Welcome
+    # markers, matching the Agent Portal's existing central classifier.
+    if downstream_category == "Live":
+        if _onboarding_state(portal_raw) == "live":
+            return _monthly_outcome_detail("Live", "Portal Status", portal_raw)
+        return _monthly_outcome_detail("Live", "CallStatus", confirmation_raw or portal_raw)
+
+    if downstream_category == "Committed Rem.":
+        if portal_raw:
+            return _monthly_outcome_detail("Pending", "Portal Status", portal_raw)
+        return _monthly_outcome_detail("Pending", "CallStatus", confirmation_raw)
+
+    if downstream_category in {"Committed Cancelled", "Live Cancelled"}:
+        if _onboarding_state(portal_raw) == "live_cancelled":
+            return _monthly_outcome_detail("Cancelled", "Portal Status", portal_raw)
+        if _is_confirmation_cancel_status(confirmation_raw):
+            return _monthly_outcome_detail("Cancelled", "CallStatus", confirmation_raw)
+        if _monthly_status_has_cancel(provisioning_raw):
+            return _monthly_outcome_detail("Cancelled", "Provisioning Status", provisioning_raw)
+        if _monthly_status_has_cancel(letter_raw):
+            return _monthly_outcome_detail("Cancelled", "LetterStatus", letter_raw)
+        return _monthly_outcome_detail("Cancelled", "Portal Status", portal_raw or confirmation_raw)
+
+    # With no decisive downstream result, retain the established QA and Welcome
+    # meanings. QA-Cancelled remains pending through map_quality(); Welcome
+    # Rejected remains cancelled through map_wc().
+    quality_category = map_quality(quality_raw)
+    if quality_category in {"Rejected", "Cancelled"}:
+        return _monthly_outcome_detail("Cancelled", "Quality Status", quality_raw)
+
+    welcome_category = map_wc(welcome_raw)
+    if welcome_category == "Cancelled":
+        return _monthly_outcome_detail("Cancelled", "Welcome Status", welcome_raw)
+
+    # If Welcome is complete but no later status exists, fold the old
+    # "Awaiting downstream" slice into Pending so the requested four-column
+    # summary still accounts for every application.
+    if welcome_category == "Done":
+        return _monthly_outcome_detail("Pending", "Welcome Status", welcome_raw)
+
+    if portal_raw:
+        return _monthly_outcome_detail("Pending", "Portal Status", portal_raw)
+    if confirmation_raw:
+        return _monthly_outcome_detail("Pending", "CallStatus", confirmation_raw)
+    if provisioning_raw:
+        if _monthly_status_has_cancel(provisioning_raw):
+            return _monthly_outcome_detail("Cancelled", "Provisioning Status", provisioning_raw)
+        return _monthly_outcome_detail("Pending", "Provisioning Status", provisioning_raw)
+    if letter_raw:
+        if _monthly_status_has_cancel(letter_raw):
+            return _monthly_outcome_detail("Cancelled", "LetterStatus", letter_raw)
+        return _monthly_outcome_detail("Pending", "LetterStatus", letter_raw)
+    if welcome_raw:
+        return _monthly_outcome_detail("Pending", "Welcome Status", welcome_raw)
+    if quality_category == "Approved" and not welcome_raw:
+        return _monthly_outcome_detail("Pending", "Welcome Status", "(blank)")
+    if quality_raw:
+        return _monthly_outcome_detail("Pending", "Quality Status", quality_raw)
+    inbound_raw = _monthly_display_text(row.get("Inbound Status", ""))
+    if inbound_raw:
+        return _monthly_outcome_detail("Pending", "Inbound Status", inbound_raw)
+    return _monthly_outcome_detail("Pending", "Quality Status", "(blank)")
+
+
+def _classify_crm_monthly_application(row):
+    """Classify CRM rows using the same sequential stage gates as CRM reporting."""
+    inbound_raw = _monthly_display_text(row.get("_CRM_InboundStatus", ""))
+    inbound_norm = normalize_workflow_status(inbound_raw)
+    if inbound_norm in {"inbound cancel", "inbound cancelled", "inbound canceled"}:
+        return _monthly_outcome_detail("Cancelled", "Inbound Status", inbound_raw)
+
+    quality_raw = _monthly_display_text(row.get("_CRM_QualityStatus", ""))
+    quality_category = map_quality(quality_raw)
+    if quality_category in {"Rejected", "Cancelled"}:
+        return _monthly_outcome_detail("Cancelled", "Quality Status", quality_raw)
+    if not bool(row.get("_CRM_QualityPassed", False)):
+        return _monthly_outcome_detail("Pending", "Quality Status", quality_raw)
+
+    welcome_raw = _monthly_display_text(row.get("_CRM_WelcomeStatus", ""))
+    if map_wc(welcome_raw) == "Cancelled" or _monthly_status_has_cancel(welcome_raw):
+        return _monthly_outcome_detail("Cancelled", "Welcome Call Status", welcome_raw)
+    if not bool(row.get("_CRM_WelcomePassed", False)):
+        return _monthly_outcome_detail("Pending", "Welcome Call Status", welcome_raw)
+
+    provisioning_raw = _monthly_display_text(row.get("_CRM_ProvisioningStatus", ""))
+    if _monthly_status_has_cancel(provisioning_raw):
+        return _monthly_outcome_detail("Cancelled", "Provisioning Status", provisioning_raw)
+    if not bool(row.get("_CRM_ProvisioningPassed", False)):
+        return _monthly_outcome_detail("Pending", "Provisioning Status", provisioning_raw)
+
+    letter_raw = _monthly_display_text(row.get("_CRM_LetterStatus", ""))
+    if _monthly_status_has_cancel(letter_raw):
+        return _monthly_outcome_detail("Cancelled", "LetterStatus (Dispatch Status)", letter_raw)
+    if not bool(row.get("_CRM_LetterPassed", False)):
+        return _monthly_outcome_detail("Pending", "LetterStatus (Dispatch Status)", letter_raw)
+
+    confirmation_raw = _monthly_display_text(row.get("_CRM_ConfirmationStatus", ""))
+    if _is_confirmation_cancel_status(confirmation_raw) or _monthly_status_has_cancel(confirmation_raw):
+        return _monthly_outcome_detail("Cancelled", "Confirmation Status", confirmation_raw)
+    if not bool(row.get("_CRM_ConfirmationPassed", False)):
+        return _monthly_outcome_detail("Pending", "Confirmation Status", confirmation_raw)
+
+    onboarding_raw = _monthly_display_text(row.get("_CRM_OnboardingStatus", ""))
+    onboarding_state = _onboarding_state(onboarding_raw)
+    if onboarding_state == "live":
+        return _monthly_outcome_detail("Live", "Committed (Live) Status (Onboarding Status)", onboarding_raw)
+    if onboarding_state == "live_cancelled" or _monthly_status_has_cancel(onboarding_raw):
+        return _monthly_outcome_detail("Cancelled", "Committed (Live) Status (Onboarding Status)", onboarding_raw)
+    return _monthly_outcome_detail("Pending", "Committed (Live) Status (Onboarding Status)", onboarding_raw)
+
+
+def build_agent_portal_combined_monthly_outcomes(apps_frame, portal_frame, agent_name=None, as_of=None):
+    """Create one row per application across legacy Excel and post-cutover CRM.
+
+    The source frames are re-filtered for the signed-in agent using the same
+    advisor canonicalisation used by the former legacy monthly table. This keeps
+    source aliases from silently removing an agent's historical month totals.
+    """
+    as_of = as_of or datetime.date.today()
+    as_of_date = as_of.date() if isinstance(as_of, datetime.datetime) else as_of
+    apps = apps_frame.copy() if isinstance(apps_frame, pd.DataFrame) else pd.DataFrame()
+    portal = portal_frame.copy() if isinstance(portal_frame, pd.DataFrame) else pd.DataFrame()
+    if agent_name is not None:
+        target_agent_key = re.sub(r"[^a-z0-9]", "", canonicalize_advisor(agent_name).lower())
+        def _for_monthly_agent(frame):
+            if frame.empty or "Advisor" not in frame.columns:
+                return frame.iloc[0:0].copy()
+            advisor_keys = frame["Advisor"].apply(
+                lambda value: re.sub(r"[^a-z0-9]", "", canonicalize_advisor(value).lower())
+            )
+            return frame.loc[advisor_keys.eq(target_agent_key)].copy()
+        apps = _for_monthly_agent(apps)
+        portal = _for_monthly_agent(portal)
+    if apps.empty:
+        return pd.DataFrame(columns=["Date_Parsed", "Outcome", "Bucket", "Source", "Stage", "Status"])
+
+    if "Date_Parsed" not in apps.columns:
+        source_date_col = next((c for c in ("Standardized_Date", "Sale Date", "Date") if c in apps.columns), None)
+        apps["Date_Parsed"] = parse_date_series(apps[source_date_col]) if source_date_col else pd.NaT
+    apps["Date_Parsed"] = pd.to_datetime(apps["Date_Parsed"], errors="coerce")
+    if "Source" not in apps.columns:
+        apps["Source"] = ""
+    if "Advisor" not in apps.columns:
+        apps["Advisor"] = ""
+
+    # ------------------------------- LEGACY --------------------------------
+    legacy_apps = apps[
+        apps["Source"].fillna("").astype(str).str.strip().eq("Google - Sparta")
+        & apps["Date_Parsed"].notna()
+        & (apps["Date_Parsed"].dt.date <= LEGACY_SOURCE_CUTOFF.date())
+        & (apps["Date_Parsed"].dt.date <= as_of_date)
+    ].copy()
+
+    legacy_portal = portal.copy()
+    if not legacy_portal.empty and "Source" in legacy_portal.columns:
+        legacy_portal = legacy_portal[
+            legacy_portal["Source"].fillna("").astype(str).str.strip().eq("Google - Sparta2")
+        ].copy()
+    else:
+        legacy_portal = pd.DataFrame()
+
+    if not legacy_portal.empty:
+        if "Date_Parsed" not in legacy_portal.columns:
+            legacy_portal["Date_Parsed"] = parse_date_series(
+                legacy_portal.get("Sale Date", pd.Series(index=legacy_portal.index, dtype=object))
+            )
+        legacy_portal["Date_Parsed"] = pd.to_datetime(legacy_portal["Date_Parsed"], errors="coerce")
+        legacy_portal = legacy_portal[
+            legacy_portal["Date_Parsed"].notna()
+            & (legacy_portal["Date_Parsed"].dt.date <= LEGACY_SOURCE_CUTOFF.date())
+            & (legacy_portal["Date_Parsed"].dt.date <= as_of_date)
+        ].copy()
+        legacy_portal = add_record_keys(legacy_portal, "Sale Date", "Telephone No.")
+        legacy_portal["_RecordKey"] = legacy_portal["_RecordKey"].fillna("").astype(str).str.strip()
+        legacy_portal = legacy_portal[legacy_portal["_RecordKey"].ne("")].drop_duplicates(
+            subset=["_RecordKey"], keep="last"
+        )
+        portal_rename = {
+            "Status": "_LegacyPortalStatus",
+            "CallStatus": "_LegacyConfirmationStatus",
+            "Provisioning Status": "_LegacyProvisioningStatus",
+            "LetterStatus": "_LegacyLetterStatus",
+            "Downstream_Category": "_LegacyDownstreamCategory",
+        }
+        portal_columns = ["_RecordKey"] + [c for c in portal_rename if c in legacy_portal.columns]
+        legacy_portal_for_merge = legacy_portal[portal_columns].rename(columns=portal_rename)
+    else:
+        legacy_portal_for_merge = pd.DataFrame(columns=[
+            "_RecordKey", "_LegacyPortalStatus", "_LegacyConfirmationStatus",
+            "_LegacyProvisioningStatus", "_LegacyLetterStatus", "_LegacyDownstreamCategory",
+        ])
+
+    legacy_records = pd.DataFrame()
+    if not legacy_apps.empty:
+        if "Standardized_Date" not in legacy_apps.columns:
+            legacy_apps["Standardized_Date"] = legacy_apps["Date_Parsed"]
+        if "CLI" not in legacy_apps.columns:
+            legacy_apps["CLI"] = legacy_apps.get("Telephone No.", "")
+        legacy_apps = add_record_keys(legacy_apps, "Standardized_Date", "CLI")
+        legacy_apps["_RecordKey"] = legacy_apps["_RecordKey"].fillna("").astype(str).str.strip()
+        has_key = legacy_apps["_RecordKey"].ne("")
+        keyed = legacy_apps.loc[has_key].drop_duplicates(subset=["_RecordKey"], keep="last")
+        unkeyed = legacy_apps.loc[~has_key]
+        legacy_apps = pd.concat([keyed, unkeyed], axis=0).sort_index(kind="stable")
+        legacy_records = legacy_apps.merge(
+            legacy_portal_for_merge,
+            on="_RecordKey",
+            how="left",
+            validate="many_to_one",
+        )
+        if "Quality Status" not in legacy_records.columns:
+            legacy_records["Quality Status"] = ""
+        if "Status" not in legacy_records.columns:
+            legacy_records["Status"] = ""
+        legacy_records = legacy_records.reset_index(drop=True)
+
+    # ------------------------------- CRM -----------------------------------
+    crm_records = build_crm_stage_reconciliation(apps, portal)
+    if not crm_records.empty:
+        crm_records["Date_Parsed"] = pd.to_datetime(crm_records["Date_Parsed"], errors="coerce")
+        crm_records = crm_records[
+            crm_records["Date_Parsed"].notna()
+            & (crm_records["Date_Parsed"].dt.date >= CRM_SOURCE_START.date())
+            & (crm_records["Date_Parsed"].dt.date <= as_of_date)
+        ].copy()
+
+    result_rows = []
+    for _, record in legacy_records.iterrows():
+        classified = _classify_legacy_monthly_application(record)
+        result_rows.append({
+            "Date_Parsed": record.get("Date_Parsed"),
+            "Outcome": classified["Outcome"],
+            "Bucket": classified["Bucket"],
+            "Source": "Legacy Excel",
+            "Stage": classified["Stage"],
+            "Status": classified["Status"],
+        })
+
+    for _, record in crm_records.iterrows():
+        classified = _classify_crm_monthly_application(record)
+        result_rows.append({
+            "Date_Parsed": record.get("Date_Parsed"),
+            "Outcome": classified["Outcome"],
+            "Bucket": classified["Bucket"],
+            "Source": "CRM",
+            "Stage": classified["Stage"],
+            "Status": classified["Status"],
+        })
+
+    if not result_rows:
+        return pd.DataFrame(columns=["Date_Parsed", "Outcome", "Bucket", "Source", "Stage", "Status"])
+
+    result = pd.DataFrame(result_rows)
+    result["Date_Parsed"] = pd.to_datetime(result["Date_Parsed"], errors="coerce")
+    result = result[result["Date_Parsed"].notna()].copy()
+    result["Outcome"] = result["Outcome"].where(
+        result["Outcome"].isin(["Pending", "Cancelled", "Live"]), "Pending"
+    )
+    return result.reset_index(drop=True)
+
+
+def render_agent_portal_combined_monthly_table_html(classified, table_id, colour_mode="Based on value"):
+    """Render the Executive Dashboard's nested month/day/category drilldown in the portal."""
+    outcome_names = ["Pending", "Cancelled", "Live"]
+    colour_targets = {
+        "Pending": (245, 158, 11),
+        "Cancelled": (239, 68, 68),
+        "Live": (34, 197, 94),
+    }
+    if classified is None or classified.empty:
+        return "<div class='compact-monthly-empty'>No applications are available for this reporting period.</div>", 180
+
+    frame = classified.copy()
+    frame["Date_Parsed"] = pd.to_datetime(frame["Date_Parsed"], errors="coerce")
+    frame = frame[frame["Date_Parsed"].notna()].copy()
+    if frame.empty:
+        return "<div class='compact-monthly-empty'>No dated applications are available for this reporting period.</div>", 180
+    frame["_MonthPeriod"] = frame["Date_Parsed"].dt.to_period("M")
+    frame["_DayKey"] = frame["Date_Parsed"].dt.strftime("%Y%m%d")
+    month_periods = sorted(frame["_MonthPeriod"].dropna().unique().tolist())
+    colour_mode = "Based on %" if str(colour_mode).strip().casefold() in {"based on %", "based on percentage", "%", "percentage"} else "Based on value"
+
+    def group_for_month(period):
+        return frame[frame["_MonthPeriod"] == period]
+
+    def group_for_day(day_value):
+        return frame[frame["_DayKey"] == day_value.strftime("%Y%m%d")]
+
+    def metrics(group):
+        total = int(len(group))
+        counts = group["Outcome"].value_counts().to_dict() if not group.empty else {}
+        result = {"Applications": total}
+        for outcome in outcome_names:
+            count = int(counts.get(outcome, 0))
+            result[outcome] = count
+            result[f"{outcome} %"] = count / total * 100.0 if total else 0.0
+        return result
+
+    def gradient_scales(groups):
+        scale = {}
+        for outcome in outcome_names:
+            field = outcome if colour_mode == "Based on value" else f"{outcome} %"
+            scale[outcome] = max((float(metrics(group).get(field, 0) or 0) for group in groups), default=0.0)
+        return scale
+
+    def gradient_colour(outcome, value, maximum):
+        if value <= 0 or maximum <= 0:
+            return ""
+        ratio = max(0.0, min(1.0, float(value) / float(maximum)))
+        blend = 0.12 + 0.72 * ratio
+        target = colour_targets[outcome]
+        rgb = tuple(round(255 * (1 - blend) + channel * blend) for channel in target)
+        return "#" + "".join(f"{channel:02x}" for channel in rgb)
+
+    def render_cells(group, scales=None, apply_gradient=True):
+        values = metrics(group)
+        parts = [f'<td class="compact-number applications-number" data-sort="{values["Applications"]}">{values["Applications"]:,}</td>']
+        for outcome in outcome_names:
+            count = int(values[outcome])
+            share = float(values[f"{outcome} %"])
+            shown = f"{count:,} ({share:.1f}%)" if count else "-"
+            style = ""
+            if apply_gradient and scales is not None:
+                measure = float(count) if colour_mode == "Based on value" else share
+                colour = gradient_colour(outcome, measure, float(scales.get(outcome, 0) or 0))
+                if colour:
+                    style = f' style="background-color:{colour};color:#172033;"'
+            parts.append(
+                f'<td class="compact-number outcome-heat-cell" data-sort="{count}" '
+                f'data-value="{count}" data-percent="{share:.4f}"{style}>{shown}</td>'
+            )
+        return "".join(parts)
+
+    bucket_order = {name: index for index, name in enumerate(
+        ["Inbound", "Quality", "Welcome", "Provisioning", "Confirmation", "Onboarding"]
+    )}
+    outcome_classes = {"Pending": "pending", "Cancelled": "cancelled", "Live": "live"}
+
+    def short_stage_hint(stage, bucket):
+        if bucket not in {"Confirmation", "Onboarding"}:
+            return ""
+        text = str(stage or "").strip()
+        lower = text.casefold()
+        if "letter" in lower or "dispatch" in lower:
+            return "Dispatch"
+        if "callstatus" in lower or "confirmation" in lower:
+            return "Confirmation"
+        if "onboarding" in lower or "portal" in lower or "committed (live)" in lower:
+            return "Onboarding"
+        return text
+
+    def render_breakdown(group):
+        if group is None or group.empty:
+            return '<div class="breakdown-empty-panel">No category or status details available.</div>'
+        values = metrics(group)
+        sections = []
+        for outcome in outcome_names:
+            outcome_count = int(values.get(outcome, 0))
+            if outcome_count <= 0:
+                continue
+            subset = group[group["Outcome"] == outcome]
+            grouped = (
+                subset.groupby(["Bucket", "Source", "Stage", "Status"], dropna=False)
+                .size().rename("Count").reset_index()
+            )
+            category_groups = {}
+            for item in grouped.itertuples(index=False):
+                bucket = _monthly_display_text(item.Bucket, "Other")
+                source = _monthly_display_text(item.Source, "Unknown")
+                stage = _monthly_display_text(item.Stage, "")
+                status = _monthly_display_text(item.Status, "(blank)")
+                key = (bucket, source, stage)
+                detail = category_groups.setdefault(key, {"count": 0, "statuses": {}})
+                count = int(item.Count)
+                detail["count"] += count
+                detail["statuses"][status] = detail["statuses"].get(status, 0) + count
+
+            category_html = []
+            ordered_categories = sorted(
+                category_groups.items(),
+                key=lambda pair: (
+                    bucket_order.get(pair[0][0], 99),
+                    -int(pair[1]["count"]),
+                    pair[0][0], pair[0][1], pair[0][2],
+                ),
+            )
+            for (bucket, source, stage), detail in ordered_categories:
+                category_count = int(detail["count"])
+                category_share = category_count / outcome_count * 100.0 if outcome_count else 0.0
+                source_class = "legacy" if source == "Legacy Excel" else "crm"
+                hint = short_stage_hint(stage, bucket)
+                hint_html = f'<span class="breakdown-category-hint">{escape(hint)}</span>' if hint else ""
+                status_rows = []
+                for status, count_raw in sorted(
+                    detail["statuses"].items(), key=lambda pair: (-int(pair[1]), str(pair[0]).casefold())
+                ):
+                    count = int(count_raw)
+                    status_share = count / category_count * 100.0 if category_count else 0.0
+                    status_rows.append(
+                        '<div class="breakdown-status-row">'
+                        f'<span class="breakdown-status-name">{escape(str(status))}</span>'
+                        f'<span class="breakdown-status-metric"><strong>{count:,}</strong>'
+                        f'<small>{status_share:.1f}%</small></span></div>'
+                    )
+                category_html.append(
+                    '<div class="breakdown-category-card">'
+                    '<div class="breakdown-category-top">'
+                    '<div class="breakdown-category-label">'
+                    f'<span>{escape(bucket)}</span>{hint_html}</div>'
+                    f'<div class="breakdown-category-total"><strong>{category_count:,}</strong>'
+                    f'<small>{category_share:.1f}%</small></div></div>'
+                    f'<div class="breakdown-category-meta"><span class="breakdown-source-chip {source_class}">{escape(source)}</span>'
+                    '<span class="breakdown-percent-label">status share of category</span></div>'
+                    f'<div class="breakdown-status-list">{"".join(status_rows)}</div></div>'
+                )
+            sections.append(
+                f'<section class="breakdown-outcome {outcome_classes[outcome]}">'
+                '<div class="breakdown-outcome-heading">'
+                f'<span>{escape(outcome)}</span><strong>{outcome_count:,}</strong></div>'
+                '<div class="breakdown-outcome-subtitle">Category percentages are of this outcome</div>'
+                f'<div class="breakdown-category-list">{"".join(category_html)}</div></section>'
+            )
+        if not sections:
+            return '<div class="breakdown-empty-panel">No category or status details available.</div>'
+        return (
+            '<div class="breakdown-panel">'
+            '<div class="breakdown-panel-legend">'
+            '<span><strong>Category %</strong> = share of outcome</span>'
+            '<span><strong>Status %</strong> = share of category</span>'
+            '</div><div class="breakdown-grid">' + "".join(sections) + '</div></div>'
+        )
+
+    monthly_groups = [group_for_month(period) for period in month_periods]
+    monthly_scales = gradient_scales(monthly_groups)
+    daily_groups = []
+    daily_rows_by_period = {}
+    last_date = max(frame["Date_Parsed"].dt.date)
+    for period in month_periods:
+        start = period.start_time.date()
+        end = min(period.end_time.date(), last_date)
+        days = []
+        current = start
+        while current <= end:
+            group = group_for_day(current)
+            days.append((current, group))
+            daily_groups.append(group)
+            current += datetime.timedelta(days=1)
+        daily_rows_by_period[period] = days
+    daily_scales = gradient_scales(daily_groups)
+
+    html = f"""
+    <style>
+      html, body {{ margin:0; padding:0; height:100%; overflow:hidden; }}
+      .compact-monthly-wrap {{ width:100%; height:100%; max-height:100%; box-sizing:border-box; border:1px solid #dbe5f0; border-radius:14px; overflow-x:auto; overflow-y:auto; overscroll-behavior:contain; scrollbar-color:#cbd5e1 #f8fafc; scrollbar-width:thin; box-shadow:0 8px 24px rgba(15,23,42,.05); background:#fff; }}
+      table.compact-monthly-table {{ width:100%; border-collapse:collapse; font-family:Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif; font-size:.9rem; color:#1e293b; font-variant-numeric:tabular-nums; }}
+      table.compact-monthly-table th {{ padding:13px 16px; text-align:center; font-size:.75rem; font-weight:850; letter-spacing:.045em; text-transform:uppercase; border-bottom:1px solid #dce5f0; white-space:nowrap; position:sticky;top:0;z-index:2; }}
+      table.compact-monthly-table th:first-child, table.compact-monthly-table td:first-child {{ text-align:left; }}
+      table.compact-monthly-table th:first-child {{ background:#f1f5f9;color:#334155; }}
+      table.compact-monthly-table th:nth-child(2) {{ background:#eff6ff;color:#1e40af; }}
+      table.compact-monthly-table th:nth-child(3) {{ background:#fff7d6;color:#8a6500; }}
+      table.compact-monthly-table th:nth-child(4) {{ background:#fee2e2;color:#b91c1c; }}
+      table.compact-monthly-table th:nth-child(5) {{ background:#dcfce7;color:#166534; }}
+      table.compact-monthly-table td {{ padding:11px 16px;text-align:center;border-bottom:1px solid #edf1f7; }}
+      table.compact-monthly-table td:first-child {{ font-weight:700;color:#172942;white-space:nowrap; }}
+      table.compact-monthly-table tbody tr.month-row:hover td:not(.outcome-heat-cell), table.compact-monthly-table tbody tr.daily-row:hover td:not(.outcome-heat-cell) {{ background:#f8fafc; }}
+      table.compact-monthly-table td.outcome-heat-cell {{ transition:filter .12s ease, box-shadow .12s ease; font-weight:650; }}
+      table.compact-monthly-table tbody tr.month-row:hover td.outcome-heat-cell, table.compact-monthly-table tbody tr.daily-row:hover td.outcome-heat-cell {{ filter:saturate(1.08) brightness(.98); }}
+      table.compact-monthly-table tr.daily-row {{ display:none;background:#f8fafc; }}
+      table.compact-monthly-table tr.daily-row.shown {{ display:table-row; }}
+      table.compact-monthly-table tr.daily-row td:first-child {{ padding-left:18px;font-size:.84rem;font-weight:600;color:#526176; }}
+      table.compact-monthly-table tr.breakdown-row {{ display:none;background:#f8fafc; }}
+      table.compact-monthly-table tr.breakdown-row.shown {{ display:table-row; }}
+      table.compact-monthly-table tr.breakdown-row > td {{ padding:10px 16px 16px 48px;text-align:left;white-space:normal;background:#f8fafc;border-bottom:1px solid #dce5f0; }}
+      table.compact-monthly-table tr.compact-total td {{ font-weight:850;background:#f1f5f9;border-top:2px solid #cbd5e1; }}
+      .compact-month-toggle {{ width:24px;height:24px;margin-right:8px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;color:#334155;font-size:15px;font-weight:800;line-height:20px;cursor:pointer;vertical-align:middle; }}
+      .compact-month-toggle:hover {{ background:#eff6ff;border-color:#93c5fd; }}
+      .compact-detail-toggle {{ margin:0 9px 0 0;padding:4px 9px;border:1px solid #d5deea;border-radius:7px;background:#fff;color:#475569;font-size:11px;font-weight:750;cursor:pointer;vertical-align:middle; }}
+      .compact-detail-toggle:hover {{ background:#eef6ff;border-color:#93c5fd;color:#1d4ed8; }}
+      .compact-day-indent {{ display:inline-block;width:7px;height:14px;margin:0 8px 0 6px;border-left:2px solid #cbd5e1;vertical-align:-2px; }}
+      .breakdown-panel {{ display:flex;flex-direction:column;gap:9px;min-width:0; }}
+      .breakdown-panel-legend {{ display:flex;flex-wrap:wrap;gap:6px 16px;padding:0 2px;color:#64748b;font-size:10px;line-height:1.4; }}
+      .breakdown-panel-legend strong {{ color:#334155;font-weight:800; }}
+      .breakdown-grid {{ display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:11px;align-items:start; }}
+      .breakdown-outcome {{ min-width:0;overflow:hidden;border:1px solid #e2e8f0;border-radius:11px;background:#fff;box-shadow:0 2px 7px rgba(15,23,42,.035); }}
+      .breakdown-outcome-heading {{ display:flex;align-items:center;justify-content:space-between;padding:9px 12px;font-size:12px;font-weight:850;letter-spacing:.015em;border-bottom:1px solid #e8edf3; }}
+      .breakdown-outcome-heading strong {{ font-size:14px;font-variant-numeric:tabular-nums; }}
+      .breakdown-outcome.pending .breakdown-outcome-heading {{ background:#fff7d6;color:#8a6500; }}
+      .breakdown-outcome.cancelled .breakdown-outcome-heading {{ background:#fee2e2;color:#b91c1c; }}
+      .breakdown-outcome.live .breakdown-outcome-heading {{ background:#dcfce7;color:#166534; }}
+      .breakdown-outcome-subtitle {{ padding:5px 11px 0;color:#94a3b8;font-size:9px; }}
+      .breakdown-category-list {{ display:flex;flex-direction:column;gap:7px;padding:8px; }}
+      .breakdown-category-card {{ min-width:0;border:1px solid #edf1f5;border-radius:8px;background:#fbfcfe;overflow:hidden; }}
+      .breakdown-category-top {{ display:flex;justify-content:space-between;align-items:center;gap:9px;padding:7px 9px 4px; }}
+      .breakdown-category-label {{ display:flex;flex-direction:column;min-width:0;color:#26364b;font-size:11px;font-weight:800;line-height:1.35;overflow-wrap:anywhere; }}
+      .breakdown-category-hint {{ margin-top:1px;color:#94a3b8;font-size:9px;font-weight:550; }}
+      .breakdown-category-total {{ display:flex;align-items:baseline;gap:6px;white-space:nowrap;color:#334155;font-size:11px;font-variant-numeric:tabular-nums; }}
+      .breakdown-category-total strong {{ font-size:12px;font-weight:850; }}
+      .breakdown-category-total small {{ color:#64748b;font-size:10px;font-weight:700; }}
+      .breakdown-category-meta {{ display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 9px 5px; }}
+      .breakdown-source-chip {{ display:inline-flex;align-items:center;padding:2px 6px;border-radius:999px;font-size:9px;font-weight:800;letter-spacing:.015em; }}
+      .breakdown-source-chip.crm {{ background:#e8f1ff;color:#2454a6; }}
+      .breakdown-source-chip.legacy {{ background:#f1f5f9;color:#475569; }}
+      .breakdown-percent-label {{ color:#a0aab8;font-size:9px; }}
+      .breakdown-status-list {{ border-top:1px solid #edf1f5;background:#fff; }}
+      .breakdown-status-row {{ display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;padding:5px 9px;border-top:1px solid #f1f4f7;color:#475569;font-size:10px;line-height:1.35; }}
+      .breakdown-status-row:first-child {{ border-top:0; }}
+      .breakdown-status-name {{ min-width:0;overflow-wrap:anywhere; }}
+      .breakdown-status-metric {{ display:flex;gap:7px;align-items:baseline;white-space:nowrap;font-variant-numeric:tabular-nums; }}
+      .breakdown-status-metric strong {{ color:#26364b;font-size:10px;font-weight:850; }}
+      .breakdown-status-metric small {{ min-width:42px;text-align:right;color:#64748b;font-size:9px;font-weight:700; }}
+      .breakdown-empty-panel {{ padding:8px;color:#64748b;font-size:11px;font-style:italic; }}
+      .compact-monthly-empty {{ padding:1rem;color:#64748b; }}
+      @media (max-width:700px) {{ .compact-detail-toggle {{ padding:4px 6px;margin-right:5px; }} table.compact-monthly-table td {{ padding:9px 10px; }} table.compact-monthly-table tr.breakdown-row > td {{ padding-left:14px; }} }}
+    </style>
+    <div class="compact-monthly-wrap">
+      <table id="{escape(table_id)}" class="compact-monthly-table">
+        <thead><tr><th>Month / Day</th><th>Applications</th><th>Pending</th><th>Cancelled</th><th>Live</th></tr></thead>
+        <tbody>
+    """
+
+    all_rows = frame
+    total_breakdown_id = "agent-compact-breakdown-total"
+    html += (
+        f'<tr class="compact-total"><td>'
+        f'<button type="button" class="compact-detail-toggle" aria-expanded="false" '
+        f'onclick="toggleAgentBreakdown(\'{total_breakdown_id}\', this)" '
+        f'title="Show category and status breakdown">Details</button>Total</td>'
+        f'{render_cells(all_rows, apply_gradient=False)}</tr>'
+    )
+    html += (
+        f'<tr id="{total_breakdown_id}" class="breakdown-row">'
+        f'<td colspan="5">{render_breakdown(all_rows)}</td></tr>'
+    )
+
+    for period in month_periods:
+        month_group = group_for_month(period)
+        group_id = f"agent-month-{period.strftime('%Y%m')}"
+        month_breakdown_id = f"agent-breakdown-month-{period.strftime('%Y%m')}"
+        month_label = period.to_timestamp().strftime("%b %Y")
+        html += (
+            f'<tr class="month-row" data-group="{group_id}">'
+            f'<td><button type="button" class="compact-month-toggle" aria-expanded="false" '
+            f'onclick="toggleAgentMonth(\'{group_id}\', this)" title="Show daily rows">+</button>'
+            f'<button type="button" class="compact-detail-toggle" aria-expanded="false" '
+            f'onclick="toggleAgentBreakdown(\'{month_breakdown_id}\', this)" '
+            f'title="Show category and status breakdown">Details</button>{escape(month_label)}</td>'
+            f'{render_cells(month_group, monthly_scales)}</tr>'
+        )
+        html += (
+            f'<tr id="{month_breakdown_id}" class="breakdown-row">'
+            f'<td colspan="5">{render_breakdown(month_group)}</td></tr>'
+        )
+        for day_value, day_group in daily_rows_by_period.get(period, []):
+            day_key = day_value.strftime("%Y%m%d")
+            day_breakdown_id = f"agent-breakdown-day-{day_key}"
+            day_label = day_value.strftime("%a, %d %b")
+            html += (
+                f'<tr class="daily-row" data-parent="{group_id}">'
+                f'<td><span class="compact-day-indent"></span>'
+                f'<button type="button" class="compact-detail-toggle" aria-expanded="false" '
+                f'onclick="toggleAgentBreakdown(\'{day_breakdown_id}\', this)" '
+                f'title="Show category and status breakdown">Details</button>{escape(day_label)}</td>'
+                f'{render_cells(day_group, daily_scales)}</tr>'
+            )
+            html += (
+                f'<tr id="{day_breakdown_id}" class="breakdown-row daily-breakdown-row" '
+                f'data-parent="{group_id}"><td colspan="5">{render_breakdown(day_group)}</td></tr>'
+            )
+
+    html += "</tbody></table></div>"
+    html += f"""
+    <script>
+    (function() {{
+      const table = document.getElementById("{table_id}");
+      if (!table) return;
+      window.toggleAgentMonth = function(groupId, button) {{
+        const rows = Array.from(table.querySelectorAll('tr.daily-row[data-parent="' + groupId + '"]'));
+        const expand = button.getAttribute('aria-expanded') !== 'true';
+        rows.forEach(row => row.classList.toggle('shown', expand));
+        button.setAttribute('aria-expanded', expand ? 'true' : 'false');
+        button.textContent = expand ? '−' : '+';
+        button.title = expand ? 'Hide daily rows' : 'Show daily rows';
+        if (!expand) {{
+          const detailRows = Array.from(table.querySelectorAll('tr.daily-breakdown-row[data-parent="' + groupId + '"]'));
+          detailRows.forEach(row => row.classList.remove('shown'));
+          rows.forEach(row => {{
+            const detailButton = row.querySelector('.compact-detail-toggle');
+            if (detailButton) {{
+              detailButton.setAttribute('aria-expanded', 'false');
+              detailButton.textContent = 'Details';
+              detailButton.title = 'Show category and status breakdown';
+            }}
+          }});
+        }}
+      }};
+      window.toggleAgentBreakdown = function(detailId, button) {{
+        const row = document.getElementById(detailId);
+        if (!row || !table.contains(row)) return;
+        const expand = button.getAttribute('aria-expanded') !== 'true';
+        row.classList.toggle('shown', expand);
+        button.setAttribute('aria-expanded', expand ? 'true' : 'false');
+        button.textContent = expand ? 'Hide' : 'Details';
+        button.title = expand ? 'Hide category and status breakdown' : 'Show category and status breakdown';
+      }};
+    }})();
+    </script>
+    """
+    visible_months = len(month_periods)
+    height = min(720, max(230, 108 + visible_months * 48))
+    return html, height
+
+
 # ----------------------------------------------------------------------------
 # SESSION STATE
 # ----------------------------------------------------------------------------
@@ -4207,946 +4884,47 @@ with dashboard_tab:
                 st.html(f'<div class="insight-wrap">{flags_html}</div>')
 
             # ------------------------------------------------------------------------
-            # MONTHLY TRADITIONAL EXCEL (SPARTA / SPARTA2) SUMMARY
-            # ------------------------------------------------------------------------
-            # Keep this as a separate table from CRM so source-specific headers and
-            # classification rules never get fused. September intentionally appears
-            # in both tables: legacy covers through 17-Sep, CRM starts 18-Sep.
-            st.html('<div style="height:6px"></div>')
-            render_section(
-                "Monthly Excel performance",
-                "▦",
-                "Traditional Sparta / Sparta2 sheets · legacy records through 17-Sep-2026",
-            )
-            st.caption(
-                "This separate table reads the traditional Sparta (gid 1598890500) and Sparta2 (gid 1601740359) worksheets directly, "
-                "using only legacy records through 17 September 2026. Its status columns are created only from status fields actually available in those legacy sheets; "
-                "CRM-only fields such as Inbound Status and Inbound Remarks are deliberately excluded. "
-                "September also appears in the CRM table below for records from 18 September onward. "
-                "Attendance follows the existing working-day rule: Sundays and 1st/3rd Saturdays are excluded; "
-                "P=1, HD=0.5, Ab/UL=0. SPD = applications ÷ total attendance."
-            )
-
-            # Build this table from the complete loaded frames rather than the already
-            # filtered KPI/log frames (ag1/ag2). The source and agent filters are applied
-            # explicitly here so a prior transformation in the main portal cannot make
-            # the legacy table appear empty for every login.
-            def _legacy_source_for_agent(source_frame, source_name):
-                if not isinstance(source_frame, pd.DataFrame) or source_frame.empty:
-                    return pd.DataFrame()
-                frame = source_frame.copy()
-                if "Source" not in frame.columns:
-                    return pd.DataFrame()
-                frame = frame[
-                    frame["Source"].fillna("").astype(str).str.strip().eq(source_name)
-                ].copy()
-                if frame.empty:
-                    return frame
-
-                # Canonicalize usernames as well as spacing/case. This preserves the
-                # per-agent access boundary while supporting the same aliases used by
-                # the rest of the portal.
-                if "Advisor" not in frame.columns:
-                    frame["Advisor"] = ""
-                frame["_LegacyAdvisorKey"] = frame["Advisor"].apply(
-                    lambda value: re.sub(r"[^a-z0-9]", "", canonicalize_advisor(value).lower())
-                )
-                target_key = re.sub(r"[^a-z0-9]", "", canonicalize_advisor(agent).lower())
-                frame = frame[frame["_LegacyAdvisorKey"].eq(target_key)].copy()
-                return frame.drop(columns=["_LegacyAdvisorKey"], errors="ignore")
-
-            # The fetch cache can contain frames created before a header variant was
-            # normalized, so normalize once more at the table boundary as a safeguard.
-            _monthly_legacy_sparta = normalize_legacy_sheet_columns(df1, "Sparta")
-            _monthly_legacy_sparta2 = normalize_legacy_sheet_columns(df2_raw, "Sparta2")
-            legacy_apps = _legacy_source_for_agent(_monthly_legacy_sparta, "Google - Sparta")
-            legacy_portal = _legacy_source_for_agent(_monthly_legacy_sparta2, "Google - Sparta2")
-            _legacy_rows_available = 0
-            if "Source" in _monthly_legacy_sparta.columns:
-                _legacy_rows_available += int(_monthly_legacy_sparta["Source"].fillna("").astype(str).str.strip().eq("Google - Sparta").sum())
-            if "Source" in _monthly_legacy_sparta2.columns:
-                _legacy_rows_available += int(_monthly_legacy_sparta2["Source"].fillna("").astype(str).str.strip().eq("Google - Sparta2").sum())
-            _legacy_agent_rows = len(legacy_apps) + len(legacy_portal)
-
-            if not legacy_apps.empty:
-                if "Date_Parsed" not in legacy_apps.columns:
-                    legacy_apps["Date_Parsed"] = pd.NaT
-                legacy_apps["Date_Parsed"] = pd.to_datetime(legacy_apps["Date_Parsed"], errors="coerce")
-                if legacy_apps["Date_Parsed"].isna().all():
-                    for _date_col in ("Standardized_Date", "Sale Date", "Date"):
-                        if _date_col in legacy_apps.columns:
-                            _parsed_dates = parse_date_series(legacy_apps[_date_col])
-                            if _parsed_dates.notna().any():
-                                legacy_apps["Date_Parsed"] = _parsed_dates
-                                break
-                legacy_apps = legacy_apps[
-                    legacy_apps["Date_Parsed"].notna()
-                    & (legacy_apps["Date_Parsed"].dt.date <= LEGACY_SOURCE_CUTOFF.date())
-                    & (legacy_apps["Date_Parsed"].dt.date <= today_date)
-                ].copy()
-                if not legacy_apps.empty:
-                    # IMPORTANT: df1 is concatenated with CRM rows before reaching this
-                    # table. Therefore the combined frame may already contain _RecordKey,
-                    # but legacy rows can have that field blank. Always rebuild the key
-                    # from the legacy sheet's own date + phone columns.
-                    legacy_apps = add_record_keys(legacy_apps, "Standardized_Date", "CLI")
-                    legacy_apps["_RecordKey"] = legacy_apps["_RecordKey"].fillna("").astype(str).str.strip()
-
-                    # Deduplicate only rows that have the agreed Sale Date + phone key.
-                    # A dated application with a missing phone must still count as an
-                    # application; it simply cannot be joined to a Sparta2 outcome row.
-                    _legacy_has_key = legacy_apps["_RecordKey"].ne("")
-                    _legacy_keyed = legacy_apps.loc[_legacy_has_key].drop_duplicates(
-                        subset=["_RecordKey"], keep="last"
-                    )
-                    _legacy_unkeyed = legacy_apps.loc[~_legacy_has_key]
-                    legacy_apps = pd.concat(
-                        [_legacy_keyed, _legacy_unkeyed], axis=0
-                    ).sort_index(kind="stable")
-
-            if not legacy_portal.empty:
-                if "Date_Parsed" not in legacy_portal.columns:
-                    legacy_portal["Date_Parsed"] = pd.NaT
-                legacy_portal["Date_Parsed"] = pd.to_datetime(legacy_portal["Date_Parsed"], errors="coerce")
-                if legacy_portal["Date_Parsed"].isna().all():
-                    for _date_col in ("Sale Date", "Standardized_Date", "Date"):
-                        if _date_col in legacy_portal.columns:
-                            _parsed_dates = parse_date_series(legacy_portal[_date_col])
-                            if _parsed_dates.notna().any():
-                                legacy_portal["Date_Parsed"] = _parsed_dates
-                                break
-                legacy_portal = legacy_portal[
-                    legacy_portal["Date_Parsed"].notna()
-                    & (legacy_portal["Date_Parsed"].dt.date <= LEGACY_SOURCE_CUTOFF.date())
-                    & (legacy_portal["Date_Parsed"].dt.date <= today_date)
-                ].copy()
-                if not legacy_portal.empty:
-                    # As above, do not trust an existing combined-frame _RecordKey for
-                    # legacy rows: regenerate from the original Sparta2 Sale Date + phone.
-                    legacy_portal = add_record_keys(legacy_portal, "Sale Date", "Telephone No.")
-                    legacy_portal["_RecordKey"] = legacy_portal["_RecordKey"].fillna("").astype(str).str.strip()
-                    legacy_portal = legacy_portal[
-                        legacy_portal["_RecordKey"].ne("")
-                    ].drop_duplicates(subset=["_RecordKey"], keep="last")
-
-            legacy_monthly = pd.DataFrame()
-            legacy_daily = pd.DataFrame()
-            legacy_status_specs = []
-            if not legacy_apps.empty:
-                # Determine the Welcome field from values actually present on legacy rows.
-                # The combined frame may contain CRM-only headers, so column existence
-                # alone is not enough to decide which traditional sheet field to use.
-                legacy_wc_col = None
-                for _candidate_wc in ("Status", "Welcome call Status"):
-                    if _candidate_wc in legacy_apps.columns:
-                        _nonblank_wc = legacy_apps[_candidate_wc].apply(clean_reason_text)
-                        if _nonblank_wc.astype(str).str.strip().ne("").any():
-                            legacy_wc_col = _candidate_wc
-                            break
-                # Only use legacy sheet fields. Never add CRM-only Inbound columns here.
-                legacy_field_candidates = [
-                    ("Quality", "Quality Status", legacy_apps),
-                    ("Welcome Call", legacy_wc_col, legacy_apps),
-                    ("Confirmation", "CallStatus_portal", legacy_portal),
-                    ("Portal / Live", "Status_portal", legacy_portal),
-                ]
-                for group_name, field_name, source_frame in legacy_field_candidates:
-                    source_field_name = field_name.removesuffix("_portal") if field_name else None
-                    if source_field_name and not source_frame.empty and source_field_name in source_frame.columns:
-                        raw_values = source_frame[source_field_name].apply(clean_reason_text)
-                        distinct = []
-                        seen = set()
-                        for raw in raw_values:
-                            label = re.sub(r"\s+", " ", str(raw or "")).strip()
-                            key = normalize_workflow_status(label)
-                            if key and key not in seen:
-                                seen.add(key)
-                                distinct.append((key, label))
-                        if distinct:
-                            legacy_status_specs.append((group_name, field_name, distinct))
-
-                # Join Sparta2 outcomes to Sparta applications using the same Sale Date
-                # + normalized phone key used by the portal log. Do not match by phone alone.
-                if not legacy_portal.empty:
-                    portal_keep = ["_RecordKey"]
-                    for _group, _field, _distinct in legacy_status_specs:
-                        _source_field = _field.removesuffix("_portal")
-                        if _source_field in legacy_portal.columns and _source_field not in portal_keep:
-                            portal_keep.append(_source_field)
-                    portal_status_frame = legacy_portal[portal_keep].drop_duplicates("_RecordKey", keep="last").rename(
-                        columns={"CallStatus": "CallStatus_portal", "Status": "Status_portal"}
-                    )
-                    legacy_work = legacy_apps.merge(
-                        portal_status_frame, on="_RecordKey", how="left", suffixes=("", "_portal"),
-                        validate="one_to_one",
-                    )
-                else:
-                    legacy_work = legacy_apps.copy()
-
-                legacy_work["_Month"] = legacy_work["Date_Parsed"].dt.to_period("M")
-                legacy_work["_SaleDay"] = legacy_work["Date_Parsed"].dt.date
-
-                # Attendance uses the selected agent's already-filtered attendance frame.
-                legacy_attendance = ag_attendance.copy() if isinstance(ag_attendance, pd.DataFrame) else pd.DataFrame()
-                if not legacy_attendance.empty:
-                    if "Date_Parsed" not in legacy_attendance.columns:
-                        legacy_attendance["Date_Parsed"] = parse_date_series(
-                            legacy_attendance.get("Date", pd.Series(index=legacy_attendance.index, dtype=object))
-                        )
-                    legacy_attendance["Date_Parsed"] = pd.to_datetime(legacy_attendance["Date_Parsed"], errors="coerce")
-                    if "Attendance_Code" not in legacy_attendance.columns:
-                        legacy_attendance["Attendance_Code"] = legacy_attendance.get(
-                            "Attendance", pd.Series("-", index=legacy_attendance.index)
-                        ).apply(normalize_attendance_status)
-                    legacy_attendance = legacy_attendance[legacy_attendance["Date_Parsed"].notna()].copy()
-                    legacy_attendance["_AttendanceDate"] = legacy_attendance["Date_Parsed"].dt.date
-                    legacy_attendance = legacy_attendance.drop_duplicates("_AttendanceDate", keep="last")
-                legacy_attendance_by_date = (
-                    dict(zip(legacy_attendance["_AttendanceDate"], legacy_attendance["Attendance_Code"]))
-                    if not legacy_attendance.empty else {}
-                )
-                legacy_attendance_units = {"P": 1.0, "HD": 0.5, "Ab": 0.0, "UL": 0.0}
-
-                legacy_month_rows, legacy_day_rows = [], []
-                legacy_month_set = set(legacy_work["_Month"].dropna().tolist())
-                # Preserve September in the Excel table as the legacy side of the
-                # mid-month source split, even when this agent had no Sep 1–17 sale.
-                if CRM_SOURCE_START.to_period("M") == LEGACY_SOURCE_CUTOFF.to_period("M"):
-                    overlap_period = LEGACY_SOURCE_CUTOFF.to_period("M")
-                    if overlap_period.start_time.date() <= today_date:
-                        legacy_month_set.add(overlap_period)
-                for month_period in sorted(legacy_month_set):
-                    month_work = legacy_work[legacy_work["_Month"] == month_period]
-                    month_start = month_period.start_time.date()
-                    month_end = min(month_period.end_time.date(), LEGACY_SOURCE_CUTOFF.date(), today_date)
-                    if month_start > month_end:
-                        continue
-                    all_dates = [month_start + datetime.timedelta(days=i)
-                                 for i in range((month_end - month_start).days + 1)]
-                    working_dates = [d for d in all_dates if not _monthly_table_is_holiday(d)]
-                    attendance_total = sum(
-                        legacy_attendance_units.get(str(legacy_attendance_by_date.get(d, "-")).strip(), 0.0)
-                        for d in working_dates
-                    )
-
-                    def _legacy_status_counts(frame):
-                        result = {}
-                        for group_name, field_name, distinct in legacy_status_specs:
-                            actual_field = field_name
-                            if actual_field not in frame.columns and f"{actual_field}_portal" in frame.columns:
-                                actual_field = f"{actual_field}_portal"
-                            if actual_field not in frame.columns:
-                                continue
-                            keys = frame[actual_field].apply(lambda v: normalize_workflow_status(clean_reason_text(v)))
-                            for status_key, label in distinct:
-                                result[f"{group_name} · {label}"] = int((keys == status_key).sum())
-                        return result
-
-                    app_count = int(len(month_work))
-                    month_row = {
-                        "Month": month_period.to_timestamp().strftime("%b-%Y"),
-                        "Total Attendance": f"{attendance_total:g}",
-                        "SPD": f"{app_count / attendance_total:.2f}" if attendance_total > 0 else "—",
-                        "Applications": app_count,
-                    }
-                    month_row.update(_legacy_status_counts(month_work))
-                    legacy_month_rows.append(month_row)
-
-                    for sale_day in all_dates:
-                        day_work = month_work[month_work["_SaleDay"] == sale_day]
-                        day_attendance = str(legacy_attendance_by_date.get(sale_day, "-")).strip()
-                        day_units = legacy_attendance_units.get(day_attendance, 0.0)
-                        day_count = int(len(day_work))
-                        day_row = {
-                            "Date": sale_day.strftime("%a, %d %b"),
-                            "_MonthKey": month_period.strftime("%Y-%m"),
-                            "Attendance": day_attendance if day_attendance in {"P", "HD", "Ab", "UL"} else "-",
-                            "SPD": f"{day_count / day_units:.2f}" if day_units > 0 else "—",
-                            "Applications": day_count,
-                        }
-                        day_row.update(_legacy_status_counts(day_work))
-                        legacy_day_rows.append(day_row)
-
-                legacy_dynamic_columns = [
-                    f"{group_name} · {label}"
-                    for group_name, _field, distinct in legacy_status_specs
-                    for _key, label in distinct
-                ]
-                legacy_monthly = pd.DataFrame(legacy_month_rows)
-                legacy_daily = pd.DataFrame(legacy_day_rows)
-                if not legacy_monthly.empty:
-                    for col in legacy_dynamic_columns:
-                        if col not in legacy_monthly.columns:
-                            legacy_monthly[col] = 0
-                        legacy_monthly[col] = pd.to_numeric(legacy_monthly[col], errors="coerce").fillna(0).astype(int)
-                    legacy_monthly = legacy_monthly.reindex(
-                        columns=["Month", "Total Attendance", "SPD", "Applications"] + legacy_dynamic_columns
-                    )
-                if not legacy_daily.empty:
-                    for col in legacy_dynamic_columns:
-                        if col not in legacy_daily.columns:
-                            legacy_daily[col] = 0
-                        legacy_daily[col] = pd.to_numeric(legacy_daily[col], errors="coerce").fillna(0).astype(int)
-                    legacy_daily = legacy_daily.reindex(
-                        columns=["Date", "_MonthKey", "Attendance", "SPD", "Applications"] + legacy_dynamic_columns
-                    )
-
-            # Even if this agent has no traditional application rows, show the shared
-            # cutover month as a zero-sales legacy row. This makes September visible in
-            # both reports and keeps the legacy attendance window limited to 17 Sep.
-            legacy_used_zero_fallback = False
-            if legacy_monthly.empty and CRM_SOURCE_START.to_period("M") == LEGACY_SOURCE_CUTOFF.to_period("M"):
-                overlap_period = LEGACY_SOURCE_CUTOFF.to_period("M")
-                overlap_start = overlap_period.start_time.date()
-                overlap_end = min(overlap_period.end_time.date(), LEGACY_SOURCE_CUTOFF.date(), today_date)
-                if overlap_start <= overlap_end:
-                    fallback_attendance = ag_attendance.copy() if isinstance(ag_attendance, pd.DataFrame) else pd.DataFrame()
-                    if not fallback_attendance.empty:
-                        if "Date_Parsed" not in fallback_attendance.columns:
-                            fallback_attendance["Date_Parsed"] = parse_date_series(
-                                fallback_attendance.get("Date", pd.Series(index=fallback_attendance.index, dtype=object))
-                            )
-                        fallback_attendance["Date_Parsed"] = pd.to_datetime(fallback_attendance["Date_Parsed"], errors="coerce")
-                        if "Attendance_Code" not in fallback_attendance.columns:
-                            fallback_attendance["Attendance_Code"] = fallback_attendance.get(
-                                "Attendance", pd.Series("-", index=fallback_attendance.index)
-                            ).apply(normalize_attendance_status)
-                        fallback_attendance = fallback_attendance[fallback_attendance["Date_Parsed"].notna()].copy()
-                        fallback_attendance["_AttendanceDate"] = fallback_attendance["Date_Parsed"].dt.date
-                        fallback_attendance = fallback_attendance.drop_duplicates("_AttendanceDate", keep="last")
-                        fallback_attendance_by_date = dict(zip(
-                            fallback_attendance["_AttendanceDate"], fallback_attendance["Attendance_Code"]
-                        ))
-                    else:
-                        fallback_attendance_by_date = {}
-                    fallback_units = {"P": 1.0, "HD": 0.5, "Ab": 0.0, "UL": 0.0}
-                    fallback_dates = [overlap_start + datetime.timedelta(days=i)
-                                      for i in range((overlap_end - overlap_start).days + 1)]
-                    fallback_working_dates = [d for d in fallback_dates if not _monthly_table_is_holiday(d)]
-                    fallback_total = sum(
-                        fallback_units.get(str(fallback_attendance_by_date.get(d, "-")).strip(), 0.0)
-                        for d in fallback_working_dates
-                    )
-                    legacy_monthly = pd.DataFrame([{
-                        "Month": overlap_period.to_timestamp().strftime("%b-%Y"),
-                        "Total Attendance": f"{fallback_total:g}",
-                        "SPD": "0.00" if fallback_total > 0 else "—",
-                        "Applications": 0,
-                    }])
-                    fallback_days = []
-                    for sale_day in fallback_dates:
-                        attendance_code = str(fallback_attendance_by_date.get(sale_day, "-")).strip()
-                        day_units = fallback_units.get(attendance_code, 0.0)
-                        fallback_days.append({
-                            "Date": sale_day.strftime("%a, %d %b"),
-                            "_MonthKey": overlap_period.strftime("%Y-%m"),
-                            "Attendance": attendance_code if attendance_code in {"P", "HD", "Ab", "UL"} else "-",
-                            "SPD": "0.00" if day_units > 0 else "—",
-                            "Applications": 0,
-                        })
-                    legacy_daily = pd.DataFrame(fallback_days)
-                    legacy_dynamic_columns = []
-                    legacy_status_specs = []
-                    legacy_used_zero_fallback = True
-
-            if legacy_used_zero_fallback:
-                st.caption(
-                    f"Legacy source diagnostic · traditional rows available after the 17-Sep cutoff: {_legacy_rows_available:,} · "
-                    f"rows matched to this account: {_legacy_agent_rows:,}. "
-                    "A zero-sales September row is being shown because no eligible Sparta application rows matched this account. "
-                    "If traditional rows are available but matches are zero, check advisor names in the legacy sheets against the portal login."
-                )
-
-            if legacy_monthly.empty:
-                st.info("No traditional Sparta / Sparta2 applications are available for your account through 17-Sep-2026.")
-                # Actionable diagnostic: shows whether the issue is worksheet loading,
-                # date filtering, or the selected account mapping without exposing rows.
-                st.caption(
-                    f"Legacy source diagnostic · rows available after the date cutoff: {_legacy_rows_available:,} · "
-                    f"rows matched to this account: {_legacy_agent_rows:,}. "
-                    "If source rows are zero, check the worksheet date headers/values; if source rows are present but matches are zero, check the legacy advisor names against the portal login."
-                )
-            else:
-                legacy_table_id = "excel-monthly-performance-table"
-                legacy_groups = []
-                for group_name, _field, distinct in legacy_status_specs:
-                    if any(f"{group_name} · {label}" in legacy_monthly.columns for _key, label in distinct):
-                        legacy_groups.append(group_name)
-                legacy_group_colours = {
-                    "Monthly Summary": "#102451", "Quality": "#1D4ED8",
-                    "Welcome Call": "#0F766E", "Confirmation": "#6D28D9", "Portal / Live": "#92400E",
-                }
-                legacy_display_pairs = [("Monthly Summary", x) for x in ["Month", "Total Attendance", "SPD", "Applications"]]
-                for col in legacy_monthly.columns:
-                    if " · " in col:
-                        group_name, label = col.split(" · ", 1)
-                        legacy_display_pairs.append((group_name, label))
-                legacy_header_top = [
-                    '<th class="legacy-expand-head" rowspan="2"></th>',
-                    '<th class="legacy-group-header" colspan="4">Monthly Summary</th>'
-                ]
-                for group_name in legacy_groups:
-                    count = sum(1 for group, _label in legacy_display_pairs if group == group_name)
-                    if count:
-                        legacy_header_top.append(
-                            f'<th class="legacy-group-header" colspan="{count}" '
-                            f'style="background:{legacy_group_colours.get(group_name, "#475569")}">{escape(group_name)}</th>'
-                        )
-                legacy_header_bottom = [
-                    f'<th class="legacy-sub-header">{escape(label)}</th>'
-                    for _group, label in legacy_display_pairs
-                ]
-
-                # Status-cell colours mirror the CRM table. Status columns are dynamic
-                # because only values genuinely present in Sparta/Sparta2 are displayed.
-                # Positive: green; pending/rework/SOP: amber; cancelled/rejected,
-                # duplicate and missed outcomes: red; unknown values: neutral grey.
-                _legacy_status_palettes = {
-                    "yellow": ("#FFFBEB", "#F59E0B"),
-                    "green": ("#ECFDF5", "#059669"),
-                    "red": ("#FEF2F2", "#DC2626"),
-                    "neutral": ("#F8FAFC", "#CBD5E1"),
-                }
-
-                def _legacy_status_family(column_name):
-                    if " · " in str(column_name):
-                        _group, _label = str(column_name).split(" · ", 1)
-                    else:
-                        _group, _label = "", str(column_name)
-                    _label_clean = re.sub(r"[^a-z0-9]+", " ", _label.casefold()).strip()
-                    _tokens = set(_label_clean.split())
-                    _compact = _label_clean.replace(" ", "")
-                    if (
-                        _tokens.intersection({
-                            "cancel", "cancellation", "cancelled", "canceled",
-                            "reject", "rejected", "duplicate", "missed",
-                        })
-                        or _compact in {"tobecancelled", "tobecanceled", "inboundcancel"}
-                        or "duplicate" in _compact
-                        or "missed" in _compact
-                    ):
-                        return "red"
-                    if (
-                        _tokens.intersection({"pending", "rework"})
-                        or "followup" in _compact
-                        or "portpending" in _compact
-                        or "reworkrequired" in _compact
-                    ):
-                        return "yellow"
-                    if _tokens.intersection({"approved", "done", "satisfied", "live"}) or _compact in {
-                        "rs/satisfied", "rp/satisfied", "rssatisfied", "rpsatisfied"
-                    }:
-                        return "green"
-                    return "neutral"
-
-                def _legacy_blend_hex(low_hex, high_hex, ratio):
-                    low_rgb = tuple(int(low_hex[i:i + 2], 16) for i in (1, 3, 5))
-                    high_rgb = tuple(int(high_hex[i:i + 2], 16) for i in (1, 3, 5))
-                    rgb = tuple(round(a + (b - a) * ratio) for a, b in zip(low_rgb, high_rgb))
-                    return "#" + "".join(f"{component:02X}" for component in rgb)
-
-                _legacy_status_families = {
-                    col: _legacy_status_family(col) for col in legacy_dynamic_columns
-                }
-                _legacy_status_max = {}
-                for _col, _family in _legacy_status_families.items():
-                    _month_values = (
-                        pd.to_numeric(legacy_monthly[_col], errors="coerce").fillna(0)
-                        if _col in legacy_monthly.columns else pd.Series(dtype=float)
-                    )
-                    _day_values = (
-                        pd.to_numeric(legacy_daily[_col], errors="coerce").fillna(0)
-                        if _col in legacy_daily.columns else pd.Series(dtype=float)
-                    )
-                    _legacy_status_max[(_family, "month")] = max(
-                        _legacy_status_max.get((_family, "month"), 0),
-                        float(_month_values.max()) if not _month_values.empty else 0,
-                    )
-                    _legacy_status_max[(_family, "day")] = max(
-                        _legacy_status_max.get((_family, "day"), 0),
-                        float(_day_values.max()) if not _day_values.empty else 0,
-                    )
-
-                def _legacy_status_cell_html(column_name, value, row_kind):
-                    try:
-                        count = int(value) if pd.notna(value) else 0
-                    except (TypeError, ValueError):
-                        count = 0
-                    family = _legacy_status_families.get(column_name, "neutral")
-                    low_hex, high_hex = _legacy_status_palettes[family]
-                    maximum = _legacy_status_max.get((family, row_kind), 0)
-                    # Keep zero cells subtly tinted to reveal the status category while
-                    # reserving stronger colour for non-zero counts.
-                    ratio = 0.0 if count <= 0 or maximum <= 0 else 0.16 + 0.84 * min(1.0, count / maximum)
-                    background = _legacy_blend_hex(low_hex, high_hex, ratio)
-                    foreground = "#FFFFFF" if family in {"green", "red"} and ratio >= 0.68 else "#334155"
-                    display_value = "—" if count <= 0 else f"{count:,}"
-                    return (
-                        f'<td class="legacy-status-number {family}" '
-                        f'style="background:{background};color:{foreground};font-weight:750;text-align:center;">'
-                        f'{display_value}</td>'
-                    )
-
-                legacy_rows_html = []
-                for _, row in legacy_monthly.iterrows():
-                    month_label = str(row["Month"])
-                    parsed = pd.to_datetime(month_label, format="%b-%Y", errors="coerce")
-                    month_key = parsed.strftime("%Y-%m") if pd.notna(parsed) else re.sub(r"[^A-Za-z0-9_-]", "", month_label)
-                    group_id = f"excel-month-{month_key}"
-                    legacy_rows_html.append(
-                        f'<tr class="legacy-month-row"><td class="legacy-expand-cell"><button type="button" '
-                        f'class="legacy-expand-button" data-group="{escape(group_id)}" aria-expanded="false" title="Expand daily breakdown">+</button></td>'
-                        f'<td class="legacy-month-cell">{escape(month_label)}</td>'
-                        f'<td class="legacy-number">{escape(str(row["Total Attendance"]))}</td>'
-                        f'<td class="legacy-number">{escape(str(row["SPD"]))}</td>'
-                        f'<td class="legacy-number legacy-apps-number">{int(row["Applications"]):,}</td>'
-                    )
-                    for col in legacy_dynamic_columns:
-                        legacy_rows_html.append(_legacy_status_cell_html(col, row.get(col, 0), "month"))
-                    legacy_rows_html.append('</tr>')
-                    month_daily = legacy_daily[legacy_daily["_MonthKey"].astype(str).eq(month_key)] if not legacy_daily.empty else pd.DataFrame()
-                    for _, day in month_daily.iterrows():
-                        legacy_rows_html.append(
-                            f'<tr class="legacy-daily-row" data-parent="{escape(group_id)}"><td class="legacy-expand-cell"></td>'
-                            f'<td class="legacy-date-cell">↳ {escape(str(day["Date"]))}</td>'
-                            f'<td class="legacy-number">{escape(str(day["Attendance"]))}</td>'
-                            f'<td class="legacy-number">{escape(str(day["SPD"]))}</td>'
-                            f'<td class="legacy-number">{int(day["Applications"]):,}</td>'
-                        )
-                        for col in legacy_dynamic_columns:
-                            legacy_rows_html.append(_legacy_status_cell_html(col, day.get(col, 0), "day"))
-                        legacy_rows_html.append('</tr>')
-                legacy_html = f"""
-                <style>
-                  .legacy-monthly-wrap,.legacy-monthly-wrap * {{box-sizing:border-box;}}
-                  .legacy-monthly-wrap {{width:100%;max-width:100%;overflow-x:auto;overflow-y:visible;border:1px solid #D9E2F0;border-radius:10px;background:#fff;font-family:Arial,sans-serif;color:#1E293B;}}
-                  .legacy-monthly-table {{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;font-size:12px;}}
-                  .legacy-monthly-table th,.legacy-monthly-table td {{padding:6px 8px;border-right:1px solid #E2E8F0;border-bottom:1px solid #E2E8F0;white-space:nowrap;}}
-                  .legacy-monthly-table thead th {{position:sticky;z-index:5;text-align:center;}}
-                  .legacy-group-header {{top:0;background:#102451;color:#fff;font-size:11px;font-weight:850;padding:8px 7px!important;}}
-                  .legacy-expand-head {{min-width:34px;width:34px;background:#102451;}}
-                  .legacy-sub-header {{top:31px;background:#EAF0F8;color:#26364F;font-size:10px;font-weight:800;}}
-                  .legacy-expand-cell {{width:34px;min-width:34px;text-align:center;padding:3px 4px;background:#F8FAFC;}}
-                  .legacy-expand-button {{width:23px;height:23px;padding:0;border:1px solid #CBD5E1;border-radius:6px;background:#fff;color:#334155;font-size:16px;line-height:20px;font-weight:800;cursor:pointer;}}
-                  .legacy-month-row td {{background:#F1F5FF;font-weight:750;}}
-                  .legacy-month-cell {{color:#102451;}}
-                  .legacy-daily-row {{display:none;}}
-                  .legacy-daily-row.shown {{display:table-row;}}
-                  .legacy-daily-row td {{font-size:11px;}}
-                  .legacy-date-cell {{background:#F8FAFC;color:#475569;padding-left:12px;}}
-                  .legacy-number,.legacy-status-number {{text-align:center;font-variant-numeric:tabular-nums;}}
-                  .legacy-apps-number {{color:#102451;font-weight:850;}}
-                  .legacy-status-number {{font-weight:750;}}
-                  .legacy-monthly-table tbody tr:hover td {{box-shadow:inset 0 0 0 9999px rgba(219,234,254,.18);}}
-                </style>
-                <div class="legacy-monthly-wrap"><table id="{legacy_table_id}" class="legacy-monthly-table">
-                <thead><tr>{''.join(legacy_header_top)}</tr><tr>{''.join(legacy_header_bottom)}</tr></thead>
-                <tbody>{''.join(legacy_rows_html)}</tbody></table></div>
-                <script>(function(){{const table=document.getElementById("{legacy_table_id}");if(!table)return;
-                table.querySelectorAll('.legacy-expand-button').forEach(function(button){{button.addEventListener('click',function(){{
-                const id=button.getAttribute('data-group');const rows=Array.from(table.tBodies[0].querySelectorAll('tr.legacy-daily-row[data-parent="'+id+'"]'));
-                const expand=button.getAttribute('aria-expanded')!=='true';rows.forEach(function(row){{row.classList.toggle('shown',expand);}});
-                button.setAttribute('aria-expanded',expand?'true':'false');button.textContent=expand?'−':'+';button.title=expand?'Collapse daily breakdown':'Expand daily breakdown';
-                }});}});}})();</script>
-                """
-                try:
-                    st.html(legacy_html, unsafe_allow_javascript=True)
-                except TypeError:
-                    legacy_html_fallback = legacy_html.replace('</script>', '</script>', 1)
-                    if hasattr(st, "iframe"):
-                        st.iframe(legacy_html_fallback, width="stretch", height="content", alt="Traditional Excel monthly performance with expandable daily rows")
-                    else:
-                        components.html(legacy_html_fallback, height=260, scrolling=False)
-
-            # ------------------------------------------------------------------------
-            # MONTHLY CRM-ONLY SUMMARY
+            # COMBINED MONTHLY PERFORMANCE — LEGACY EXCEL + CRM
             # ------------------------------------------------------------------------
             st.html('<div style="height:6px"></div>')
             render_section(
-                "Monthly CRM performance",
+                "Combined monthly performance",
                 "▦",
-                "CRM mirror only · raw status values counted after prior-stage approval gates",
+                "One consolidated view across legacy Excel and the post-cutover CRM mirror",
             )
             st.caption(
-                "This table is agent-specific and independent of the main date filter. "
-                "September starts at the CRM cutover (18 Sep 2026); the current month is month-to-date. "
-                "Inbound is an independent process: Inbound Status is counted separately and never suppresses sales-stage counts. "
-                "Sales-stage counts follow the approval gates: Quality → Welcome → Provisioning → Letter → Confirmation → Onboarding. "
-                "Welcome counts only after QA-Approved; Provisioning only after Welcome Approved; Letter only after a recognised successful Provisioning status "
-                "(Connectivity: Committed or Connectivity: Order Provisioned); Confirmation only after Dispatch Approved; and Onboarding only after Confirmation Approved. "
-                "Monthly Total Attendance = summed attendance units on scheduled working days (P=1, HD=0.5, Ab/UL=0). "
-                "Expanded daily rows use the same gates. SPD = all CRM applications ÷ total attendance. "
-                "Sundays and 1st/3rd Saturdays are excluded from monthly attendance totals."
+                "Applications are combined by sale month, with the existing source cutover preserved: "
+                f"legacy Sparta / Sparta2 through {LEGACY_SOURCE_CUTOFF.strftime('%d %b %Y')} and CRM from "
+                f"{CRM_SOURCE_START.strftime('%d %b %Y')}. Pending includes applications awaiting the next "
+                "workflow step (including Welcome-complete records awaiting downstream progress); exact blank "
+                "statuses remain visible in Details. Cancelled and Live are mutually exclusive application outcomes. "
+                "Expand a month for daily "
+                "rows, or select Details to inspect the exact workflow categories, source and original statuses."
             )
-            monthly_crm_summary, daily_crm_summary = build_crm_monthly_summary(
-                ag1, ag2, ag_attendance, as_of=today_date
+
+            combined_monthly_outcomes = build_agent_portal_combined_monthly_outcomes(
+                df1, df2_raw, agent_name=agent, as_of=today_date
             )
-            if monthly_crm_summary.empty:
-                st.info("No CRM mirror applications are available for your account yet.")
+            if combined_monthly_outcomes.empty:
+                st.info("No monthly performance records are available for your account yet.")
             else:
-                # Compact two-level headers: workflow groups on the first row and
-                # individual status names on the second row. Native Streamlit controls
-                # above the table toggle each month's daily rows without iframe overlap.
-                workflow_groups = ["Inbound", "Quality", "Welcome", "Provisioning", "Letter", "Confirmation", "Onboarding"]
-
-                def compact_status_header(group_name, label):
-                    text = str(label).strip()
-                    prefixes = {
-                        "Inbound": r"^Inbound[-\s]+",
-                        "Quality": r"^QA[-\s]+",
-                        "Welcome": r"^(?:Welcome|WC)[-\s]+",
-                        "Provisioning": r"^Connectivity[:\s-]+",
-                        "Letter": r"^Dispatch[-\s]+",
-                        "Confirmation": r"^Confirmation[-\s]+",
-                        "Onboarding": r"^Onboarding[-\s]+",
-                    }
-                    pattern = prefixes.get(group_name)
-                    if pattern:
-                        text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
-                    return text or str(label).strip()
-
-                summary_columns = ["Month", "Total Attendance", "SPD", "Applications"]
-                status_columns = [
-                    col for col in monthly_crm_summary.columns
-                    if col not in set(summary_columns)
-                ]
-                display_pairs = [("Monthly Summary", name) for name in summary_columns]
-                for col in status_columns:
-                    group_name, raw_label = col.split(" · ", 1)
-                    display_pairs.append((group_name, compact_status_header(group_name, raw_label)))
-
-                header_colours = {
-                    "Monthly Summary": "#102451",
-                    "Inbound": "#475569",
-                    "Quality": "#1D4ED8",
-                    "Welcome": "#0F766E",
-                    "Provisioning": "#6D28D9",
-                    "Letter": "#C2410C",
-                    "Confirmation": "#BE185D",
-                    "Onboarding": "#92400E",
-                }
-
-                def status_colour_family(group_name, short_label):
-                    """Assign a consistent semantic colour to CRM and legacy status columns."""
-                    label = re.sub(r"[^a-z0-9]+", " ", str(short_label).casefold()).strip()
-                    tokens = set(label.split())
-                    compact = label.replace(" ", "")
-
-                    # Negative / terminal outcomes. Match singular as well as plural
-                    # forms because the traditional sheets use labels such as "Cancel"
-                    # and "Quality Reject", while CRM may use "Cancelled" / "Rejected".
-                    if (
-                        tokens.intersection({
-                            "cancel", "cancellation", "cancelled", "canceled",
-                            "reject", "rejected", "duplicate", "missed",
-                        })
-                        or compact in {"tobecancelled", "tobecanceled", "inboundcancel"}
-                        or "duplicate" in compact
-                        or "missed" in compact
-                    ):
-                        return "red"
-
-                    # Waiting / work-in-progress / follow-up states.
-                    if (
-                        tokens.intersection({"pending", "rework", "delayed", "delay", "extended", "hold"})
-                        or "followup" in compact
-                        or "portpending" in compact
-                        or "reworkrequired" in compact
-                    ):
-                        return "yellow"
-
-                    # Positive outcomes across both sources.
-                    if (
-                        tokens.intersection({"approved", "done", "satisfied", "live"})
-                        or compact in {
-                            "rs/satisfied", "rp/satisfied", "rssatisfied", "rpsatisfied",
-                            "committed", "orderprovisioned",
-                        }
-                    ):
-                        return "green"
-                    return "neutral"
-
-                status_palettes = {
-                    "yellow": ("#FFFBEB", "#F59E0B"),
-                    "green": ("#ECFDF5", "#059669"),
-                    "red": ("#FEF2F2", "#DC2626"),
-                    "neutral": ("#F8FAFC", "#CBD5E1"),
-                }
-
-                def blend_hex(low_hex, high_hex, ratio):
-                    low_rgb = tuple(int(low_hex[i:i + 2], 16) for i in (1, 3, 5))
-                    high_rgb = tuple(int(high_hex[i:i + 2], 16) for i in (1, 3, 5))
-                    rgb = tuple(round(a + (b - a) * ratio) for a, b in zip(low_rgb, high_rgb))
-                    return "#" + "".join(f"{component:02X}" for component in rgb)
-
-                status_families = {}
-                for group_name, short_label in display_pairs:
-                    if group_name != "Monthly Summary":
-                        matching_col = next(
-                            col for col in status_columns
-                            if col.split(" · ", 1)[0] == group_name
-                            and compact_status_header(group_name, col.split(" · ", 1)[1]) == short_label
-                        )
-                        status_families[matching_col] = status_colour_family(group_name, short_label)
-
-                # Scale monthly and daily shades separately so daily counts remain
-                # visually meaningful instead of being washed out by monthly totals.
-                shade_max = {}
-                for col, family in status_families.items():
-                    month_values = pd.to_numeric(monthly_crm_summary[col], errors="coerce").fillna(0)
-                    day_values = (
-                        pd.to_numeric(daily_crm_summary[col], errors="coerce").fillna(0)
-                        if col in daily_crm_summary.columns else pd.Series(dtype=float)
-                    )
-                    shade_max[(family, "month")] = max(
-                        shade_max.get((family, "month"), 0),
-                        float(month_values.max()) if not month_values.empty else 0,
-                    )
-                    shade_max[(family, "day")] = max(
-                        shade_max.get((family, "day"), 0),
-                        float(day_values.max()) if not day_values.empty else 0,
-                    )
-
-                def status_cell_html(col, value, row_kind):
-                    try:
-                        count = int(value) if pd.notna(value) else 0
-                    except (TypeError, ValueError):
-                        count = 0
-                    family = status_families.get(col, "neutral")
-                    low_hex, high_hex = status_palettes[family]
-                    maximum = shade_max.get((family, row_kind), 0)
-                    ratio = 0.0 if count <= 0 or maximum <= 0 else 0.16 + 0.84 * min(1.0, count / maximum)
-                    background = blend_hex(low_hex, high_hex, ratio)
-                    foreground = "#FFFFFF" if family in {"green", "red"} and ratio >= 0.68 else "#334155"
-                    display_value = "—" if count <= 0 else f"{count:,}"
-                    return (
-                        f'<td class="status-cell" style="background:{background};color:{foreground};'
-                        f'font-weight:750;text-align:center;">{display_value}</td>'
-                    )
-
-                def basic_cell_html(value, extra_class=""):
-                    safe_value = escape(str(value))
-                    return f'<td class="{extra_class}">{safe_value}</td>'
-
-                group_counts = {}
-                for group_name, _label in display_pairs:
-                    group_counts[group_name] = group_counts.get(group_name, 0) + 1
-
-                header_row_one = ['<th class="group-header summary-group" colspan="4">Monthly Summary</th>']
-                for group_name in workflow_groups:
-                    count = sum(1 for pair in display_pairs if pair[0] == group_name)
-                    if count:
-                        header_row_one.append(
-                            f'<th class="group-header" colspan="{count}" '
-                            f'style="background:{header_colours[group_name]}">{escape(group_name)}</th>'
-                        )
-
-                header_row_two = []
-                for group_name, label in display_pairs:
-                    if group_name == "Monthly Summary":
-                        shown_label = label
-                    else:
-                        shown_label = label
-                    header_row_two.append(
-                        f'<th class="sub-header" style="border-top:3px solid '
-                        f'{header_colours.get(group_name, "#CBD5E1")}">{escape(shown_label)}</th>'
-                    )
-
-                def monthly_summary_key(month_label):
-                    # Derive the key from the month label without relying on locale-sensitive parsing.
-                    parsed_month = pd.to_datetime(str(month_label), format="%b-%Y", errors="coerce")
-                    if pd.isna(parsed_month):
-                        return re.sub(r"[^A-Za-z0-9_-]", "", str(month_label))
-                    return parsed_month.strftime("%Y-%m")
-
-                # Match the internal row expander design used by the Executive Dashboard's
-                # Monthly KPI Breakdown. The iframe must follow its content height: when
-                # every month is collapsed it shows only the monthly summary rows; when a
-                # month is expanded the daily rows increase the iframe height naturally,
-                # pushing Recent Applications Log down; collapsing removes that height.
-                table_id = "crm-monthly-performance-table"
-
-                table_rows_html = []
-                for _, month_row in monthly_crm_summary.iterrows():
-                    month_label = str(month_row["Month"])
-                    month_key = monthly_summary_key(month_label)
-                    group_id = f"crm-month-{month_key}"
-                    table_rows_html.append(
-                        f'<tr class="month-row" data-group="{escape(group_id)}">'
-                        f'<td class="expand-cell"><button type="button" class="expand-button" '
-                        f'aria-expanded="false" data-group="{escape(group_id)}" '
-                        f'title="Expand daily breakdown">+</button></td>'
-                    )
-                    table_rows_html.append(
-                        f'<td class="month-cell"><strong>{escape(month_label)}</strong></td>'
-                    )
-                    table_rows_html.append(
-                        basic_cell_html(month_row["Total Attendance"], "numeric-cell attendance-total-cell")
-                    )
-                    table_rows_html.append(basic_cell_html(month_row["SPD"], "numeric-cell spd-cell"))
-                    table_rows_html.append(
-                        basic_cell_html(f'{int(month_row["Applications"]):,}', "numeric-cell applications-cell")
-                    )
-                    for col in status_columns:
-                        table_rows_html.append(status_cell_html(col, month_row.get(col, 0), "month"))
-                    table_rows_html.append("</tr>")
-
-                    month_daily = (
-                        daily_crm_summary[
-                            daily_crm_summary["_MonthKey"].astype(str).eq(month_key)
-                        ]
-                        if not daily_crm_summary.empty
-                        else pd.DataFrame()
-                    )
-                    for _, day_row in month_daily.iterrows():
-                        table_rows_html.append(
-                            f'<tr class="daily-row" data-parent="{escape(group_id)}">'
-                            '<td class="expand-cell"></td>'
-                        )
-                        table_rows_html.append(
-                            f'<td class="date-cell"><span class="daily-indent">↳</span>'
-                            f'{escape(str(day_row["Date"]))}</td>'
-                        )
-                        table_rows_html.append(
-                            basic_cell_html(day_row["Attendance"], "numeric-cell attendance-code-cell")
-                        )
-                        table_rows_html.append(basic_cell_html(day_row["SPD"], "numeric-cell spd-cell"))
-                        table_rows_html.append(
-                            basic_cell_html(f'{int(day_row["Applications"]):,}', "numeric-cell applications-cell")
-                        )
-                        for col in status_columns:
-                            table_rows_html.append(status_cell_html(col, day_row.get(col, 0), "day"))
-                        table_rows_html.append("</tr>")
-
-                header_row_one = [
-                    '<th class="expand-head" rowspan="2" aria-label="Expand monthly details"></th>',
-                    '<th class="group-header summary-group" colspan="4">Monthly Summary</th>',
-                ]
-                for group_name in workflow_groups:
-                    count = sum(1 for pair in display_pairs if pair[0] == group_name)
-                    if count:
-                        header_row_one.append(
-                            f'<th class="group-header" colspan="{count}" '
-                            f'style="background:{header_colours[group_name]}">{escape(group_name)}</th>'
-                        )
-
-                header_row_two = []
-                for group_name, label in display_pairs:
-                    header_row_two.append(
-                        f'<th class="sub-header" style="border-top:3px solid '
-                        f'{header_colours.get(group_name, "#CBD5E1")}">{escape(label)}</th>'
-                    )
-
-                table_html = f"""
-                <style>
-                  /* Scoped to this table: the dashboard page itself is never sized or overflow-adjusted. */
-                  .crm-monthly-wrap, .crm-monthly-wrap * {{ box-sizing:border-box; }}
-                  .crm-monthly-wrap {{ display:block; width:100%; max-width:100%; height:auto; max-height:none;
-                    margin:0; padding:0; overflow-x:auto; overflow-y:visible; border:1px solid #D9E2F0;
-                    border-radius:10px; background:#fff; font-family:Arial,sans-serif; color:#1E293B;
-                    scrollbar-width:thin; }}
-                  .crm-monthly-table {{ border-collapse:separate; border-spacing:0; width:max-content; min-width:100%; font-size:12px; }}
-                  .crm-monthly-table th, .crm-monthly-table td {{ padding:6px 8px; border-right:1px solid #E2E8F0;
-                    border-bottom:1px solid #E2E8F0; white-space:nowrap; }}
-                  .crm-monthly-table thead th {{ position:sticky; z-index:5; text-align:center; }}
-                  .crm-monthly-table .group-header {{ top:0; background:#102451; color:#FFF; font-size:11px;
-                    font-weight:850; letter-spacing:.35px; padding:8px 7px !important; }}
-                  .crm-monthly-table .summary-group {{ background:#102451; }}
-                  .crm-monthly-table .expand-head {{ left:0; min-width:34px; width:34px; background:#102451; }}
-                  .crm-monthly-table .sub-header {{ top:31px; background:#EAF0F8; color:#26364F; font-size:10px; font-weight:800; }}
-                  .crm-monthly-table .expand-cell {{ width:34px; min-width:34px; text-align:center; padding:3px 4px; background:#F8FAFC; }}
-                  .crm-monthly-table .expand-button {{ width:23px; height:23px; padding:0; border:1px solid #CBD5E1;
-                    border-radius:6px; background:#FFF; color:#334155; font-size:16px; line-height:20px;
-                    font-weight:800; cursor:pointer; }}
-                  .crm-monthly-table .expand-button:hover {{ background:#EFF6FF; border-color:#93C5FD; }}
-                  .crm-monthly-table .month-row td {{ background-color:#F1F5FF; font-weight:750; }}
-                  .crm-monthly-table .month-row .month-cell {{ color:#102451; text-align:left; }}
-                  .crm-monthly-table .daily-row {{ display:none; }}
-                  .crm-monthly-table .daily-row.shown {{ display:table-row; }}
-                  .crm-monthly-table .daily-row td {{ font-size:11px; }}
-                  .crm-monthly-table .daily-row .date-cell {{ background:#F8FAFC; color:#475569; text-align:left; padding-left:12px; }}
-                  .crm-monthly-table .daily-indent {{ color:#94A3B8; margin-right:6px; }}
-                  .crm-monthly-table .numeric-cell {{ text-align:center; font-variant-numeric:tabular-nums; }}
-                  .crm-monthly-table .attendance-total-cell {{ color:#102451; font-weight:850; }}
-                  .crm-monthly-table .attendance-code-cell {{ color:#475569; font-weight:800; }}
-                  .crm-monthly-table .spd-cell {{ color:#0F766E; font-weight:750; }}
-                  .crm-monthly-table .applications-cell {{ color:#102451; font-weight:850; }}
-                  .crm-monthly-table tbody tr:hover td {{ box-shadow:inset 0 0 0 9999px rgba(219,234,254,.18); }}
-                </style>
-                <div class="crm-monthly-wrap">
-                  <table id="{table_id}" class="crm-monthly-table">
-                    <thead><tr>{''.join(header_row_one)}</tr><tr>{''.join(header_row_two)}</tr></thead>
-                    <tbody>{''.join(table_rows_html)}</tbody>
-                  </table>
-                </div>
-                <script>
-                  (function() {{
-                    const table = document.getElementById("{table_id}");
-                    if (!table) return;
-                    const tbody = table.tBodies[0];
-                    table.querySelectorAll('.expand-button').forEach(function(button) {{
-                      button.addEventListener('click', function() {{
-                        const groupId = button.getAttribute('data-group');
-                        const rows = Array.from(tbody.querySelectorAll(
-                          'tr.daily-row[data-parent="' + groupId + '"]'
-                        ));
-                        const expand = button.getAttribute('aria-expanded') !== 'true';
-                        rows.forEach(function(row) {{ row.classList.toggle('shown', expand); }});
-                        button.setAttribute('aria-expanded', expand ? 'true' : 'false');
-                        button.textContent = expand ? '−' : '+';
-                        button.title = expand ? 'Collapse daily breakdown' : 'Expand daily breakdown';
-                      }});
-                    }});
-                    // The table is rendered directly into Streamlit's page (not in an
-                    // iframe). Hiding/showing rows therefore changes the page's natural
-                    // document flow immediately, without leaving an old iframe height behind.
-                  }})();
-                </script>
-                """
-                # Render directly into the Streamlit document, rather than an iframe.
-                # Native document flow automatically closes the space when rows are
-                # collapsed, so the Recent Applications Log moves up immediately.
-                # unsafe_allow_javascript is needed only for the table's local +/- controls.
-                try:
-                    st.html(table_html, unsafe_allow_javascript=True)
-                except TypeError:
-                    # Compatibility for Streamlit builds whose st.html has no JavaScript
-                    # flag yet. Dynamically resize the frame itself on every toggle so it
-                    # shrinks as well as grows (unlike a fixed-height components.html).
-                    frame_resize_script = r"""
-                      <script>
-                        (function() {
-                          function fitMonthlyFrame() {
-                            var wrap = document.querySelector('.crm-monthly-wrap');
-                            if (!wrap || !window.frameElement) return;
-                            var height = Math.ceil(wrap.getBoundingClientRect().height + 4);
-                            window.frameElement.style.height = height + 'px';
-                            window.frameElement.setAttribute('height', String(height));
-                          }
-                          document.querySelectorAll('.expand-button').forEach(function(button) {
-                            button.addEventListener('click', function() {
-                              requestAnimationFrame(function() { requestAnimationFrame(fitMonthlyFrame); });
-                            });
-                          });
-                          if (typeof ResizeObserver !== 'undefined') {
-                            new ResizeObserver(function() { requestAnimationFrame(fitMonthlyFrame); })
-                              .observe(document.querySelector('.crm-monthly-wrap'));
-                          }
-                          window.addEventListener('load', fitMonthlyFrame);
-                          requestAnimationFrame(fitMonthlyFrame);
-                        })();
-                      </script>
-                    """
-                    legacy_table_html = table_html.replace('</script>', '</script>' + frame_resize_script, 1)
-                    if hasattr(st, "iframe"):
-                        st.iframe(
-                            legacy_table_html,
-                            width="stretch",
-                            height="content",
-                            alt="Monthly CRM performance table with expandable daily rows",
-                        )
-                    else:
-                        components.html(legacy_table_html, height=260, scrolling=False)
+                colour_mode = st.radio(
+                    "Outcome colour intensity",
+                    options=["Based on value", "Based on %"],
+                    index=0,
+                    horizontal=True,
+                    key="agent_combined_monthly_colour_mode",
+                )
+                combined_table_html, combined_table_height = render_agent_portal_combined_monthly_table_html(
+                    combined_monthly_outcomes,
+                    table_id="agent-combined-monthly-performance-table",
+                    colour_mode=colour_mode,
+                )
+                components.html(
+                    combined_table_html,
+                    height=combined_table_height,
+                    scrolling=False,
+                )
 
             # ------------------------------------------------------------------------
             # RECENT APPLICATIONS LOG
