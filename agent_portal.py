@@ -3061,6 +3061,16 @@ def _classify_legacy_monthly_application(row):
             "LetterStatus": letter_raw,
         })[0]
 
+    # In legacy Sparta2, the primary Live/Onboarding status value "Pending"
+    # belongs in the Live outcome column (not the general Pending bucket).
+    # Keep explicit cancellation outcomes authoritative, and apply this legacy-
+    # only adjustment before the normal committed-reminder handling.
+    if (
+        downstream_category == "Committed Rem."
+        and _onboarding_state(portal_raw) == "pending"
+    ):
+        return _monthly_outcome_detail("Live", "Portal Status", portal_raw)
+
     # A definitive downstream outcome takes precedence over earlier QA/Welcome
     # markers, matching the Agent Portal's existing central classifier.
     if downstream_category == "Live":
